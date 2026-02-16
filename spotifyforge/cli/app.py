@@ -429,7 +429,7 @@ def playlist_deduplicate(
     ) as progress:
         progress.add_task("Scanning for duplicates...", total=None)
         try:
-            result = _run(manager.deduplicate_playlist(playlist_id))
+            result = _run(manager.deduplicate(playlist_id))
         except Exception as exc:
             _error_panel(f"Deduplication failed: {exc}")
 
@@ -561,11 +561,11 @@ def discover_top_tracks(
 ) -> None:
     """Show your top tracks on Spotify."""
     try:
-        from spotifyforge.core.discovery import Discovery
+        from spotifyforge.core.discovery import DiscoveryEngine
     except Exception as exc:
         _error_panel(f"Failed to import discovery module: {exc}")
 
-    discovery = Discovery()
+    discovery = DiscoveryEngine()
 
     with Progress(
         SpinnerColumn(),
@@ -630,11 +630,11 @@ def discover_deep_cuts(
 ) -> None:
     """Find an artist's lesser-known tracks (deep cuts)."""
     try:
-        from spotifyforge.core.discovery import Discovery
+        from spotifyforge.core.discovery import DiscoveryEngine
     except Exception as exc:
         _error_panel(f"Failed to import discovery module: {exc}")
 
-    discovery = Discovery()
+    discovery = DiscoveryEngine()
 
     with Progress(
         SpinnerColumn(),
@@ -703,11 +703,11 @@ def discover_genre(
 ) -> None:
     """Build a playlist from a specific genre."""
     try:
-        from spotifyforge.core.discovery import Discovery
+        from spotifyforge.core.discovery import DiscoveryEngine
     except Exception as exc:
         _error_panel(f"Failed to import discovery module: {exc}")
 
-    discovery = Discovery()
+    discovery = DiscoveryEngine()
 
     with Progress(
         SpinnerColumn(),
@@ -760,11 +760,11 @@ def discover_time_capsule(
 ) -> None:
     """Create a time-capsule playlist from your listening history."""
     try:
-        from spotifyforge.core.discovery import Discovery
+        from spotifyforge.core.discovery import DiscoveryEngine
     except Exception as exc:
         _error_panel(f"Failed to import discovery module: {exc}")
 
-    discovery = Discovery()
+    discovery = DiscoveryEngine()
 
     with Progress(
         SpinnerColumn(),

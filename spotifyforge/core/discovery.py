@@ -406,3 +406,146 @@ class DiscoveryEngine:
             "Built time capsule (%s): %d tracks", time_range, len(tracks)
         )
         return tracks
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience functions (used by the web routes layer)
+# ---------------------------------------------------------------------------
+
+
+def _build_spotify_client(user: Any) -> "Spotify":
+    """Create a Tekore async Spotify client from a User model's stored token."""
+    return tk.Spotify(user.access_token_enc, asynchronous=True)
+
+
+def _track_to_dict(track: Any) -> dict[str, Any]:
+    """Convert a Tekore FullTrack to a plain dict for API responses."""
+    artist_names = [a.name for a in track.artists] if track.artists else []
+    return {
+        "id": 0,
+        "spotify_id": track.id or "",
+        "name": track.name or "",
+        "artist_names": artist_names,
+        "album_name": track.album.name if track.album else None,
+        "album_id": track.album.id if track.album else None,
+        "duration_ms": track.duration_ms or 0,
+        "popularity": track.popularity,
+        "isrc": None,
+        "cached_at": __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ).isoformat(),
+    }
+
+
+def _artist_to_dict(artist: Any) -> dict[str, Any]:
+    """Convert a Tekore FullArtist to a plain dict for API responses."""
+    return {
+        "id": artist.id or "",
+        "name": artist.name or "",
+        "genres": list(artist.genres) if artist.genres else [],
+        "popularity": artist.popularity,
+        "followers": artist.followers.total if artist.followers else 0,
+    }
+
+
+async def get_top_tracks(
+    user: Any,
+    time_range: str = "medium_term",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Module-level convenience for fetching a user's top tracks."""
+    sp = _build_spotify_client(user)
+    engine = DiscoveryEngine(sp)
+    tracks = await engine.get_user_top_tracks(time_range=time_range, limit=limit)
+    return [_track_to_dict(t) for t in tracks]
+
+
+async def get_top_artists(
+    user: Any,
+    time_range: str = "medium_term",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Module-level convenience for fetching a user's top artists."""
+    sp = _build_spotify_client(user)
+    engine = DiscoveryEngine(sp)
+    artists = await engine.get_user_top_artists(time_range=time_range, limit=limit)
+    return [_artist_to_dict(a) for a in artists]
+
+
+async def get_deep_cuts(
+    user: Any,
+    artist_id: str,
+    threshold: int = 30,
+) -> list[dict[str, Any]]:
+    """Module-level convenience for finding an artist's deep cuts."""
+    sp = _build_spotify_client(user)
+    engine = DiscoveryEngine(sp)
+    tracks = await engine.find_deep_cuts(
+        artist_id=artist_id, popularity_threshold=threshold
+    )
+    return [_track_to_dict(t) for t in tracks]
+
+
+async def create_genre_based_playlist(
+    user: Any,
+    genre: str,
+    limit: int = 30,
+    playlist_name: str | None = None,
+    db: Any = None,
+) -> Any:
+    """Module-level convenience for creating a genre-based playlist.
+
+    Discovers tracks via the DiscoveryEngine, creates a Spotify playlist,
+    and adds the tracks to it.  Returns the local Playlist DB row.
+    """
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.models.models import Playlist
+
+    sp = _build_spotify_client(user)
+    engine = DiscoveryEngine(sp)
+    tracks = await engine.build_genre_playlist(genre=genre, limit=limit)
+
+    name = playlist_name or f"SpotifyForge: {genre.title()}"
+    manager = PlaylistManager(sp)
+    db_playlist = await manager.create_playlist(name=name, description=f"Genre playlist: {genre}")
+
+    if tracks:
+        uris = [t.uri for t in tracks if t.uri]
+        if uris:
+            await manager.add_tracks(db_playlist.spotify_id, uris)
+
+    return db_playlist
+
+
+async def create_time_capsule_playlist(
+    user: Any,
+    year: int | None = None,
+    month: int | None = None,
+    playlist_name: str | None = None,
+    db: Any = None,
+) -> Any:
+    """Module-level convenience for creating a time-capsule playlist.
+
+    Fetches the user's top tracks and creates a Spotify playlist with them.
+    Returns the local Playlist DB row.
+    """
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.models.models import Playlist
+
+    sp = _build_spotify_client(user)
+    engine = DiscoveryEngine(sp)
+    tracks = await engine.build_time_capsule(time_range="long_term")
+
+    name = playlist_name or "SpotifyForge: Time Capsule"
+    if year:
+        name = playlist_name or f"SpotifyForge: Time Capsule ({year}{f'-{month:02d}' if month else ''})"
+
+    manager = PlaylistManager(sp)
+    db_playlist = await manager.create_playlist(name=name, description="Time capsule playlist")
+
+    if tracks:
+        uris = [t.uri for t in tracks if t.uri]
+        if uris:
+            await manager.add_tracks(db_playlist.spotify_id, uris)
+
+    return db_playlist

@@ -216,6 +216,10 @@ class PlaylistTrack(SQLModel, table=True):
     track: Track | None = Relationship(back_populates="playlist_tracks")
 
 
+# Alias used by the repository layer
+PlaylistTrackLink = PlaylistTrack
+
+
 class ScheduledJob(SQLModel, table=True):
     """A recurring automation job configured by a user."""
 

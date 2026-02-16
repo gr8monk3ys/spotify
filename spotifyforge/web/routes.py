@@ -37,18 +37,10 @@ logger = logging.getLogger("spotifyforge.web.routes")
 
 
 # ---------------------------------------------------------------------------
-# Lazy imports for dependency injection helpers (avoids circular imports)
+# Dependency injection helpers (imported from dedicated module to avoid
+# circular imports with app.py)
 # ---------------------------------------------------------------------------
-
-
-def _get_db_session_dep():
-    from spotifyforge.web.app import get_db_session
-    return get_db_session
-
-
-def _get_current_user_dep():
-    from spotifyforge.web.app import get_current_user
-    return get_current_user
+from spotifyforge.web.deps import get_current_user, get_db_session
 
 
 # =========================================================================
@@ -154,7 +146,7 @@ async def auth_callback(
 
 @auth_router.get("/me", summary="Get current user info")
 async def auth_me(
-    current_user: User = Depends(_get_current_user_dep()),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return profile information for the currently authenticated user."""
     return {
@@ -200,8 +192,8 @@ playlist_router = APIRouter(prefix="/api/playlists", tags=["playlists"])
 async def list_playlists(
     offset: int = Query(default=0, ge=0, description="Pagination offset"),
     limit: int = Query(default=20, ge=1, le=100, description="Page size"),
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> list[Playlist]:
     """Return the authenticated user's playlists with pagination.
 
@@ -226,8 +218,8 @@ async def list_playlists(
 )
 async def create_playlist(
     body: PlaylistCreate,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> Playlist:
     """Create a new Spotify playlist and register it in SpotifyForge.
 
@@ -273,8 +265,8 @@ async def create_playlist(
 )
 async def get_playlist(
     playlist_id: int,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> Playlist:
     """Return full details for a specific playlist, including track list.
 
@@ -303,8 +295,8 @@ async def get_playlist(
 async def update_playlist(
     playlist_id: int,
     body: PlaylistUpdate,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> Playlist:
     """Update the name, description, or visibility of a playlist.
 
@@ -353,8 +345,8 @@ async def update_playlist(
 )
 async def sync_playlist(
     playlist_id: int,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Trigger a full sync of the playlist from Spotify.
 
@@ -407,8 +399,8 @@ async def sync_playlist(
 )
 async def deduplicate_playlist(
     playlist_id: int,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Scan the playlist for duplicate tracks and remove them.
 
@@ -458,8 +450,8 @@ async def deduplicate_playlist(
 async def add_tracks(
     playlist_id: int,
     uris: list[str],
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Add one or more tracks to a playlist by Spotify URI.
 
@@ -516,8 +508,8 @@ async def add_tracks(
 async def remove_tracks(
     playlist_id: int,
     uris: list[str],
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Remove one or more tracks from a playlist by Spotify URI.
 
@@ -580,11 +572,11 @@ discovery_router = APIRouter(prefix="/api/discover", tags=["discovery"])
 async def top_tracks(
     time_range: str = Query(
         default="medium_term",
-        regex="^(short_term|medium_term|long_term)$",
+        pattern="^(short_term|medium_term|long_term)$",
         description="Spotify time range: short_term, medium_term, or long_term",
     ),
     limit: int = Query(default=50, ge=1, le=50, description="Number of results"),
-    current_user: User = Depends(_get_current_user_dep()),
+    current_user: User = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     """Return the user's top tracks from Spotify.
 
@@ -617,11 +609,11 @@ async def top_tracks(
 async def top_artists(
     time_range: str = Query(
         default="medium_term",
-        regex="^(short_term|medium_term|long_term)$",
+        pattern="^(short_term|medium_term|long_term)$",
         description="Spotify time range: short_term, medium_term, or long_term",
     ),
     limit: int = Query(default=50, ge=1, le=50, description="Number of results"),
-    current_user: User = Depends(_get_current_user_dep()),
+    current_user: User = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     """Return the user's top artists from Spotify.
 
@@ -658,7 +650,7 @@ async def deep_cuts(
         le=100,
         description="Maximum popularity score to qualify as a deep cut",
     ),
-    current_user: User = Depends(_get_current_user_dep()),
+    current_user: User = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     """Discover lesser-known tracks by a given artist.
 
@@ -695,8 +687,8 @@ async def create_genre_playlist(
     playlist_name: str | None = Query(
         default=None, description="Custom playlist name (auto-generated if omitted)"
     ),
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> Playlist:
     """Generate and create a new playlist populated with tracks from a genre.
 
@@ -734,8 +726,8 @@ async def create_time_capsule(
     playlist_name: str | None = Query(
         default=None, description="Custom playlist name (auto-generated if omitted)"
     ),
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> Playlist:
     """Create a nostalgia playlist based on the user's listening history.
 
@@ -774,8 +766,8 @@ schedule_router = APIRouter(prefix="/api/schedules", tags=["schedules"])
     summary="List scheduled jobs",
 )
 async def list_schedules(
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> list[ScheduledJob]:
     """Return all scheduled automation jobs for the authenticated user.
 
@@ -798,8 +790,8 @@ async def list_schedules(
 )
 async def create_schedule(
     body: ScheduledJobCreate,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> ScheduledJob:
     """Register a new recurring automation job.
 
@@ -852,8 +844,8 @@ async def create_schedule(
 )
 async def delete_schedule(
     job_id: int,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> None:
     """Delete a scheduled job.
 
@@ -891,8 +883,8 @@ async def delete_schedule(
 )
 async def toggle_schedule(
     job_id: int,
-    current_user: User = Depends(_get_current_user_dep()),
-    db: AsyncSession = Depends(_get_db_session_dep()),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> ScheduledJob:
     """Enable or disable a scheduled job.
 

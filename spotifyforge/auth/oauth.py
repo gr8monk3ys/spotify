@@ -501,3 +501,54 @@ class SpotifyAuth:
             logger.info("Refreshed and stored token for user %s", user_id)
 
         return tekore.Spotify(token, asynchronous=self._asynchronous)
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience functions (used by web routes and web app)
+# ---------------------------------------------------------------------------
+
+
+def build_auth_url(state: str | None = None) -> str:
+    """Module-level convenience for getting the Spotify auth URL."""
+    auth = SpotifyAuth()
+    return auth.get_auth_url(state)
+
+
+async def exchange_code(code: str, state: str | None = None) -> dict[str, Any]:
+    """Module-level convenience for exchanging an authorization code for tokens.
+
+    Returns a dict with ``access_token``, ``refresh_token``, and
+    ``expires_at`` keys, compatible with what the web layer expects.
+    """
+    auth = SpotifyAuth(asynchronous=True)
+    try:
+        token: tekore.Token = await auth.credentials.request_user_token(code)
+    except Exception as exc:
+        raise AuthenticationError(
+            f"Failed to exchange authorization code: {exc}"
+        ) from exc
+
+    return _token_to_dict(token)
+
+
+async def get_spotify_user(access_token: str) -> dict[str, Any]:
+    """Module-level convenience for fetching the Spotify user profile.
+
+    Creates a Tekore async Spotify client with the given *access_token*,
+    calls ``/me``, and returns a dict with ``id``, ``display_name``,
+    ``email``, and ``product`` fields.
+    """
+    client = tekore.Spotify(access_token, asynchronous=True)
+    try:
+        user = await client.current_user()
+    except Exception as exc:
+        raise AuthenticationError(
+            f"Failed to fetch Spotify user profile: {exc}"
+        ) from exc
+
+    return {
+        "id": user.id,
+        "display_name": user.display_name,
+        "email": getattr(user, "email", None),
+        "product": getattr(user, "product", None),
+    }

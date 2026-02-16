@@ -16,7 +16,7 @@ from spotifyforge.models.models import (
     Artist,
     AudioFeatures,
     Playlist,
-    PlaylistTrackLink,
+    PlaylistTrack,
     ScheduledJob,
     Track,
 )
@@ -268,13 +268,13 @@ class PlaylistRepository:
     ) -> None:
         """Replace all tracks in a playlist and update its snapshot.
 
-        Existing :class:`PlaylistTrackLink` rows for *playlist_id* are deleted
+        Existing :class:`PlaylistTrack` rows for *playlist_id* are deleted
         and replaced with new rows preserving the order given by *track_ids*.
         """
         # Remove existing links
         existing_links = self.session.exec(
-            select(PlaylistTrackLink).where(
-                PlaylistTrackLink.playlist_id == playlist_id
+            select(PlaylistTrack).where(
+                PlaylistTrack.playlist_id == playlist_id
             )
         ).all()
         for link in existing_links:
@@ -282,7 +282,7 @@ class PlaylistRepository:
 
         # Insert new links with positional ordering
         for position, track_id in enumerate(track_ids):
-            link = PlaylistTrackLink(
+            link = PlaylistTrack(
                 playlist_id=playlist_id,
                 track_id=track_id,
                 position=position,

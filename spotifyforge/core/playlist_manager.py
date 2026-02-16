@@ -43,6 +43,87 @@ class PlaylistManager:
         self._sp = spotify
 
     # ------------------------------------------------------------------
+    # Read / List
+    # ------------------------------------------------------------------
+
+    async def get_user_playlists(self) -> list[dict[str, Any]]:
+        """Fetch the current user's playlists from Spotify.
+
+        Returns a list of dicts with keys: ``id``, ``name``,
+        ``track_count``, ``public``, ``followers``.
+        """
+        try:
+            user = await self._sp.current_user()
+            paging = await self._sp.playlists(user.id, limit=50)
+        except tk.HTTPError as exc:
+            logger.error("Failed to fetch user playlists: %s", exc)
+            raise
+
+        playlists: list[dict[str, Any]] = []
+
+        def _collect(page):
+            if page and page.items:
+                for pl in page.items:
+                    playlists.append({
+                        "id": pl.id,
+                        "name": pl.name,
+                        "track_count": pl.tracks.total if pl.tracks else 0,
+                        "public": pl.public,
+                        "followers": pl.followers.total if pl.followers else 0,
+                    })
+
+        _collect(paging)
+        while paging.next is not None:
+            try:
+                paging = await self._sp.next(paging)
+            except tk.HTTPError as exc:
+                logger.error("Failed during playlist pagination: %s", exc)
+                raise
+            if paging is None:
+                break
+            _collect(paging)
+
+        return playlists
+
+    async def get_playlist_details(self, playlist_id: str) -> dict[str, Any]:
+        """Fetch a single playlist with its tracks from Spotify.
+
+        Returns a dict with ``meta`` (playlist metadata) and ``tracks``
+        (list of track dicts).
+        """
+        try:
+            sp_playlist = await self._sp.playlist(playlist_id)
+        except tk.HTTPError as exc:
+            logger.error("Failed to fetch playlist %s: %s", playlist_id, exc)
+            raise
+
+        meta: dict[str, Any] = {
+            "name": sp_playlist.name,
+            "description": sp_playlist.description or "",
+            "owner": sp_playlist.owner.display_name if sp_playlist.owner else "N/A",
+            "track_count": sp_playlist.tracks.total if sp_playlist.tracks else 0,
+            "followers": sp_playlist.followers.total if sp_playlist.followers else 0,
+            "public": sp_playlist.public,
+        }
+
+        all_items = await self.get_playlist_tracks(playlist_id)
+        tracks: list[dict[str, Any]] = []
+        for item in all_items:
+            track = item.track
+            if track is None or track.id is None:
+                continue
+            artist_names = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
+            tracks.append({
+                "name": track.name,
+                "artist": artist_names,
+                "album": track.album.name if track.album else "Unknown",
+                "duration_ms": track.duration_ms,
+                "uri": track.uri,
+            })
+
+        return {"meta": meta, "tracks": tracks}
+
+    # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
 
