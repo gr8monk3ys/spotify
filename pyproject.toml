@@ -23,6 +23,7 @@ dependencies = [
     "keyring>=25.0",
     "cryptography>=42.0",
     "aiosqlite>=0.20",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]

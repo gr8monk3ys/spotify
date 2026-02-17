@@ -107,6 +107,12 @@ def create_app() -> FastAPI:
 
         uvicorn spotifyforge.web.app:create_app --factory
     """
+    # Configure logging from application settings
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
     app = FastAPI(
         title="SpotifyForge API",
         version=__version__,
@@ -122,9 +128,26 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "Accept"],
     )
+
+    # ------------------------------------------------------------------
+    # Security headers middleware
+    # ------------------------------------------------------------------
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = "default-src 'self'"
+        if request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains"
+            )
+        return response
 
     # ------------------------------------------------------------------
     # Global exception handler
@@ -138,7 +161,10 @@ def create_app() -> FastAPI:
         )
 
     # ------------------------------------------------------------------
-    # Simple in-memory rate limiter (replace with SlowAPI/Redis in production)
+    # Simple in-memory rate limiter
+    # NOTE: This in-memory implementation is only suitable for single-worker
+    # deployments.  For multi-worker production deployments, replace with a
+    # Redis-backed solution such as slowapi (https://github.com/laurentS/slowapi).
     # ------------------------------------------------------------------
     import time as _time
     from collections import defaultdict
@@ -146,6 +172,22 @@ def create_app() -> FastAPI:
     _rate_limit_store: dict[str, list[float]] = defaultdict(list)
     _RATE_LIMIT = 60  # requests per window
     _RATE_WINDOW = 60  # seconds
+    _CLEANUP_EVERY = 100  # run stale-IP cleanup every N requests
+    _request_counter = {"count": 0}  # mutable container for nonlocal access
+
+    def _prune_stale_ips(now: float) -> None:
+        """Remove IPs that have not been seen within 2x the rate window.
+
+        This prevents unbounded memory growth when many unique client IPs
+        hit the server over time.
+        """
+        stale_cutoff = now - (_RATE_WINDOW * 2)
+        stale_keys = [
+            ip for ip, timestamps in _rate_limit_store.items()
+            if not timestamps or timestamps[-1] < stale_cutoff
+        ]
+        for ip in stale_keys:
+            del _rate_limit_store[ip]
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
@@ -157,7 +199,13 @@ def create_app() -> FastAPI:
         now = _time.time()
         window_start = now - _RATE_WINDOW
 
-        # Clean old entries and add new one
+        # Periodically prune IPs that haven't been seen in 2x the window
+        _request_counter["count"] += 1
+        if _request_counter["count"] >= _CLEANUP_EVERY:
+            _request_counter["count"] = 0
+            _prune_stale_ips(now)
+
+        # Clean old entries for the current IP and add the new one
         _rate_limit_store[client_ip] = [
             t for t in _rate_limit_store[client_ip] if t > window_start
         ]

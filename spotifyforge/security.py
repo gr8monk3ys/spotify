@@ -23,6 +23,8 @@ def _get_fernet() -> Fernet:
         "SPOTIFYFORGE_SECRET_KEY", ""
     )
     if not secret:
+        if getattr(settings, "environment", "development") == "production":
+            raise RuntimeError("SPOTIFYFORGE_SECRET_KEY must be set in production")
         warnings.warn(
             "SPOTIFYFORGE_SECRET_KEY not set — using insecure default. "
             "DO NOT use in production.",

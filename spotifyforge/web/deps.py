@@ -7,17 +7,90 @@ can import them without circular-import issues.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from spotifyforge.auth.oauth import SpotifyAuth, AuthenticationError
 from spotifyforge.db.engine import _get_async_engine
 from spotifyforge.models.models import User
-from spotifyforge.security import hash_token
+from spotifyforge.security import decrypt_token, encrypt_token, hash_token
 
 logger = logging.getLogger("spotifyforge.web.deps")
+
+
+async def _refresh_user_token(user: User, db: AsyncSession) -> User:
+    """Attempt to refresh the user's expired Spotify access token.
+
+    Decrypts the stored refresh token, calls the Spotify token-refresh
+    endpoint via :class:`SpotifyAuth`, and persists the new encrypted
+    tokens and expiry back to the database.
+
+    Parameters
+    ----------
+    user
+        The :class:`User` whose token needs refreshing.
+    db
+        An active async database session for persisting updated tokens.
+
+    Returns
+    -------
+    User
+        The same user instance, updated with new token fields.
+
+    Raises
+    ------
+    HTTPException (401)
+        If the refresh token is missing, cannot be decrypted, or the
+        Spotify refresh request fails.
+    """
+    if not user.refresh_token_enc:
+        logger.warning(
+            "User %s has no refresh token; cannot auto-refresh.", user.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired and no refresh token available. Please re-authenticate.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        refresh_token_plain = decrypt_token(user.refresh_token_enc)
+    except Exception:
+        logger.exception("Failed to decrypt refresh token for user %s", user.id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired and refresh token is invalid. Please re-authenticate.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        auth = SpotifyAuth(asynchronous=True)
+        new_token = await auth.credentials.refresh_user_token(refresh_token_plain)
+    except (AuthenticationError, Exception):
+        logger.exception("Failed to refresh Spotify token for user %s", user.id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired and refresh failed. Please re-authenticate.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Persist the refreshed tokens
+    user.access_token_enc = encrypt_token(new_token.access_token)
+    if new_token.refresh_token:
+        user.refresh_token_enc = encrypt_token(new_token.refresh_token)
+    user.token_expiry = datetime.fromtimestamp(new_token.expires_at, tz=timezone.utc)
+    user.updated_at = datetime.now(tz=timezone.utc)
+
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    logger.info("Successfully refreshed token for user %s", user.id)
+    return user
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
@@ -66,6 +139,12 @@ async def get_current_user(
             )
             user = result.scalars().first()
             if user is not None:
+                if (
+                    user.token_expiry is not None
+                    and user.token_expiry.replace(tzinfo=timezone.utc)
+                    <= datetime.now(tz=timezone.utc)
+                ):
+                    user = await _refresh_user_token(user, db)
                 return user
 
     if user_id is None:
@@ -84,5 +163,12 @@ async def get_current_user(
             detail="User session is invalid or expired. Please re-authenticate.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    if (
+        user.token_expiry is not None
+        and user.token_expiry.replace(tzinfo=timezone.utc)
+        <= datetime.now(tz=timezone.utc)
+    ):
+        user = await _refresh_user_token(user, db)
 
     return user
