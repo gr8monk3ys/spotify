@@ -20,6 +20,7 @@ from cryptography.fernet import Fernet
 from cryptography.fernet import InvalidToken as FernetInvalidToken
 
 from spotifyforge.config import Settings
+from spotifyforge.security import encrypt_token, decrypt_token, generate_csrf_state, verify_csrf_state
 
 logger = logging.getLogger(__name__)
 
@@ -509,17 +510,27 @@ class SpotifyAuth:
 
 
 def build_auth_url(state: str | None = None) -> str:
-    """Module-level convenience for getting the Spotify auth URL."""
+    """Build a Spotify authorization URL.
+
+    If no state is provided, generates a CSRF token automatically.
+    """
+    if state is None:
+        state = generate_csrf_state()
     auth = SpotifyAuth()
-    return auth.get_auth_url(state)
+    return auth.get_auth_url(state=state)
 
 
-async def exchange_code(code: str, state: str | None = None) -> dict[str, Any]:
-    """Module-level convenience for exchanging an authorization code for tokens.
+async def exchange_code(code: str, state: str | None = None, expected_state: str | None = None) -> dict[str, Any]:
+    """Exchange an authorization code for token info.
+
+    If expected_state is provided, validates the state parameter to prevent CSRF.
 
     Returns a dict with ``access_token``, ``refresh_token``, and
     ``expires_at`` keys, compatible with what the web layer expects.
     """
+    if expected_state is not None and not verify_csrf_state(expected_state, state):
+        raise AuthenticationError("CSRF state mismatch — possible cross-site request forgery.")
+
     auth = SpotifyAuth(asynchronous=True)
     try:
         token: tekore.Token = await auth.credentials.request_user_token(code)

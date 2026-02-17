@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -68,6 +68,7 @@ async def auth_login() -> dict[str, str]:
     summary="Handle OAuth callback",
 )
 async def auth_callback(
+    request: Request,
     code: str = Query(..., description="Authorization code from Spotify"),
     state: str | None = Query(default=None, description="Anti-CSRF state parameter"),
 ) -> RedirectResponse:
@@ -136,8 +137,9 @@ async def auth_callback(
             key="spotifyforge_user_id",
             value=str(user.id),
             httponly=True,
+            secure=request.url.scheme == "https",  # Secure in production
             samesite="lax",
-            max_age=60 * 60 * 24 * 30,  # 30 days
+            max_age=60 * 60 * 24 * 7,  # 7 days (was 30)
         )
         return response
     finally:

@@ -15,6 +15,7 @@ from sqlmodel import select
 
 from spotifyforge.db.engine import _get_async_engine
 from spotifyforge.models.models import User
+from spotifyforge.security import hash_token
 
 logger = logging.getLogger("spotifyforge.web.deps")
 
@@ -58,6 +59,8 @@ async def get_current_user(
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
+            # TODO: After migration, look up by hash_token(token) instead of raw token
+            # token_hash = hash_token(token)
             result = await db.execute(
                 select(User).where(User.access_token_enc == token)
             )

@@ -32,7 +32,7 @@ def get_engine():
         _engine = create_engine(
             f"sqlite:///{db_path}",
             echo=False,
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False},  # Required for SQLite with threads; not needed for PostgreSQL
         )
 
     return _engine
@@ -46,13 +46,31 @@ def _get_async_engine():
         db_path = settings.db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Add pool settings for production use
         _async_engine = create_async_engine(
             f"sqlite+aiosqlite:///{db_path}",
             echo=False,
+            pool_pre_ping=True,  # Verify connections before use
+            # Note: SQLite doesn't support pool_size/max_overflow (single-writer),
+            # but these settings prepare for PostgreSQL migration
             connect_args={"check_same_thread": False},
         )
 
     return _async_engine
+
+
+def get_production_engine_url() -> str:
+    """Return the database URL, preferring DATABASE_URL env var for production.
+
+    Falls back to SQLite for development.
+    """
+    import os
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        return database_url
+    # Development fallback
+    db_path = settings.db_path
+    return f"sqlite:///{db_path}"
 
 
 # ---------------------------------------------------------------------------

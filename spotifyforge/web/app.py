@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, AsyncGenerator
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -125,6 +125,70 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # ------------------------------------------------------------------
+    # Global exception handler
+    # ------------------------------------------------------------------
+    @app.exception_handler(Exception)
+    async def _global_exception_handler(request: Request, exc: Exception):
+        logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error. Please try again later."},
+        )
+
+    # ------------------------------------------------------------------
+    # Simple in-memory rate limiter (replace with SlowAPI/Redis in production)
+    # ------------------------------------------------------------------
+    import time as _time
+    from collections import defaultdict
+
+    _rate_limit_store: dict[str, list[float]] = defaultdict(list)
+    _RATE_LIMIT = 60  # requests per window
+    _RATE_WINDOW = 60  # seconds
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        # Skip rate limiting for health checks
+        if request.url.path == "/health":
+            return await call_next(request)
+
+        client_ip = request.client.host if request.client else "unknown"
+        now = _time.time()
+        window_start = now - _RATE_WINDOW
+
+        # Clean old entries and add new one
+        _rate_limit_store[client_ip] = [
+            t for t in _rate_limit_store[client_ip] if t > window_start
+        ]
+
+        if len(_rate_limit_store[client_ip]) >= _RATE_LIMIT:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Please slow down."},
+                headers={"Retry-After": str(_RATE_WINDOW)},
+            )
+
+        _rate_limit_store[client_ip].append(now)
+        return await call_next(request)
+
+    # ------------------------------------------------------------------
+    # Request logging middleware
+    # ------------------------------------------------------------------
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        import time
+        start = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "%s %s %d %.1fms",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
 
     # Include routers from the routes module
     from spotifyforge.web.routes import (

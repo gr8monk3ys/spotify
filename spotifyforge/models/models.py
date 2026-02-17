@@ -68,9 +68,10 @@ class User(SQLModel, table=True):
     email: str | None = Field(default=None, max_length=320)
 
     # OAuth tokens — stored encrypted (Fernet) in the database.
-    access_token_enc: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    access_token_enc: str | None = Field(default=None, sa_column=Column(Text, nullable=True, index=True))
     refresh_token_enc: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     token_expiry: datetime | None = Field(default=None)
+    token_hash: str | None = Field(default=None, index=True)
 
     is_premium: bool = Field(default=False)
 
@@ -184,6 +185,7 @@ class Playlist(SQLModel, table=True):
     follower_count: int = Field(default=0)
     track_count: int = Field(default=0)
     last_synced_at: datetime | None = Field(default=None)
+    deleted_at: datetime | None = Field(default=None, index=True)
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -237,10 +239,12 @@ class ScheduledJob(SQLModel, table=True):
     playlist_id: int | None = Field(default=None, foreign_key="playlists.id", index=True)
     config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     cron_expression: str = Field(max_length=128)
-    enabled: bool = Field(default=True)
+    enabled: bool = Field(default=True, index=True)
 
     last_run_at: datetime | None = Field(default=None)
     next_run_at: datetime | None = Field(default=None)
+    failure_count: int = Field(default=0)
+    last_error: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
