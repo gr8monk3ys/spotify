@@ -192,12 +192,16 @@ prefix) or a `.env` file. See `.env.example` for a complete template.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `SPOTIFYFORGE_ENVIRONMENT` | `development` | Set to `production` to enforce required settings |
+| `SPOTIFYFORGE_SECRET_KEY` | `""` | Encryption key for tokens (required in production) |
 | `SPOTIFYFORGE_SPOTIFY_CLIENT_ID` | `""` | Spotify app client ID (required) |
 | `SPOTIFYFORGE_SPOTIFY_CLIENT_SECRET` | `""` | Spotify app client secret (required) |
-| `SPOTIFYFORGE_SPOTIFY_REDIRECT_URI` | `http://localhost:8888/callback` | OAuth redirect URI |
+| `SPOTIFYFORGE_SPOTIFY_REDIRECT_URI` | `http://localhost:8000/api/auth/callback` | OAuth redirect URI |
 | `SPOTIFYFORGE_DB_PATH` | `~/.spotifyforge/spotifyforge.db` | SQLite database path |
+| `SPOTIFYFORGE_DATABASE_URL` | `""` | Database URL; overrides DB_PATH (e.g. `postgresql://...`) |
 | `SPOTIFYFORGE_WEB_HOST` | `127.0.0.1` | API server bind address |
 | `SPOTIFYFORGE_WEB_PORT` | `8000` | API server port |
+| `SPOTIFYFORGE_LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `SPOTIFYFORGE_SCHEDULER_ENABLED` | `true` | Enable background scheduler |
 | `SPOTIFYFORGE_CACHE_TTL_AUDIO_FEATURES` | `0` | Audio features cache (seconds, 0 = indefinite) |
 | `SPOTIFYFORGE_CACHE_TTL_TRACK_METADATA` | `604800` | Track metadata cache (7 days) |

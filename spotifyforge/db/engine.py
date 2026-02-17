@@ -18,59 +18,62 @@ _async_engine = None
 
 
 def get_engine():
-    """Return a singleton SQLite engine, creating the db directory if needed.
+    """Return a singleton database engine.
 
-    The database path is read from ``Settings.db_path``.  The parent directory
-    is created automatically so callers never have to worry about it.
+    If ``Settings.database_url`` is set, it is used directly.  Otherwise a
+    SQLite URL is constructed from ``Settings.db_path`` (creating the parent
+    directory automatically).
     """
     global _engine  # noqa: PLW0603
 
     if _engine is None:
-        db_path = settings.db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if settings.database_url:
+            url = settings.database_url
+        else:
+            db_path = settings.db_path
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            url = f"sqlite:///{db_path}"
 
-        _engine = create_engine(
-            f"sqlite:///{db_path}",
-            echo=False,
-            connect_args={"check_same_thread": False},  # Required for SQLite with threads; not needed for PostgreSQL
-        )
+        kwargs: dict = {"echo": False, "pool_pre_ping": True}
+        if url.startswith("sqlite"):
+            kwargs["connect_args"] = {"check_same_thread": False}
+
+        _engine = create_engine(url, **kwargs)
 
     return _engine
 
 
 def _get_async_engine():
-    """Return a singleton async (aiosqlite) engine."""
+    """Return a singleton async database engine.
+
+    If ``Settings.database_url`` is set the URL is adapted for async drivers
+    (``asyncpg`` for PostgreSQL, ``aiosqlite`` for SQLite).  Otherwise a
+    SQLite+aiosqlite URL is constructed from ``Settings.db_path``.
+    """
     global _async_engine  # noqa: PLW0603
 
     if _async_engine is None:
-        db_path = settings.db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if settings.database_url:
+            url = settings.database_url
+            if url.startswith("postgresql://"):
+                url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            elif url.startswith("sqlite://"):
+                url = url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+        else:
+            db_path = settings.db_path
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            url = f"sqlite+aiosqlite:///{db_path}"
 
-        # Add pool settings for production use
-        _async_engine = create_async_engine(
-            f"sqlite+aiosqlite:///{db_path}",
-            echo=False,
-            pool_pre_ping=True,  # Verify connections before use
-            # Note: SQLite doesn't support pool_size/max_overflow (single-writer),
-            # but these settings prepare for PostgreSQL migration
-            connect_args={"check_same_thread": False},
-        )
+        kwargs: dict = {"echo": False, "pool_pre_ping": True}
+        if url.startswith("sqlite"):
+            kwargs["connect_args"] = {"check_same_thread": False}
+        elif url.startswith("postgresql"):
+            kwargs["pool_size"] = 5
+            kwargs["max_overflow"] = 10
+
+        _async_engine = create_async_engine(url, **kwargs)
 
     return _async_engine
-
-
-def get_production_engine_url() -> str:
-    """Return the database URL, preferring DATABASE_URL env var for production.
-
-    Falls back to SQLite for development.
-    """
-    import os
-    database_url = os.environ.get("DATABASE_URL")
-    if database_url:
-        return database_url
-    # Development fallback
-    db_path = settings.db_path
-    return f"sqlite:///{db_path}"
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +81,7 @@ def get_production_engine_url() -> str:
 # ---------------------------------------------------------------------------
 
 def init_db() -> None:
-    """Create the SQLite database file and all registered SQLModel tables.
+    """Create all registered SQLModel tables in the configured database.
 
     Models are imported here so that their metadata is registered with
     ``SQLModel.metadata`` before ``create_all`` is called.

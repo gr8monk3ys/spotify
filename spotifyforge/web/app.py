@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from spotifyforge import __version__
 from spotifyforge.config import settings
 from spotifyforge.db.engine import init_db
@@ -79,6 +79,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         scheduler = _get_scheduler()
         if not scheduler.running:
             scheduler.start()
+
+        # Reload saved jobs from the database
+        try:
+            from sqlmodel import Session, select
+            from spotifyforge.db.engine import get_engine
+            from spotifyforge.models.models import ScheduledJob
+            from spotifyforge.core.scheduler import register_job
+
+            with Session(get_engine()) as session:
+                jobs = session.exec(
+                    select(ScheduledJob).where(ScheduledJob.enabled == True)  # noqa: E712
+                ).all()
+                for job in jobs:
+                    try:
+                        register_job(job)
+                    except Exception:
+                        logger.warning("Failed to reload job %s (%s)", job.id, job.name, exc_info=True)
+                logger.info("Reloaded %d scheduled job(s) from database.", len(jobs))
+        except Exception:
+            logger.warning("Failed to reload scheduled jobs from database.", exc_info=True)
 
     yield
 
@@ -261,6 +281,35 @@ def create_app() -> FastAPI:
             "status": "healthy",
             "version": __version__,
         }
+
+    @app.get("/dashboard", response_class=HTMLResponse, summary="Dashboard", tags=["oauth"])
+    async def dashboard():
+        """Simple landing page shown after successful OAuth login."""
+        return HTMLResponse(content="""<!DOCTYPE html>
+<html>
+<head><title>SpotifyForge</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px; color: #1a1a1a; }
+h1 { color: #1DB954; }
+a { color: #1DB954; }
+.card { background: #f5f5f5; border-radius: 8px; padding: 20px; margin: 20px 0; }
+</style></head>
+<body>
+<h1>SpotifyForge</h1>
+<div class="card">
+<p><strong>Authentication successful.</strong> You're now logged in.</p>
+<p>You can use the SpotifyForge API to manage your playlists, discover music, and set up automated workflows.</p>
+</div>
+<h2>Next steps</h2>
+<ul>
+<li><a href="/docs">API Documentation</a> — Interactive Swagger UI</li>
+<li><a href="/api/auth/me">Your Profile</a> — View your account info</li>
+<li><a href="/api/playlists">Your Playlists</a> — Browse your playlists</li>
+</ul>
+<p style="margin-top: 40px; color: #666; font-size: 0.9em;">
+Or use the CLI: <code>spotifyforge playlist list</code>
+</p>
+</body></html>""")
 
     return app
 

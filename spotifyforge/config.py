@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Spotify OAuth
     spotify_client_id: str = ""
     spotify_client_secret: str = ""
-    spotify_redirect_uri: str = "http://localhost:8888/callback"
+    spotify_redirect_uri: str = "http://localhost:8000/api/auth/callback"
 
     # Security
     secret_key: str = ""
