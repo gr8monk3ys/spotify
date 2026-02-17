@@ -2,27 +2,22 @@
 
 This module creates and configures the main FastAPI application, including
 CORS middleware, lifespan events for database and scheduler initialization,
-the Spotify OAuth callback endpoint, a health check, and dependency
-injection helpers used across all route modules.
+a health check, and dependency injection helpers used across all route
+modules.
 """
 
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, AsyncGenerator
+from typing import TYPE_CHECKING
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
-
+from fastapi.responses import JSONResponse
 from spotifyforge import __version__
 from spotifyforge.config import settings
-from spotifyforge.db.engine import _get_async_engine, init_db
-from spotifyforge.models.models import User
+from spotifyforge.db.engine import init_db
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -255,74 +250,6 @@ def create_app() -> FastAPI:
     # Top-level endpoints (outside any router)
     # ------------------------------------------------------------------
 
-    @app.get(
-        "/callback",
-        response_class=RedirectResponse,
-        summary="Spotify OAuth redirect handler",
-        tags=["oauth"],
-    )
-    async def oauth_callback(
-        code: str = Query(..., description="Authorization code returned by Spotify"),
-        state: str | None = Query(default=None, description="Anti-CSRF state token"),
-    ) -> RedirectResponse:
-        """Handle the Spotify OAuth redirect.
-
-        Exchanges the authorization *code* for access and refresh tokens,
-        persists or updates the user record, and redirects the browser to
-        the front-end dashboard.
-        """
-        from spotifyforge.auth.oauth import exchange_code, get_spotify_user
-
-        try:
-            token_info = await exchange_code(code, state=state)
-        except Exception as exc:
-            logger.error("OAuth token exchange failed: %s", exc)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to exchange authorization code with Spotify.",
-            ) from exc
-
-        try:
-            spotify_user = await get_spotify_user(token_info["access_token"])
-        except Exception as exc:
-            logger.error("Failed to fetch Spotify user profile: %s", exc)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to retrieve Spotify user profile.",
-            ) from exc
-
-        # Upsert user in database
-        async with get_async_session_raw() as session:
-            result = await session.execute(
-                select(User).where(User.spotify_id == spotify_user["id"])
-            )
-            user = result.scalars().first()
-
-            if user is None:
-                user = User(
-                    spotify_id=spotify_user["id"],
-                    display_name=spotify_user.get("display_name"),
-                    email=spotify_user.get("email"),
-                    access_token_enc=token_info["access_token"],
-                    refresh_token_enc=token_info.get("refresh_token"),
-                    token_expiry=token_info.get("expires_at"),
-                    is_premium=spotify_user.get("product") == "premium",
-                )
-                session.add(user)
-            else:
-                user.access_token_enc = token_info["access_token"]
-                user.refresh_token_enc = token_info.get("refresh_token", user.refresh_token_enc)
-                user.token_expiry = token_info.get("expires_at")
-                user.display_name = spotify_user.get("display_name", user.display_name)
-                user.email = spotify_user.get("email", user.email)
-                user.is_premium = spotify_user.get("product") == "premium"
-                user.updated_at = datetime.now(timezone.utc)
-                session.add(user)
-
-            await session.commit()
-
-        return RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-
     @app.get("/health", summary="Health check", tags=["ops"])
     async def health_check() -> dict[str, str]:
         """Return a simple health-check response.
@@ -343,17 +270,6 @@ def create_app() -> FastAPI:
 # to avoid circular imports with routes.py; re-exported here for convenience)
 # ---------------------------------------------------------------------------
 from spotifyforge.web.deps import get_current_user, get_db_session  # noqa: F401, E402
-
-
-async def get_async_session_raw() -> AsyncGenerator[AsyncSession, None]:
-    """Yield a raw async session outside of FastAPI dependency injection.
-
-    This is used internally (e.g. in the ``/callback`` handler).  For
-    route handlers, prefer :func:`get_db_session`.
-    """
-    engine = _get_async_engine()
-    async with AsyncSession(engine) as session:
-        yield session
 
 
 # ---------------------------------------------------------------------------

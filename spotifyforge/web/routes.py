@@ -32,6 +32,7 @@ from spotifyforge.models.models import (
     TrackResponse,
     User,
 )
+from spotifyforge.security import encrypt_token, hash_token
 
 logger = logging.getLogger("spotifyforge.web.routes")
 
@@ -113,16 +114,18 @@ async def auth_callback(
                 spotify_id=spotify_user["id"],
                 display_name=spotify_user.get("display_name"),
                 email=spotify_user.get("email"),
-                access_token_enc=token_info["access_token"],
-                refresh_token_enc=token_info.get("refresh_token"),
-                token_expiry=token_info.get("expires_at"),
+                access_token_enc=encrypt_token(token_info["access_token"]),
+                refresh_token_enc=encrypt_token(token_info["refresh_token"]) if token_info.get("refresh_token") else None,
+                token_expiry=datetime.fromtimestamp(token_info["expires_at"], tz=timezone.utc) if token_info.get("expires_at") else None,
+                token_hash=hash_token(token_info["access_token"]),
                 is_premium=spotify_user.get("product") == "premium",
             )
             db.add(user)
         else:
-            user.access_token_enc = token_info["access_token"]
-            user.refresh_token_enc = token_info.get("refresh_token", user.refresh_token_enc)
-            user.token_expiry = token_info.get("expires_at")
+            user.access_token_enc = encrypt_token(token_info["access_token"])
+            user.refresh_token_enc = encrypt_token(token_info["refresh_token"]) if token_info.get("refresh_token") else user.refresh_token_enc
+            user.token_expiry = datetime.fromtimestamp(token_info["expires_at"], tz=timezone.utc) if token_info.get("expires_at") else None
+            user.token_hash = hash_token(token_info["access_token"])
             user.display_name = spotify_user.get("display_name", user.display_name)
             user.email = spotify_user.get("email", user.email)
             user.is_premium = spotify_user.get("product") == "premium"

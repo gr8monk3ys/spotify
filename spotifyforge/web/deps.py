@@ -80,6 +80,7 @@ async def _refresh_user_token(user: User, db: AsyncSession) -> User:
 
     # Persist the refreshed tokens
     user.access_token_enc = encrypt_token(new_token.access_token)
+    user.token_hash = hash_token(new_token.access_token)
     if new_token.refresh_token:
         user.refresh_token_enc = encrypt_token(new_token.refresh_token)
     user.token_expiry = datetime.fromtimestamp(new_token.expires_at, tz=timezone.utc)
@@ -132,10 +133,8 @@ async def get_current_user(
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            # TODO: After migration, look up by hash_token(token) instead of raw token
-            # token_hash = hash_token(token)
             result = await db.execute(
-                select(User).where(User.access_token_enc == token)
+                select(User).where(User.token_hash == hash_token(token))
             )
             user = result.scalars().first()
             if user is not None:
