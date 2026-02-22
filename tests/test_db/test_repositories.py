@@ -4,21 +4,11 @@ Uses an in-memory SQLite database via a session-scoped fixture so that every
 test method gets a fresh, empty database with all tables created.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
-from spotifyforge.models.models import (
-    AudioFeatures,
-    AudioFeaturesSource,
-    JobType,
-    Playlist,
-    PlaylistTrackLink,
-    ScheduledJob,
-    Track,
-    User,
-)
 from spotifyforge.db.repositories import (
     ArtistRepository,
     AudioFeaturesRepository,
@@ -26,7 +16,14 @@ from spotifyforge.db.repositories import (
     ScheduledJobRepository,
     TrackRepository,
 )
-
+from spotifyforge.models.models import (
+    AudioFeaturesSource,
+    JobType,
+    Playlist,
+    PlaylistTrackLink,
+    Track,
+    User,
+)
 
 # ============================================================================
 # Fixtures
@@ -71,7 +68,7 @@ def fixture_sample_tracks(session: Session) -> list[Track]:
             name=name,
             artist_names=artists,
             duration_ms=dur,
-            cached_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            cached_at=datetime(2025, 1, 1, tzinfo=UTC),
         )
         for i, (name, artists, dur) in enumerate(
             [
@@ -129,15 +126,11 @@ class TestTrackRepositoryUpsert:
 
     def test_upsert_updates_existing_track(self, session: Session):
         repo = TrackRepository(session)
-        original = repo.upsert(
-            {"spotify_id": "upd_1", "name": "Original", "duration_ms": 100}
-        )
+        original = repo.upsert({"spotify_id": "upd_1", "name": "Original", "duration_ms": 100})
         original_id = original.id
         original_cached = original.cached_at
 
-        updated = repo.upsert(
-            {"spotify_id": "upd_1", "name": "Updated", "duration_ms": 200}
-        )
+        updated = repo.upsert({"spotify_id": "upd_1", "name": "Updated", "duration_ms": 200})
         assert updated.id == original_id
         assert updated.name == "Updated"
         assert updated.duration_ms == 200
@@ -206,9 +199,7 @@ class TestTrackRepositoryRead:
         spotify_ids = {t.spotify_id for t in tracks}
         assert spotify_ids == {"sp_track_1", "sp_track_3"}
 
-    def test_get_many_by_spotify_ids_partial_match(
-        self, session: Session, sample_tracks
-    ):
+    def test_get_many_by_spotify_ids_partial_match(self, session: Session, sample_tracks):
         repo = TrackRepository(session)
         tracks = repo.get_many_by_spotify_ids(["sp_track_1", "nonexistent"])
         assert len(tracks) == 1
@@ -256,9 +247,7 @@ class TestTrackRepositorySearch:
     def test_search_respects_limit(self, session: Session):
         repo = TrackRepository(session)
         for i in range(10):
-            repo.upsert(
-                {"spotify_id": f"lim_{i}", "name": f"Song {i}", "duration_ms": 0}
-            )
+            repo.upsert({"spotify_id": f"lim_{i}", "name": f"Song {i}", "duration_ms": 0})
         results = repo.search("Song", limit=3)
         assert len(results) == 3
 
@@ -293,12 +282,8 @@ class TestArtistRepositoryUpsert:
 
     def test_upsert_updates_existing(self, session: Session):
         repo = ArtistRepository(session)
-        original = repo.upsert(
-            {"spotify_id": "art_upd", "name": "Old Name", "genres": ["rock"]}
-        )
-        updated = repo.upsert(
-            {"spotify_id": "art_upd", "name": "New Name", "genres": ["pop"]}
-        )
+        original = repo.upsert({"spotify_id": "art_upd", "name": "Old Name", "genres": ["rock"]})
+        updated = repo.upsert({"spotify_id": "art_upd", "name": "New Name", "genres": ["pop"]})
         assert updated.id == original.id
         assert updated.name == "New Name"
         assert updated.genres == ["pop"]
@@ -468,9 +453,7 @@ class TestPlaylistRepositorySyncTracks:
         from sqlmodel import select
 
         links = session.exec(
-            select(PlaylistTrackLink).where(
-                PlaylistTrackLink.playlist_id == sample_playlist.id
-            )
+            select(PlaylistTrackLink).where(PlaylistTrackLink.playlist_id == sample_playlist.id)
         ).all()
         assert len(links) == 3
 
@@ -507,16 +490,12 @@ class TestPlaylistRepositorySyncTracks:
         )
 
         # Second sync with last track only (no overlap with first sync)
-        repo.sync_tracks(
-            sample_playlist.id, [sample_tracks[2].id], "snap_b"
-        )
+        repo.sync_tracks(sample_playlist.id, [sample_tracks[2].id], "snap_b")
 
         from sqlmodel import select
 
         links = session.exec(
-            select(PlaylistTrackLink).where(
-                PlaylistTrackLink.playlist_id == sample_playlist.id
-            )
+            select(PlaylistTrackLink).where(PlaylistTrackLink.playlist_id == sample_playlist.id)
         ).all()
         assert len(links) == 1
         assert links[0].track_id == sample_tracks[2].id
@@ -528,18 +507,14 @@ class TestPlaylistRepositorySyncTracks:
         sample_tracks: list[Track],
     ):
         repo = PlaylistRepository(session)
-        repo.sync_tracks(
-            sample_playlist.id, [t.id for t in sample_tracks], "snap_x"
-        )
+        repo.sync_tracks(sample_playlist.id, [t.id for t in sample_tracks], "snap_x")
         # Now sync with empty list
         repo.sync_tracks(sample_playlist.id, [], "snap_empty")
 
         from sqlmodel import select
 
         links = session.exec(
-            select(PlaylistTrackLink).where(
-                PlaylistTrackLink.playlist_id == sample_playlist.id
-            )
+            select(PlaylistTrackLink).where(PlaylistTrackLink.playlist_id == sample_playlist.id)
         ).all()
         assert len(links) == 0
 
@@ -547,16 +522,12 @@ class TestPlaylistRepositorySyncTracks:
 class TestPlaylistRepositoryNeedsSync:
     """PlaylistRepository.needs_sync checks snapshot_id divergence."""
 
-    def test_needs_sync_same_snapshot(
-        self, session: Session, sample_playlist: Playlist
-    ):
+    def test_needs_sync_same_snapshot(self, session: Session, sample_playlist: Playlist):
         repo = PlaylistRepository(session)
         # sample_playlist has snapshot_id="snap_v1"
         assert repo.needs_sync(sample_playlist.id, "snap_v1") is False
 
-    def test_needs_sync_different_snapshot(
-        self, session: Session, sample_playlist: Playlist
-    ):
+    def test_needs_sync_different_snapshot(self, session: Session, sample_playlist: Playlist):
         repo = PlaylistRepository(session)
         assert repo.needs_sync(sample_playlist.id, "snap_v2") is True
 
@@ -572,9 +543,7 @@ class TestPlaylistRepositoryNeedsSync:
         sample_tracks: list[Track],
     ):
         repo = PlaylistRepository(session)
-        repo.sync_tracks(
-            sample_playlist.id, [sample_tracks[0].id], "snap_updated"
-        )
+        repo.sync_tracks(sample_playlist.id, [sample_tracks[0].id], "snap_updated")
         assert repo.needs_sync(sample_playlist.id, "snap_updated") is False
         assert repo.needs_sync(sample_playlist.id, "snap_old") is True
 
@@ -603,9 +572,7 @@ class TestAudioFeaturesRepositoryUpsert:
         assert af.energy == 0.7
         assert af.cached_at is not None
 
-    def test_upsert_updates_existing(
-        self, session: Session, sample_tracks: list[Track]
-    ):
+    def test_upsert_updates_existing(self, session: Session, sample_tracks: list[Track]):
         repo = AudioFeaturesRepository(session)
         original = repo.upsert(
             {
@@ -626,9 +593,7 @@ class TestAudioFeaturesRepositoryUpsert:
         assert updated.danceability == 0.9
         assert updated.energy == 0.6
 
-    def test_upsert_all_feature_fields(
-        self, session: Session, sample_tracks: list[Track]
-    ):
+    def test_upsert_all_feature_fields(self, session: Session, sample_tracks: list[Track]):
         repo = AudioFeaturesRepository(session)
         af = repo.upsert(
             {
@@ -656,9 +621,7 @@ class TestAudioFeaturesRepositoryUpsert:
 class TestAudioFeaturesRepositoryUpsertMany:
     """AudioFeaturesRepository.upsert_many batch operations."""
 
-    def test_upsert_many_creates_all(
-        self, session: Session, sample_tracks: list[Track]
-    ):
+    def test_upsert_many_creates_all(self, session: Session, sample_tracks: list[Track]):
         repo = AudioFeaturesRepository(session)
         features = repo.upsert_many(
             [
@@ -685,9 +648,7 @@ class TestAudioFeaturesRepositoryUpsertMany:
 class TestAudioFeaturesRepositoryRead:
     """AudioFeaturesRepository read operations."""
 
-    def test_get_by_track_id_found(
-        self, session: Session, sample_tracks: list[Track]
-    ):
+    def test_get_by_track_id_found(self, session: Session, sample_tracks: list[Track]):
         repo = AudioFeaturesRepository(session)
         repo.upsert(
             {
@@ -704,17 +665,13 @@ class TestAudioFeaturesRepositoryRead:
         repo = AudioFeaturesRepository(session)
         assert repo.get_by_track_id(99999) is None
 
-    def test_get_missing_track_ids_all_missing(
-        self, session: Session, sample_tracks: list[Track]
-    ):
+    def test_get_missing_track_ids_all_missing(self, session: Session, sample_tracks: list[Track]):
         repo = AudioFeaturesRepository(session)
         track_ids = [t.id for t in sample_tracks]
         missing = repo.get_missing_track_ids(track_ids)
         assert set(missing) == set(track_ids)
 
-    def test_get_missing_track_ids_some_cached(
-        self, session: Session, sample_tracks: list[Track]
-    ):
+    def test_get_missing_track_ids_some_cached(self, session: Session, sample_tracks: list[Track]):
         repo = AudioFeaturesRepository(session)
         # Cache features for first track only
         repo.upsert(
@@ -730,9 +687,7 @@ class TestAudioFeaturesRepositoryRead:
         assert sample_tracks[1].id in missing
         assert sample_tracks[2].id in missing
 
-    def test_get_missing_track_ids_none_missing(
-        self, session: Session, sample_tracks: list[Track]
-    ):
+    def test_get_missing_track_ids_none_missing(self, session: Session, sample_tracks: list[Track]):
         repo = AudioFeaturesRepository(session)
         for t in sample_tracks:
             repo.upsert(
@@ -849,9 +804,7 @@ class TestScheduledJobRepositoryGetEnabledJobs:
         names = {j.name for j in enabled}
         assert names == {"Enabled 1", "Enabled 2"}
 
-    def test_returns_empty_when_all_disabled(
-        self, session: Session, sample_user: User
-    ):
+    def test_returns_empty_when_all_disabled(self, session: Session, sample_user: User):
         repo = ScheduledJobRepository(session)
         repo.create(
             {
@@ -924,7 +877,7 @@ class TestScheduledJobRepositoryUpdateLastRun:
 
     def test_update_last_run_nonexistent_returns_none(self, session: Session):
         repo = ScheduledJobRepository(session)
-        assert repo.update_last_run(99999, datetime.now(timezone.utc)) is None
+        assert repo.update_last_run(99999, datetime.now(UTC)) is None
 
     def test_update_last_run_overwrites(self, session: Session, sample_user: User):
         repo = ScheduledJobRepository(session)
@@ -953,9 +906,7 @@ class TestScheduledJobRepositoryUpdateLastRun:
 class TestCrossRepositoryIntegration:
     """Tests that span multiple repositories working together."""
 
-    def test_track_upsert_then_audio_features(
-        self, session: Session
-    ):
+    def test_track_upsert_then_audio_features(self, session: Session):
         """Upsert a track, then add audio features for it."""
         track_repo = TrackRepository(session)
         af_repo = AudioFeaturesRepository(session)
@@ -978,9 +929,7 @@ class TestCrossRepositoryIntegration:
         assert result is not None
         assert result.danceability == 0.65
 
-    def test_playlist_sync_with_upserted_tracks(
-        self, session: Session, sample_user: User
-    ):
+    def test_playlist_sync_with_upserted_tracks(self, session: Session, sample_user: User):
         """Create tracks, create a playlist, sync them together."""
         track_repo = TrackRepository(session)
         playlist_repo = PlaylistRepository(session)
@@ -1007,18 +956,13 @@ class TestCrossRepositoryIntegration:
         assert playlist_repo.needs_sync(playlist.id, "snap_synced") is False
         assert playlist_repo.needs_sync(playlist.id, "snap_other") is True
 
-    def test_get_missing_audio_features_for_tracks(
-        self, session: Session
-    ):
+    def test_get_missing_audio_features_for_tracks(self, session: Session):
         """Upsert several tracks, add features for some, check missing."""
         track_repo = TrackRepository(session)
         af_repo = AudioFeaturesRepository(session)
 
         tracks = track_repo.upsert_many(
-            [
-                {"spotify_id": f"miss_{i}", "name": f"Track {i}", "duration_ms": 0}
-                for i in range(5)
-            ]
+            [{"spotify_id": f"miss_{i}", "name": f"Track {i}", "duration_ms": 0} for i in range(5)]
         )
         track_ids = [t.id for t in tracks]
 

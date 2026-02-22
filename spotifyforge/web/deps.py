@@ -7,14 +7,14 @@ can import them without circular-import issues.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from spotifyforge.auth.oauth import SpotifyAuth, AuthenticationError
+from spotifyforge.auth.oauth import AuthenticationError, SpotifyAuth
 from spotifyforge.db.engine import _get_async_engine
 from spotifyforge.models.models import User
 from spotifyforge.security import decrypt_token, encrypt_token, hash_token
@@ -48,9 +48,7 @@ async def _refresh_user_token(user: User, db: AsyncSession) -> User:
         Spotify refresh request fails.
     """
     if not user.refresh_token_enc:
-        logger.warning(
-            "User %s has no refresh token; cannot auto-refresh.", user.id
-        )
+        logger.warning("User %s has no refresh token; cannot auto-refresh.", user.id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token expired and no refresh token available. Please re-authenticate.",
@@ -83,8 +81,8 @@ async def _refresh_user_token(user: User, db: AsyncSession) -> User:
     user.token_hash = hash_token(new_token.access_token)
     if new_token.refresh_token:
         user.refresh_token_enc = encrypt_token(new_token.refresh_token)
-    user.token_expiry = datetime.fromtimestamp(new_token.expires_at, tz=timezone.utc)
-    user.updated_at = datetime.now(tz=timezone.utc)
+    user.token_expiry = datetime.fromtimestamp(new_token.expires_at, tz=UTC)
+    user.updated_at = datetime.now(tz=UTC)
 
     db.add(user)
     await db.commit()
@@ -133,16 +131,12 @@ async def get_current_user(
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            result = await db.execute(
-                select(User).where(User.token_hash == hash_token(token))
-            )
+            result = await db.execute(select(User).where(User.token_hash == hash_token(token)))
             user = result.scalars().first()
             if user is not None:
-                if (
-                    user.token_expiry is not None
-                    and user.token_expiry.replace(tzinfo=timezone.utc)
-                    <= datetime.now(tz=timezone.utc)
-                ):
+                if user.token_expiry is not None and user.token_expiry.replace(
+                    tzinfo=UTC
+                ) <= datetime.now(tz=UTC):
                     user = await _refresh_user_token(user, db)
                 return user
 
@@ -163,10 +157,8 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if (
-        user.token_expiry is not None
-        and user.token_expiry.replace(tzinfo=timezone.utc)
-        <= datetime.now(tz=timezone.utc)
+    if user.token_expiry is not None and user.token_expiry.replace(tzinfo=UTC) <= datetime.now(
+        tz=UTC
     ):
         user = await _refresh_user_token(user, db)
 

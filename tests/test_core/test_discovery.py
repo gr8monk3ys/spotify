@@ -14,7 +14,6 @@ import tekore as tk
 
 from spotifyforge.core.discovery import DiscoveryEngine
 
-
 # ---------------------------------------------------------------------------
 # Helpers -- lightweight stand-ins for Tekore response objects
 # ---------------------------------------------------------------------------
@@ -291,9 +290,7 @@ class TestGetRecentlyPlayed:
         assert result == []
 
     async def test_none_items(self, engine, mock_spotify):
-        mock_spotify.playback_recently_played.return_value = SimpleNamespace(
-            items=None, next=None
-        )
+        mock_spotify.playback_recently_played.return_value = SimpleNamespace(items=None, next=None)
 
         result = await engine.get_recently_played()
 
@@ -319,7 +316,11 @@ class TestFindDeepCuts:
     async def test_basic_deep_cuts(self, engine, mock_spotify):
         """Tracks below the threshold are returned, sorted by popularity ascending."""
         albums = [_make_album("alb1")]
-        album_tracks = [_make_simple_track("t1"), _make_simple_track("t2"), _make_simple_track("t3")]
+        album_tracks = [
+            _make_simple_track("t1"),
+            _make_simple_track("t2"),
+            _make_simple_track("t3"),
+        ]
 
         # Artist albums: single page, no next
         mock_spotify.artist_albums.return_value = _make_paging(albums, next_url=None)
@@ -328,9 +329,9 @@ class TestFindDeepCuts:
 
         # Full tracks: popularity varies
         full_tracks = [
-            _make_track("t1", popularity=10),   # deep cut
-            _make_track("t2", popularity=50),   # NOT deep cut
-            _make_track("t3", popularity=20),   # deep cut
+            _make_track("t1", popularity=10),  # deep cut
+            _make_track("t2", popularity=50),  # NOT deep cut
+            _make_track("t3", popularity=20),  # deep cut
         ]
         mock_spotify.tracks.return_value = full_tracks
 
@@ -399,8 +400,8 @@ class TestFindDeepCuts:
 
         mock_spotify.artist_albums.return_value = page1
         mock_spotify.next.side_effect = [
-            page2,          # album pagination result
-            None,           # extra safety
+            page2,  # album pagination result
+            None,  # extra safety
         ]
 
         # Each album has one track.
@@ -501,9 +502,7 @@ class TestFindDeepCuts:
 
         def _album_tracks_side_effect(album_id, limit=50):
             if album_id == "alb_bad":
-                raise tk.HTTPError(
-                    "server error", request=MagicMock(), response=MagicMock()
-                )
+                raise tk.HTTPError("server error", request=MagicMock(), response=MagicMock())
             return _make_paging([_make_simple_track("t1")], next_url=None)
 
         mock_spotify.album_tracks.side_effect = _album_tracks_side_effect
@@ -570,9 +569,7 @@ class TestSearchTracks:
         result = await engine.search_tracks("indie rock")
 
         assert len(result) == 1
-        mock_spotify.search.assert_awaited_once_with(
-            "indie rock", types=("track",), limit=50
-        )
+        mock_spotify.search.assert_awaited_once_with("indie rock", types=("track",), limit=50)
 
     async def test_search_with_year_filter(self, engine, mock_spotify):
         tracks_paging = _make_paging([_make_track("t1")])
@@ -580,9 +577,7 @@ class TestSearchTracks:
 
         await engine.search_tracks("rock", filters={"year": "2020"})
 
-        mock_spotify.search.assert_awaited_once_with(
-            "rock year:2020", types=("track",), limit=50
-        )
+        mock_spotify.search.assert_awaited_once_with("rock year:2020", types=("track",), limit=50)
 
     async def test_search_with_genre_filter(self, engine, mock_spotify):
         tracks_paging = _make_paging([_make_track("t1")])
@@ -647,9 +642,7 @@ class TestSearchTracks:
 
         await engine.search_tracks("test", limit=10)
 
-        mock_spotify.search.assert_awaited_once_with(
-            "test", types=("track",), limit=10
-        )
+        mock_spotify.search.assert_awaited_once_with("test", types=("track",), limit=10)
 
     async def test_search_limit_clamped_high(self, engine, mock_spotify):
         tracks_paging = _make_paging([])
@@ -657,9 +650,7 @@ class TestSearchTracks:
 
         await engine.search_tracks("test", limit=999)
 
-        mock_spotify.search.assert_awaited_once_with(
-            "test", types=("track",), limit=50
-        )
+        mock_spotify.search.assert_awaited_once_with("test", types=("track",), limit=50)
 
     async def test_search_limit_clamped_low(self, engine, mock_spotify):
         tracks_paging = _make_paging([])
@@ -667,9 +658,7 @@ class TestSearchTracks:
 
         await engine.search_tracks("test", limit=-1)
 
-        mock_spotify.search.assert_awaited_once_with(
-            "test", types=("track",), limit=1
-        )
+        mock_spotify.search.assert_awaited_once_with("test", types=("track",), limit=1)
 
     async def test_search_empty_results(self, engine, mock_spotify):
         tracks_paging = _make_paging([])
@@ -702,9 +691,7 @@ class TestSearchTracks:
 
         await engine.search_tracks("hello", filters=None)
 
-        mock_spotify.search.assert_awaited_once_with(
-            "hello", types=("track",), limit=50
-        )
+        mock_spotify.search.assert_awaited_once_with("hello", types=("track",), limit=50)
 
     async def test_search_empty_filters(self, engine, mock_spotify):
         """An empty filters dict should use the raw query unchanged."""
@@ -713,9 +700,7 @@ class TestSearchTracks:
 
         await engine.search_tracks("hello", filters={})
 
-        mock_spotify.search.assert_awaited_once_with(
-            "hello", types=("track",), limit=50
-        )
+        mock_spotify.search.assert_awaited_once_with("hello", types=("track",), limit=50)
 
 
 # ===================================================================
@@ -739,9 +724,7 @@ class TestBuildGenrePlaylist:
         call_query = mock_spotify.search.call_args.args[0]
         assert "jazz" in call_query
         assert "genre:jazz" in call_query
-        mock_spotify.search.assert_awaited_once_with(
-            "jazz genre:jazz", types=("track",), limit=20
-        )
+        mock_spotify.search.assert_awaited_once_with("jazz genre:jazz", types=("track",), limit=20)
 
     async def test_genre_playlist_default_limit(self, engine, mock_spotify):
         tracks_paging = _make_paging([])
@@ -833,7 +816,7 @@ class TestBuildMoodPlaylist:
             genre_seeds=["pop"],
             limit=20,
             target_valence=0.75,  # (0.6+0.9)/2
-            target_energy=0.65,   # (0.5+0.8)/2
+            target_energy=0.65,  # (0.5+0.8)/2
             min_valence=0.6,
             max_valence=0.9,
             min_energy=0.5,

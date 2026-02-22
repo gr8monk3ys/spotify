@@ -10,33 +10,32 @@ import pytest
 from pydantic import ValidationError
 
 from spotifyforge.models.models import (
-    # Enums
-    AudioFeaturesSource,
-    JobType,
-    RuleType,
     # Table models
     Album,
     Artist,
     AudioFeatures,
-    CurationRule,
-    Playlist,
-    PlaylistTrack,
-    PlaylistTrackLink,
-    ScheduledJob,
-    Track,
-    User,
     # Pydantic schemas
     AudioFeaturesResponse,
+    # Enums
+    AudioFeaturesSource,
+    CurationRule,
     CurationRuleCreate,
     CurationRuleResponse,
+    JobType,
+    Playlist,
     PlaylistCreate,
     PlaylistResponse,
+    PlaylistTrack,
+    PlaylistTrackLink,
     PlaylistUpdate,
+    RuleType,
+    ScheduledJob,
     ScheduledJobCreate,
     ScheduledJobResponse,
+    Track,
     TrackResponse,
+    User,
 )
-
 
 # ============================================================================
 # Enum tests
@@ -46,7 +45,7 @@ from spotifyforge.models.models import (
 class TestAudioFeaturesSourceEnum:
     """AudioFeaturesSource should expose exactly three members."""
 
-    def test_members(self):
+    def test_members(self) -> None:
         assert set(AudioFeaturesSource) == {
             AudioFeaturesSource.spotify,
             AudioFeaturesSource.soundnet,
@@ -61,11 +60,11 @@ class TestAudioFeaturesSourceEnum:
             (AudioFeaturesSource.cyanite, "cyanite"),
         ],
     )
-    def test_string_values(self, member, value):
+    def test_string_values(self, member, value) -> None:
         assert member.value == value
         assert str(member) == value
 
-    def test_is_str_enum(self):
+    def test_is_str_enum(self) -> None:
         for member in AudioFeaturesSource:
             assert isinstance(member, str)
 
@@ -82,10 +81,10 @@ class TestJobTypeEnum:
         "health_check",
     }
 
-    def test_member_count(self):
+    def test_member_count(self) -> None:
         assert len(JobType) == 6
 
-    def test_member_values(self):
+    def test_member_values(self) -> None:
         assert {m.value for m in JobType} == self.EXPECTED
 
     @pytest.mark.parametrize(
@@ -99,7 +98,7 @@ class TestJobTypeEnum:
             "health_check",
         ],
     )
-    def test_lookup_by_value(self, name):
+    def test_lookup_by_value(self, name) -> None:
         assert JobType(name) is not None
 
 
@@ -116,10 +115,10 @@ class TestRuleTypeEnum:
         "replace_tracks",
     }
 
-    def test_member_count(self):
+    def test_member_count(self) -> None:
         assert len(RuleType) == 7
 
-    def test_member_values(self):
+    def test_member_values(self) -> None:
         assert {m.value for m in RuleType} == self.EXPECTED
 
     @pytest.mark.parametrize(
@@ -134,7 +133,7 @@ class TestRuleTypeEnum:
             "replace_tracks",
         ],
     )
-    def test_lookup_by_value(self, name):
+    def test_lookup_by_value(self, name) -> None:
         assert RuleType(name) is not None
 
 
@@ -146,20 +145,20 @@ class TestRuleTypeEnum:
 class TestUserModel:
     """User model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         user = User(spotify_id="user123")
         assert user.spotify_id == "user123"
         assert user.id is None
         assert user.display_name is None
         assert user.email is None
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         user = User(spotify_id="u1")
         assert user.is_premium is False
         assert isinstance(user.created_at, datetime)
         assert isinstance(user.updated_at, datetime)
 
-    def test_all_fields(self):
+    def test_all_fields(self) -> None:
         now = datetime(2025, 1, 1)
         user = User(
             spotify_id="u2",
@@ -181,13 +180,13 @@ class TestUserModel:
 class TestTrackModel:
     """Track model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         track = Track(spotify_id="track1", name="Song A")
         assert track.spotify_id == "track1"
         assert track.name == "Song A"
         assert track.id is None
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         track = Track(spotify_id="t1", name="X")
         assert track.duration_ms == 0
         assert track.popularity is None
@@ -197,7 +196,7 @@ class TestTrackModel:
         assert track.isrc is None
         assert isinstance(track.cached_at, datetime)
 
-    def test_json_field_artist_names(self):
+    def test_json_field_artist_names(self) -> None:
         track = Track(
             spotify_id="t2",
             name="Y",
@@ -205,7 +204,7 @@ class TestTrackModel:
         )
         assert track.artist_names == ["Artist A", "Artist B"]
 
-    def test_all_fields(self):
+    def test_all_fields(self) -> None:
         track = Track(
             spotify_id="t3",
             name="Z",
@@ -224,19 +223,19 @@ class TestTrackModel:
 class TestArtistModel:
     """Artist model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         artist = Artist(spotify_id="art1", name="Radiohead")
         assert artist.spotify_id == "art1"
         assert artist.name == "Radiohead"
         assert artist.id is None
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         artist = Artist(spotify_id="a1", name="A")
         assert artist.genres is None
         assert artist.popularity is None
         assert isinstance(artist.cached_at, datetime)
 
-    def test_json_field_genres(self):
+    def test_json_field_genres(self) -> None:
         artist = Artist(
             spotify_id="a2",
             name="B",
@@ -248,19 +247,19 @@ class TestArtistModel:
 class TestAlbumModel:
     """Album model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         album = Album(spotify_id="alb1", name="OK Computer")
         assert album.spotify_id == "alb1"
         assert album.name == "OK Computer"
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         album = Album(spotify_id="al1", name="Al")
         assert album.artist_ids is None
         assert album.release_date is None
         assert album.total_tracks is None
         assert isinstance(album.cached_at, datetime)
 
-    def test_json_field_artist_ids(self):
+    def test_json_field_artist_ids(self) -> None:
         album = Album(
             spotify_id="al2",
             name="Al2",
@@ -272,7 +271,7 @@ class TestAlbumModel:
 class TestAudioFeaturesModel:
     """AudioFeatures model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         af = AudioFeatures(
             track_id=1,
             source=AudioFeaturesSource.spotify,
@@ -280,7 +279,7 @@ class TestAudioFeaturesModel:
         assert af.track_id == 1
         assert af.source == AudioFeaturesSource.spotify
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         af = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify)
         assert af.danceability is None
         assert af.energy is None
@@ -295,7 +294,7 @@ class TestAudioFeaturesModel:
         assert af.liveness is None
         assert isinstance(af.cached_at, datetime)
 
-    def test_all_fields(self):
+    def test_all_fields(self) -> None:
         af = AudioFeatures(
             track_id=1,
             source=AudioFeaturesSource.cyanite,
@@ -321,13 +320,13 @@ class TestAudioFeaturesModel:
 class TestPlaylistModel:
     """Playlist model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         pl = Playlist(spotify_id="pl1", owner_id=1, name="My Mix")
         assert pl.spotify_id == "pl1"
         assert pl.owner_id == 1
         assert pl.name == "My Mix"
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         pl = Playlist(spotify_id="pl1", owner_id=1, name="X")
         assert pl.public is True
         assert pl.collaborative is False
@@ -342,21 +341,21 @@ class TestPlaylistModel:
 class TestPlaylistTrackModel:
     """PlaylistTrack / PlaylistTrackLink model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         pt = PlaylistTrack(playlist_id=1, track_id=1)
         assert pt.playlist_id == 1
         assert pt.track_id == 1
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         pt = PlaylistTrack(playlist_id=1, track_id=1)
         assert pt.position == 0
         assert pt.added_at is None
         assert pt.added_by is None
 
-    def test_alias_is_same_class(self):
+    def test_alias_is_same_class(self) -> None:
         assert PlaylistTrackLink is PlaylistTrack
 
-    def test_with_position(self):
+    def test_with_position(self) -> None:
         pt = PlaylistTrack(playlist_id=1, track_id=5, position=3)
         assert pt.position == 3
 
@@ -364,7 +363,7 @@ class TestPlaylistTrackModel:
 class TestScheduledJobModel:
     """ScheduledJob model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         job = ScheduledJob(
             user_id=1,
             name="Nightly sync",
@@ -375,7 +374,7 @@ class TestScheduledJobModel:
         assert job.name == "Nightly sync"
         assert job.job_type == JobType.playlist_sync
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         job = ScheduledJob(
             user_id=1,
             name="J",
@@ -390,7 +389,7 @@ class TestScheduledJobModel:
         assert isinstance(job.created_at, datetime)
         assert isinstance(job.updated_at, datetime)
 
-    def test_json_field_config(self):
+    def test_json_field_config(self) -> None:
         job = ScheduledJob(
             user_id=1,
             name="Configured",
@@ -404,7 +403,7 @@ class TestScheduledJobModel:
 class TestCurationRuleModel:
     """CurationRule model instantiation and defaults."""
 
-    def test_create_minimal(self):
+    def test_create_minimal(self) -> None:
         rule = CurationRule(
             user_id=1,
             name="Dedup",
@@ -413,7 +412,7 @@ class TestCurationRuleModel:
         assert rule.name == "Dedup"
         assert rule.rule_type == RuleType.deduplicate
 
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         rule = CurationRule(
             user_id=1,
             name="R",
@@ -427,7 +426,7 @@ class TestCurationRuleModel:
         assert isinstance(rule.created_at, datetime)
         assert isinstance(rule.updated_at, datetime)
 
-    def test_json_fields(self):
+    def test_json_fields(self) -> None:
         rule = CurationRule(
             user_id=1,
             name="Energy filter",
@@ -447,14 +446,14 @@ class TestCurationRuleModel:
 class TestPlaylistCreateSchema:
     """PlaylistCreate request schema."""
 
-    def test_valid_minimal(self):
+    def test_valid_minimal(self) -> None:
         pc = PlaylistCreate(name="My Playlist")
         assert pc.name == "My Playlist"
         assert pc.description is None
         assert pc.public is True
         assert pc.collaborative is False
 
-    def test_valid_full(self):
+    def test_valid_full(self) -> None:
         pc = PlaylistCreate(
             name="Chill Vibes",
             description="Relaxing tracks for study sessions",
@@ -466,25 +465,25 @@ class TestPlaylistCreateSchema:
         assert pc.public is False
         assert pc.collaborative is True
 
-    def test_rejects_empty_name(self):
+    def test_rejects_empty_name(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
             PlaylistCreate(name="")
         errors = exc_info.value.errors()
         assert any(e["type"] == "string_too_short" for e in errors)
 
-    def test_rejects_missing_name(self):
+    def test_rejects_missing_name(self) -> None:
         with pytest.raises(ValidationError):
             PlaylistCreate()  # type: ignore[call-arg]
 
-    def test_rejects_name_too_long(self):
+    def test_rejects_name_too_long(self) -> None:
         with pytest.raises(ValidationError):
             PlaylistCreate(name="x" * 513)
 
-    def test_rejects_description_too_long(self):
+    def test_rejects_description_too_long(self) -> None:
         with pytest.raises(ValidationError):
             PlaylistCreate(name="ok", description="x" * 2001)
 
-    def test_strict_mode_rejects_int_for_name(self):
+    def test_strict_mode_rejects_int_for_name(self) -> None:
         """strict=True should reject non-string for name."""
         with pytest.raises(ValidationError):
             PlaylistCreate(name=123)  # type: ignore[arg-type]
@@ -493,24 +492,24 @@ class TestPlaylistCreateSchema:
 class TestPlaylistUpdateSchema:
     """PlaylistUpdate allows partial updates -- all fields optional."""
 
-    def test_empty_update(self):
+    def test_empty_update(self) -> None:
         pu = PlaylistUpdate()
         assert pu.name is None
         assert pu.description is None
         assert pu.public is None
         assert pu.collaborative is None
 
-    def test_partial_name_only(self):
+    def test_partial_name_only(self) -> None:
         pu = PlaylistUpdate(name="New Name")
         assert pu.name == "New Name"
         assert pu.public is None
 
-    def test_partial_public_only(self):
+    def test_partial_public_only(self) -> None:
         pu = PlaylistUpdate(public=False)
         assert pu.public is False
         assert pu.name is None
 
-    def test_all_fields(self):
+    def test_all_fields(self) -> None:
         pu = PlaylistUpdate(
             name="Updated",
             description="New desc",
@@ -522,11 +521,11 @@ class TestPlaylistUpdateSchema:
         assert pu.public is True
         assert pu.collaborative is True
 
-    def test_rejects_empty_name_when_provided(self):
+    def test_rejects_empty_name_when_provided(self) -> None:
         with pytest.raises(ValidationError):
             PlaylistUpdate(name="")
 
-    def test_model_dump_excludes_unset(self):
+    def test_model_dump_excludes_unset(self) -> None:
         pu = PlaylistUpdate(name="Only Name")
         dumped = pu.model_dump(exclude_unset=True)
         assert "name" in dumped
@@ -537,7 +536,7 @@ class TestPlaylistUpdateSchema:
 class TestScheduledJobCreateSchema:
     """ScheduledJobCreate request schema."""
 
-    def test_valid(self):
+    def test_valid(self) -> None:
         sj = ScheduledJobCreate(
             name="Daily sync",
             job_type=JobType.playlist_sync,
@@ -550,7 +549,7 @@ class TestScheduledJobCreateSchema:
         assert sj.playlist_id is None
         assert sj.config is None
 
-    def test_rejects_empty_name(self):
+    def test_rejects_empty_name(self) -> None:
         with pytest.raises(ValidationError):
             ScheduledJobCreate(
                 name="",
@@ -558,7 +557,7 @@ class TestScheduledJobCreateSchema:
                 cron_expression="* * * * *",
             )
 
-    def test_rejects_empty_cron(self):
+    def test_rejects_empty_cron(self) -> None:
         with pytest.raises(ValidationError):
             ScheduledJobCreate(
                 name="Job",
@@ -566,7 +565,7 @@ class TestScheduledJobCreateSchema:
                 cron_expression="",
             )
 
-    def test_with_config(self):
+    def test_with_config(self) -> None:
         sj = ScheduledJobCreate(
             name="Discovery",
             job_type=JobType.discovery_refresh,
@@ -579,7 +578,7 @@ class TestScheduledJobCreateSchema:
 class TestCurationRuleCreateSchema:
     """CurationRuleCreate request schema."""
 
-    def test_valid(self):
+    def test_valid(self) -> None:
         cr = CurationRuleCreate(
             name="Remove dupes",
             rule_type=RuleType.deduplicate,
@@ -589,11 +588,11 @@ class TestCurationRuleCreateSchema:
         assert cr.enabled is True
         assert cr.priority == 0
 
-    def test_rejects_empty_name(self):
+    def test_rejects_empty_name(self) -> None:
         with pytest.raises(ValidationError):
             CurationRuleCreate(name="", rule_type=RuleType.sort)
 
-    def test_with_conditions_and_actions(self):
+    def test_with_conditions_and_actions(self) -> None:
         cr = CurationRuleCreate(
             name="Filter low energy",
             rule_type=RuleType.filter,
@@ -614,7 +613,7 @@ class TestCurationRuleCreateSchema:
 class TestPlaylistResponseSchema:
     """PlaylistResponse should be constructable from a Playlist ORM object."""
 
-    def test_from_orm_object(self):
+    def test_from_orm_object(self) -> None:
         now = datetime(2025, 6, 1, 12, 0, 0)
         pl = Playlist(
             id=1,
@@ -645,7 +644,7 @@ class TestPlaylistResponseSchema:
         assert resp.last_synced_at == now
         assert resp.created_at == now
 
-    def test_nullable_fields(self):
+    def test_nullable_fields(self) -> None:
         now = datetime.utcnow()
         pl = Playlist(
             id=2,
@@ -668,7 +667,7 @@ class TestPlaylistResponseSchema:
 class TestTrackResponseSchema:
     """TrackResponse should be constructable from a Track ORM object."""
 
-    def test_from_orm_object(self):
+    def test_from_orm_object(self) -> None:
         now = datetime(2025, 3, 15, 8, 30, 0)
         track = Track(
             id=10,
@@ -693,7 +692,7 @@ class TestTrackResponseSchema:
         assert resp.isrc == "GBUM71029604"
         assert resp.cached_at == now
 
-    def test_json_field_multiple_artists(self):
+    def test_json_field_multiple_artists(self) -> None:
         now = datetime.utcnow()
         track = Track(
             id=11,
@@ -706,7 +705,7 @@ class TestTrackResponseSchema:
         resp = TrackResponse.model_validate(track)
         assert resp.artist_names == ["Artist A", "Artist B", "Artist C"]
 
-    def test_nullable_fields(self):
+    def test_nullable_fields(self) -> None:
         now = datetime.utcnow()
         track = Track(
             id=12,
@@ -726,7 +725,7 @@ class TestTrackResponseSchema:
 class TestAudioFeaturesResponseSchema:
     """AudioFeaturesResponse from_attributes round-trip."""
 
-    def test_from_orm_object(self):
+    def test_from_orm_object(self) -> None:
         now = datetime(2025, 5, 1)
         af = AudioFeatures(
             id=1,
@@ -755,7 +754,7 @@ class TestAudioFeaturesResponseSchema:
         assert resp.key == 7
         assert resp.cached_at == now
 
-    def test_nullable_feature_fields(self):
+    def test_nullable_feature_fields(self) -> None:
         now = datetime.utcnow()
         af = AudioFeatures(
             id=2,
@@ -773,7 +772,7 @@ class TestAudioFeaturesResponseSchema:
 class TestScheduledJobResponseSchema:
     """ScheduledJobResponse from_attributes round-trip."""
 
-    def test_from_orm_object(self):
+    def test_from_orm_object(self) -> None:
         now = datetime(2025, 7, 1)
         job = ScheduledJob(
             id=5,
@@ -798,7 +797,7 @@ class TestScheduledJobResponseSchema:
         assert resp.cron_expression == "0 0 * * *"
         assert resp.enabled is True
 
-    def test_nullable_fields(self):
+    def test_nullable_fields(self) -> None:
         now = datetime.utcnow()
         job = ScheduledJob(
             id=6,
@@ -819,7 +818,7 @@ class TestScheduledJobResponseSchema:
 class TestCurationRuleResponseSchema:
     """CurationRuleResponse from_attributes round-trip."""
 
-    def test_from_orm_object(self):
+    def test_from_orm_object(self) -> None:
         now = datetime(2025, 4, 1)
         rule = CurationRule(
             id=3,
@@ -844,7 +843,7 @@ class TestCurationRuleResponseSchema:
         assert resp.actions == {"boost": True}
         assert resp.priority == 5
 
-    def test_nullable_fields(self):
+    def test_nullable_fields(self) -> None:
         now = datetime.utcnow()
         rule = CurationRule(
             id=4,
@@ -880,58 +879,42 @@ class TestAudioFeaturesFieldBounds:
             "liveness",
         ],
     )
-    def test_zero_to_one_fields_accept_boundaries(self, field):
+    def test_zero_to_one_fields_accept_boundaries(self, field) -> None:
         """Fields bounded [0.0, 1.0] should accept both endpoints."""
-        af_low = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, **{field: 0.0}
-        )
+        af_low = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, **{field: 0.0})
         assert getattr(af_low, field) == 0.0
 
-        af_high = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, **{field: 1.0}
-        )
+        af_high = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, **{field: 1.0})
         assert getattr(af_high, field) == 1.0
 
-    def test_key_boundaries(self):
-        af = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, key=-1
-        )
+    def test_key_boundaries(self) -> None:
+        af = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, key=-1)
         assert af.key == -1
-        af2 = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, key=11
-        )
+        af2 = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, key=11)
         assert af2.key == 11
 
-    def test_mode_boundaries(self):
-        af0 = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, mode=0
-        )
+    def test_mode_boundaries(self) -> None:
+        af0 = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, mode=0)
         assert af0.mode == 0
-        af1 = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, mode=1
-        )
+        af1 = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, mode=1)
         assert af1.mode == 1
 
-    def test_tempo_non_negative(self):
-        af = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, tempo=0.0
-        )
+    def test_tempo_non_negative(self) -> None:
+        af = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, tempo=0.0)
         assert af.tempo == 0.0
-        af2 = AudioFeatures(
-            track_id=1, source=AudioFeaturesSource.spotify, tempo=300.0
-        )
+        af2 = AudioFeatures(track_id=1, source=AudioFeaturesSource.spotify, tempo=300.0)
         assert af2.tempo == 300.0
 
 
 class TestPlaylistCreateStrictMode:
     """PlaylistCreate uses ConfigDict(strict=True)."""
 
-    def test_rejects_int_for_bool_public(self):
+    def test_rejects_int_for_bool_public(self) -> None:
         """strict mode should reject 1 for a bool field."""
         with pytest.raises(ValidationError):
             PlaylistCreate(name="test", public=1)  # type: ignore[arg-type]
 
-    def test_rejects_int_for_bool_collaborative(self):
+    def test_rejects_int_for_bool_collaborative(self) -> None:
         with pytest.raises(ValidationError):
             PlaylistCreate(name="test", collaborative=1)  # type: ignore[arg-type]
 
@@ -939,7 +922,7 @@ class TestPlaylistCreateStrictMode:
 class TestPlaylistUpdateStrictMode:
     """PlaylistUpdate uses ConfigDict(strict=True)."""
 
-    def test_rejects_int_for_bool_public(self):
+    def test_rejects_int_for_bool_public(self) -> None:
         with pytest.raises(ValidationError):
             PlaylistUpdate(public=1)  # type: ignore[arg-type]
 
@@ -948,19 +931,19 @@ class TestJsonFieldSerialization:
     """JSON fields (genres, artist_names, config, conditions, actions) can hold
     various JSON-compatible structures."""
 
-    def test_track_artist_names_empty_list(self):
+    def test_track_artist_names_empty_list(self) -> None:
         track = Track(spotify_id="t_empty", name="Empty Artists", artist_names=[])
         assert track.artist_names == []
 
-    def test_artist_genres_empty_list(self):
+    def test_artist_genres_empty_list(self) -> None:
         artist = Artist(spotify_id="a_empty", name="No Genre", genres=[])
         assert artist.genres == []
 
-    def test_album_artist_ids_single(self):
+    def test_album_artist_ids_single(self) -> None:
         album = Album(spotify_id="al_single", name="Solo", artist_ids=["one"])
         assert album.artist_ids == ["one"]
 
-    def test_scheduled_job_nested_config(self):
+    def test_scheduled_job_nested_config(self) -> None:
         job = ScheduledJob(
             user_id=1,
             name="Nested",
@@ -974,7 +957,7 @@ class TestJsonFieldSerialization:
         assert job.config["metrics"] == ["plays", "saves"]
         assert job.config["filters"]["genre"] == "jazz"
 
-    def test_curation_rule_complex_conditions(self):
+    def test_curation_rule_complex_conditions(self) -> None:
         rule = CurationRule(
             user_id=1,
             name="Complex",

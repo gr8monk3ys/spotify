@@ -1,4 +1,5 @@
 """Cryptographic utilities for SpotifyForge."""
+
 from __future__ import annotations
 
 import base64
@@ -19,15 +20,12 @@ def _get_fernet() -> Fernet:
     Derives a Fernet key from SPOTIFYFORGE_SECRET_KEY.
     If no key is set, falls back to a deterministic key (dev only).
     """
-    secret = getattr(settings, "secret_key", "") or os.environ.get(
-        "SPOTIFYFORGE_SECRET_KEY", ""
-    )
+    secret = getattr(settings, "secret_key", "") or os.environ.get("SPOTIFYFORGE_SECRET_KEY", "")
     if not secret:
         if getattr(settings, "environment", "development") == "production":
             raise RuntimeError("SPOTIFYFORGE_SECRET_KEY must be set in production")
         warnings.warn(
-            "SPOTIFYFORGE_SECRET_KEY not set — using insecure default. "
-            "DO NOT use in production.",
+            "SPOTIFYFORGE_SECRET_KEY not set — using insecure default. DO NOT use in production.",
             stacklevel=2,
         )
         secret = "insecure-dev-default-key-do-not-use-in-production"

@@ -13,7 +13,7 @@ Each router is included by :func:`spotifyforge.web.app.create_app`.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -42,7 +42,6 @@ logger = logging.getLogger("spotifyforge.web.routes")
 # circular imports with app.py)
 # ---------------------------------------------------------------------------
 from spotifyforge.web.deps import get_current_user, get_db_session
-
 
 # =========================================================================
 # Auth Router
@@ -104,9 +103,7 @@ async def auth_callback(
     session_gen = get_db_session()
     db: AsyncSession = await session_gen.__anext__()
     try:
-        result = await db.execute(
-            select(User).where(User.spotify_id == spotify_user["id"])
-        )
+        result = await db.execute(select(User).where(User.spotify_id == spotify_user["id"]))
         user = result.scalars().first()
 
         if user is None:
@@ -115,21 +112,33 @@ async def auth_callback(
                 display_name=spotify_user.get("display_name"),
                 email=spotify_user.get("email"),
                 access_token_enc=encrypt_token(token_info["access_token"]),
-                refresh_token_enc=encrypt_token(token_info["refresh_token"]) if token_info.get("refresh_token") else None,
-                token_expiry=datetime.fromtimestamp(token_info["expires_at"], tz=timezone.utc) if token_info.get("expires_at") else None,
+                refresh_token_enc=encrypt_token(token_info["refresh_token"])
+                if token_info.get("refresh_token")
+                else None,
+                token_expiry=datetime.fromtimestamp(token_info["expires_at"], tz=UTC)
+                if token_info.get("expires_at")
+                else None,
                 token_hash=hash_token(token_info["access_token"]),
                 is_premium=spotify_user.get("product") == "premium",
             )
             db.add(user)
         else:
             user.access_token_enc = encrypt_token(token_info["access_token"])
-            user.refresh_token_enc = encrypt_token(token_info["refresh_token"]) if token_info.get("refresh_token") else user.refresh_token_enc
-            user.token_expiry = datetime.fromtimestamp(token_info["expires_at"], tz=timezone.utc) if token_info.get("expires_at") else None
+            user.refresh_token_enc = (
+                encrypt_token(token_info["refresh_token"])
+                if token_info.get("refresh_token")
+                else user.refresh_token_enc
+            )
+            user.token_expiry = (
+                datetime.fromtimestamp(token_info["expires_at"], tz=UTC)
+                if token_info.get("expires_at")
+                else None
+            )
             user.token_hash = hash_token(token_info["access_token"])
             user.display_name = spotify_user.get("display_name", user.display_name)
             user.email = spotify_user.get("email", user.email)
             user.is_premium = spotify_user.get("product") == "premium"
-            user.updated_at = datetime.now(timezone.utc)
+            user.updated_at = datetime.now(UTC)
             db.add(user)
 
         await db.commit()
@@ -324,7 +333,7 @@ async def update_playlist(
     for field, value in update_data.items():
         setattr(playlist, field, value)
 
-    playlist.updated_at = datetime.now(timezone.utc)
+    playlist.updated_at = datetime.now(UTC)
     db.add(playlist)
 
     # Sync changes to Spotify
@@ -386,8 +395,8 @@ async def sync_playlist(
             detail="Failed to sync playlist from Spotify.",
         ) from exc
 
-    playlist.last_synced_at = datetime.now(timezone.utc)
-    playlist.updated_at = datetime.now(timezone.utc)
+    playlist.last_synced_at = datetime.now(UTC)
+    playlist.updated_at = datetime.now(UTC)
     db.add(playlist)
     await db.commit()
 
@@ -910,7 +919,7 @@ async def toggle_schedule(
         )
 
     job.enabled = not job.enabled
-    job.updated_at = datetime.now(timezone.utc)
+    job.updated_at = datetime.now(UTC)
     db.add(job)
     await db.commit()
     await db.refresh(job)

@@ -20,7 +20,10 @@ from cryptography.fernet import Fernet
 from cryptography.fernet import InvalidToken as FernetInvalidToken
 
 from spotifyforge.config import Settings
-from spotifyforge.security import encrypt_token, decrypt_token, generate_csrf_state, verify_csrf_state
+from spotifyforge.security import (
+    generate_csrf_state,
+    verify_csrf_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,9 +165,7 @@ class KeyringTokenStore(TokenStore):
     def load_token(self, user_id: str) -> tekore.Token:
         raw = self._keyring.get_password(self._service, user_id)
         if raw is None:
-            raise TokenNotFoundError(
-                f"No token found in keyring for user '{user_id}'"
-            )
+            raise TokenNotFoundError(f"No token found in keyring for user '{user_id}'")
         data: dict[str, Any] = json.loads(raw)
         return _dict_to_token(data)
 
@@ -173,9 +174,7 @@ class KeyringTokenStore(TokenStore):
             self._keyring.delete_password(self._service, user_id)
             logger.debug("Deleted token for user %s from keyring", user_id)
         except self._keyring.errors.PasswordDeleteError as exc:
-            raise TokenNotFoundError(
-                f"No token found in keyring for user '{user_id}'"
-            ) from exc
+            raise TokenNotFoundError(f"No token found in keyring for user '{user_id}'") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -204,9 +203,7 @@ class DBTokenStore(TokenStore):
         try:
             self._fernet = Fernet(encryption_key)
         except (ValueError, Exception) as exc:
-            raise AuthenticationError(
-                "Invalid Fernet encryption key for DBTokenStore"
-            ) from exc
+            raise AuthenticationError("Invalid Fernet encryption key for DBTokenStore") from exc
         self._storage: dict[str, bytes] = {}
 
     # -- internal persistence hooks (override for real DB) ------------------
@@ -234,24 +231,19 @@ class DBTokenStore(TokenStore):
     def load_token(self, user_id: str) -> tekore.Token:
         encrypted = self._retrieve(user_id)
         if encrypted is None:
-            raise TokenNotFoundError(
-                f"No token found in DB store for user '{user_id}'"
-            )
+            raise TokenNotFoundError(f"No token found in DB store for user '{user_id}'")
         try:
             decrypted = self._fernet.decrypt(encrypted)
         except FernetInvalidToken as exc:
             raise AuthenticationError(
-                f"Failed to decrypt token for user '{user_id}'; "
-                "the encryption key may have changed"
+                f"Failed to decrypt token for user '{user_id}'; the encryption key may have changed"
             ) from exc
         data: dict[str, Any] = json.loads(decrypted)
         return _dict_to_token(data)
 
     def delete_token(self, user_id: str) -> None:
         if not self._remove(user_id):
-            raise TokenNotFoundError(
-                f"No token found in DB store for user '{user_id}'"
-            )
+            raise TokenNotFoundError(f"No token found in DB store for user '{user_id}'")
         logger.debug("Deleted encrypted token for user %s", user_id)
 
 
@@ -425,15 +417,11 @@ class SpotifyAuth:
         """
         try:
             if self._asynchronous:
-                token: tekore.Token = await self._credentials.refresh_user_token(
-                    refresh_token
-                )
+                token: tekore.Token = await self._credentials.refresh_user_token(refresh_token)
             else:
                 token = self._credentials.refresh_user_token(refresh_token)
         except Exception as exc:
-            raise TokenExpiredError(
-                f"Failed to refresh token: {exc}"
-            ) from exc
+            raise TokenExpiredError(f"Failed to refresh token: {exc}") from exc
 
         return tekore.Spotify(token, asynchronous=self._asynchronous)
 
@@ -520,7 +508,11 @@ def build_auth_url(state: str | None = None) -> str:
     return auth.get_auth_url(state=state)
 
 
-async def exchange_code(code: str, state: str | None = None, expected_state: str | None = None) -> dict[str, Any]:
+async def exchange_code(
+    code: str,
+    state: str | None = None,
+    expected_state: str | None = None,
+) -> dict[str, Any]:
     """Exchange an authorization code for token info.
 
     If expected_state is provided, validates the state parameter to prevent CSRF.
@@ -535,9 +527,7 @@ async def exchange_code(code: str, state: str | None = None, expected_state: str
     try:
         token: tekore.Token = await auth.credentials.request_user_token(code)
     except Exception as exc:
-        raise AuthenticationError(
-            f"Failed to exchange authorization code: {exc}"
-        ) from exc
+        raise AuthenticationError(f"Failed to exchange authorization code: {exc}") from exc
 
     return _token_to_dict(token)
 
@@ -553,9 +543,7 @@ async def get_spotify_user(access_token: str) -> dict[str, Any]:
     try:
         user = await client.current_user()
     except Exception as exc:
-        raise AuthenticationError(
-            f"Failed to fetch Spotify user profile: {exc}"
-        ) from exc
+        raise AuthenticationError(f"Failed to fetch Spotify user profile: {exc}") from exc
 
     return {
         "id": user.id,

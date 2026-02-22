@@ -55,9 +55,7 @@ class DiscoveryEngine:
         """
         limit = min(max(limit, 1), 50)
         try:
-            paging = await self._sp.current_user_top_tracks(
-                time_range=time_range, limit=limit
-            )
+            paging = await self._sp.current_user_top_tracks(time_range=time_range, limit=limit)
             return list(paging.items) if paging.items else []
         except tk.HTTPError as exc:
             logger.error("Failed to fetch top tracks (range=%s): %s", time_range, exc)
@@ -83,9 +81,7 @@ class DiscoveryEngine:
         """
         limit = min(max(limit, 1), 50)
         try:
-            paging = await self._sp.current_user_top_artists(
-                time_range=time_range, limit=limit
-            )
+            paging = await self._sp.current_user_top_artists(time_range=time_range, limit=limit)
             return list(paging.items) if paging.items else []
         except tk.HTTPError as exc:
             logger.error("Failed to fetch top artists (range=%s): %s", time_range, exc)
@@ -165,9 +161,7 @@ class DiscoveryEngine:
         for album in albums:
             try:
                 tracks_paging = await self._sp.album_tracks(album.id, limit=50)
-                page_tracks: list[Any] = (
-                    list(tracks_paging.items) if tracks_paging.items else []
-                )
+                page_tracks: list[Any] = list(tracks_paging.items) if tracks_paging.items else []
 
                 while tracks_paging.next is not None:
                     tracks_paging = await self._sp.next(tracks_paging)
@@ -180,9 +174,7 @@ class DiscoveryEngine:
                         all_track_ids.append(t.id)
 
             except tk.HTTPError as exc:
-                logger.warning(
-                    "Skipping album %s due to error: %s", album.id, exc
-                )
+                logger.warning("Skipping album %s due to error: %s", album.id, exc)
                 continue
 
         if not all_track_ids:
@@ -196,9 +188,7 @@ class DiscoveryEngine:
                 batch = await self._sp.tracks(chunk)
                 full_tracks.extend(batch)
             except tk.HTTPError as exc:
-                logger.warning(
-                    "Failed to fetch track batch at offset %d: %s", offset, exc
-                )
+                logger.warning("Failed to fetch track batch at offset %d: %s", offset, exc)
                 continue
 
         # Filter to deep cuts and deduplicate by ID.
@@ -264,9 +254,7 @@ class DiscoveryEngine:
                 enriched_query = f"{query} {' '.join(filter_parts)}"
 
         try:
-            results = await self._sp.search(
-                enriched_query, types=("track",), limit=limit
-            )
+            results = await self._sp.search(enriched_query, types=("track",), limit=limit)
             tracks_paging = results[0]  # First element is the track paging
             return list(tracks_paging.items) if tracks_paging.items else []
         except tk.HTTPError as exc:
@@ -299,9 +287,7 @@ class DiscoveryEngine:
         -------
         A list of Tekore ``FullTrack`` objects matching the genre.
         """
-        return await self.search_tracks(
-            query=genre, filters={"genre": genre}, limit=limit
-        )
+        return await self.search_tracks(query=genre, filters={"genre": genre}, limit=limit)
 
     async def build_mood_playlist(
         self,
@@ -402,9 +388,7 @@ class DiscoveryEngine:
         current top tracks.
         """
         tracks = await self.get_user_top_tracks(time_range=time_range, limit=50)
-        logger.info(
-            "Built time capsule (%s): %d tracks", time_range, len(tracks)
-        )
+        logger.info("Built time capsule (%s): %d tracks", time_range, len(tracks))
         return tracks
 
 
@@ -413,7 +397,7 @@ class DiscoveryEngine:
 # ---------------------------------------------------------------------------
 
 
-def _build_spotify_client(user: Any) -> "Spotify":
+def _build_spotify_client(user: Any) -> Spotify:
     """Create a Tekore async Spotify client from a User model's stored token."""
     return tk.Spotify(user.access_token_enc, asynchronous=True)
 
@@ -431,9 +415,9 @@ def _track_to_dict(track: Any) -> dict[str, Any]:
         "duration_ms": track.duration_ms or 0,
         "popularity": track.popularity,
         "isrc": None,
-        "cached_at": __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc
-        ).isoformat(),
+        "cached_at": __import__("datetime")
+        .datetime.now(__import__("datetime").timezone.utc)
+        .isoformat(),
     }
 
 
@@ -480,9 +464,7 @@ async def get_deep_cuts(
     """Module-level convenience for finding an artist's deep cuts."""
     sp = _build_spotify_client(user)
     engine = DiscoveryEngine(sp)
-    tracks = await engine.find_deep_cuts(
-        artist_id=artist_id, popularity_threshold=threshold
-    )
+    tracks = await engine.find_deep_cuts(artist_id=artist_id, popularity_threshold=threshold)
     return [_track_to_dict(t) for t in tracks]
 
 
@@ -499,7 +481,6 @@ async def create_genre_based_playlist(
     and adds the tracks to it.  Returns the local Playlist DB row.
     """
     from spotifyforge.core.playlist_manager import PlaylistManager
-    from spotifyforge.models.models import Playlist
 
     sp = _build_spotify_client(user)
     engine = DiscoveryEngine(sp)
@@ -530,7 +511,6 @@ async def create_time_capsule_playlist(
     Returns the local Playlist DB row.
     """
     from spotifyforge.core.playlist_manager import PlaylistManager
-    from spotifyforge.models.models import Playlist
 
     sp = _build_spotify_client(user)
     engine = DiscoveryEngine(sp)
@@ -538,7 +518,8 @@ async def create_time_capsule_playlist(
 
     name = playlist_name or "SpotifyForge: Time Capsule"
     if year:
-        name = playlist_name or f"SpotifyForge: Time Capsule ({year}{f'-{month:02d}' if month else ''})"
+        suffix = f"-{month:02d}" if month else ""
+        name = playlist_name or f"SpotifyForge: Time Capsule ({year}{suffix})"
 
     manager = PlaylistManager(sp)
     db_playlist = await manager.create_playlist(name=name, description="Time capsule playlist")

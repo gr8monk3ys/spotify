@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
-from typing import AsyncGenerator, Generator
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlmodel import Session, SQLModel, create_engine
@@ -80,6 +80,7 @@ def _get_async_engine():
 # Table initialisation
 # ---------------------------------------------------------------------------
 
+
 def init_db() -> None:
     """Create all registered SQLModel tables in the configured database.
 
@@ -96,6 +97,7 @@ def init_db() -> None:
 # ---------------------------------------------------------------------------
 # Session helpers
 # ---------------------------------------------------------------------------
+
 
 @contextmanager
 def get_session() -> Generator[Session, None, None]:

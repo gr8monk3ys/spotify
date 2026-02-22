@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+
 from spotifyforge import __version__
 from spotifyforge.config import settings
 from spotifyforge.db.engine import init_db
@@ -83,9 +84,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Reload saved jobs from the database
         try:
             from sqlmodel import Session, select
+
+            from spotifyforge.core.scheduler import register_job
             from spotifyforge.db.engine import get_engine
             from spotifyforge.models.models import ScheduledJob
-            from spotifyforge.core.scheduler import register_job
 
             with Session(get_engine()) as session:
                 jobs = session.exec(
@@ -95,7 +97,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     try:
                         register_job(job)
                     except Exception:
-                        logger.warning("Failed to reload job %s (%s)", job.id, job.name, exc_info=True)
+                        logger.warning(
+                            "Failed to reload job %s (%s)", job.id, job.name, exc_info=True
+                        )
                 logger.info("Reloaded %d scheduled job(s) from database.", len(jobs))
         except Exception:
             logger.warning("Failed to reload scheduled jobs from database.", exc_info=True)
@@ -159,9 +163,7 @@ def create_app() -> FastAPI:
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Content-Security-Policy"] = "default-src 'self'"
         if request.url.scheme == "https":
-            response.headers["Strict-Transport-Security"] = (
-                "max-age=31536000; includeSubDomains"
-            )
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
 
     # ------------------------------------------------------------------
@@ -198,7 +200,8 @@ def create_app() -> FastAPI:
         """
         stale_cutoff = now - (_RATE_WINDOW * 2)
         stale_keys = [
-            ip for ip, timestamps in _rate_limit_store.items()
+            ip
+            for ip, timestamps in _rate_limit_store.items()
             if not timestamps or timestamps[-1] < stale_cutoff
         ]
         for ip in stale_keys:
@@ -221,9 +224,7 @@ def create_app() -> FastAPI:
             _prune_stale_ips(now)
 
         # Clean old entries for the current IP and add the new one
-        _rate_limit_store[client_ip] = [
-            t for t in _rate_limit_store[client_ip] if t > window_start
-        ]
+        _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if t > window_start]
 
         if len(_rate_limit_store[client_ip]) >= _RATE_LIMIT:
             return JSONResponse(
@@ -241,6 +242,7 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
         import time
+
         start = time.perf_counter()
         response = await call_next(request)
         elapsed_ms = (time.perf_counter() - start) * 1000
@@ -285,7 +287,8 @@ def create_app() -> FastAPI:
     @app.get("/dashboard", response_class=HTMLResponse, summary="Dashboard", tags=["oauth"])
     async def dashboard():
         """Simple landing page shown after successful OAuth login."""
-        return HTMLResponse(content="""<!DOCTYPE html>
+        return HTMLResponse(
+            content="""<!DOCTYPE html>
 <html>
 <head><title>SpotifyForge</title>
 <style>
@@ -309,7 +312,8 @@ a { color: #1DB954; }
 <p style="margin-top: 40px; color: #666; font-size: 0.9em;">
 Or use the CLI: <code>spotifyforge playlist list</code>
 </p>
-</body></html>""")
+</body></html>"""
+        )
 
     return app
 
@@ -319,7 +323,6 @@ Or use the CLI: <code>spotifyforge playlist list</code>
 # to avoid circular imports with routes.py; re-exported here for convenience)
 # ---------------------------------------------------------------------------
 from spotifyforge.web.deps import get_current_user, get_db_session  # noqa: F401, E402
-
 
 # ---------------------------------------------------------------------------
 # Convenience: module-level app for ``uvicorn spotifyforge.web.app:app``

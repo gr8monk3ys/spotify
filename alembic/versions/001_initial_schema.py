@@ -4,15 +4,17 @@ Revision ID: 001_initial
 Revises:
 Create Date: 2026-02-16
 """
-from typing import Sequence, Union
-from alembic import op
+
+from collections.abc import Sequence
+
 import sqlalchemy as sa
-import sqlmodel
+
+from alembic import op
 
 revision: str = "001_initial"
-down_revision: Union[str, None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -114,7 +116,9 @@ def upgrade() -> None:
     op.create_table(
         "playlist_tracks",
         sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("playlist_id", sa.Integer(), sa.ForeignKey("playlists.id"), nullable=False, index=True),
+        sa.Column(
+            "playlist_id", sa.Integer(), sa.ForeignKey("playlists.id"), nullable=False, index=True
+        ),
         sa.Column("track_id", sa.Integer(), sa.ForeignKey("tracks.id"), nullable=False, index=True),
         sa.Column("position", sa.Integer(), nullable=False, server_default=sa.text("0")),
         sa.Column("added_at", sa.DateTime(), nullable=True),
@@ -130,7 +134,9 @@ def upgrade() -> None:
         sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id"), nullable=False, index=True),
         sa.Column("name", sa.String(length=256), nullable=False),
         sa.Column("job_type", sa.String(), nullable=False),
-        sa.Column("playlist_id", sa.Integer(), sa.ForeignKey("playlists.id"), nullable=True, index=True),
+        sa.Column(
+            "playlist_id", sa.Integer(), sa.ForeignKey("playlists.id"), nullable=True, index=True
+        ),
         sa.Column("config", sa.JSON(), nullable=True),
         sa.Column("cron_expression", sa.String(length=128), nullable=False),
         sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.text("1"), index=True),
@@ -147,7 +153,9 @@ def upgrade() -> None:
         "curation_rules",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id"), nullable=False, index=True),
-        sa.Column("playlist_id", sa.Integer(), sa.ForeignKey("playlists.id"), nullable=True, index=True),
+        sa.Column(
+            "playlist_id", sa.Integer(), sa.ForeignKey("playlists.id"), nullable=True, index=True
+        ),
         sa.Column("name", sa.String(length=256), nullable=False),
         sa.Column("rule_type", sa.String(), nullable=False),
         sa.Column("conditions", sa.JSON(), nullable=True),

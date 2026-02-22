@@ -10,8 +10,9 @@ limits or page sizes.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 import tekore as tk
 from sqlmodel import select
@@ -64,13 +65,15 @@ class PlaylistManager:
         def _collect(page):
             if page and page.items:
                 for pl in page.items:
-                    playlists.append({
-                        "id": pl.id,
-                        "name": pl.name,
-                        "track_count": pl.tracks.total if pl.tracks else 0,
-                        "public": pl.public,
-                        "followers": pl.followers.total if pl.followers else 0,
-                    })
+                    playlists.append(
+                        {
+                            "id": pl.id,
+                            "name": pl.name,
+                            "track_count": pl.tracks.total if pl.tracks else 0,
+                            "public": pl.public,
+                            "followers": pl.followers.total if pl.followers else 0,
+                        }
+                    )
 
         _collect(paging)
         while paging.next is not None:
@@ -113,13 +116,15 @@ class PlaylistManager:
             if track is None or track.id is None:
                 continue
             artist_names = ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
-            tracks.append({
-                "name": track.name,
-                "artist": artist_names,
-                "album": track.album.name if track.album else "Unknown",
-                "duration_ms": track.duration_ms,
-                "uri": track.uri,
-            })
+            tracks.append(
+                {
+                    "name": track.name,
+                    "artist": artist_names,
+                    "album": track.album.name if track.album else "Unknown",
+                    "duration_ms": track.duration_ms,
+                    "uri": track.uri,
+                }
+            )
 
         return {"meta": meta, "tracks": tracks}
 
@@ -327,9 +332,7 @@ class PlaylistManager:
             chunk = list(track_uris[offset : offset + _CHUNK_SIZE])
             insert_pos = (position + offset) if position is not None else None
             try:
-                snapshot_id = await self._sp.playlist_add(
-                    playlist_id, chunk, position=insert_pos
-                )
+                snapshot_id = await self._sp.playlist_add(playlist_id, chunk, position=insert_pos)
             except tk.HTTPError as exc:
                 logger.error(
                     "Failed to add tracks (chunk at offset %d) to %s: %s",
@@ -473,9 +476,7 @@ class PlaylistManager:
             try:
                 page = await self._sp.next(page)
             except tk.HTTPError as exc:
-                logger.error(
-                    "Failed during pagination for playlist %s: %s", playlist_id, exc
-                )
+                logger.error("Failed during pagination for playlist %s: %s", playlist_id, exc)
                 raise
             if page is None:
                 break
@@ -494,9 +495,7 @@ class PlaylistManager:
         *known_snapshot_id*, indicating the playlist has been modified.
         """
         try:
-            sp_playlist = await self._sp.playlist(
-                playlist_id, fields="snapshot_id"
-            )
+            sp_playlist = await self._sp.playlist(playlist_id, fields="snapshot_id")
         except tk.HTTPError as exc:
             logger.error("Failed to check snapshot for %s: %s", playlist_id, exc)
             raise

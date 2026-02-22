@@ -7,7 +7,7 @@ or background scheduler.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from spotifyforge.models.models import (
     JobType,
     Playlist,
-    PlaylistCreate,
     ScheduledJob,
     User,
 )
@@ -28,7 +27,7 @@ from spotifyforge.models.models import (
 # ---------------------------------------------------------------------------
 
 # Build a minimal test user that all authenticated endpoints will use.
-_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
 
 def _make_user(
@@ -331,9 +330,7 @@ class TestPlaylistRoutes:
 
     def test_list_playlists_returns_list(self):
         playlist = _make_playlist()
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(items=[playlist])]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[playlist])])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -364,9 +361,7 @@ class TestPlaylistRoutes:
 
     def test_list_playlists_with_pagination(self):
         playlist = _make_playlist()
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(items=[playlist])]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[playlist])])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -388,9 +383,7 @@ class TestPlaylistRoutes:
         # The route does a lazy import:
         #   from spotifyforge.core.playlists import create_spotify_playlist
         fake_playlists = types.ModuleType("spotifyforge.core.playlists")
-        fake_playlists.create_spotify_playlist = AsyncMock(
-            return_value=mock_spotify_playlist
-        )
+        fake_playlists.create_spotify_playlist = AsyncMock(return_value=mock_spotify_playlist)
 
         with patch.dict(
             "sys.modules",
@@ -427,9 +420,7 @@ class TestPlaylistRoutes:
         client = TestClient(app, raise_server_exceptions=False)
 
         mock_module = MagicMock()
-        mock_module.create_spotify_playlist = AsyncMock(
-            side_effect=Exception("Spotify API down")
-        )
+        mock_module.create_spotify_playlist = AsyncMock(side_effect=Exception("Spotify API down"))
         with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
             response = client.post(
                 "/api/playlists",
@@ -444,9 +435,7 @@ class TestPlaylistRoutes:
 
     def test_get_playlist_success(self):
         playlist = _make_playlist(id=5)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=playlist)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -457,9 +446,7 @@ class TestPlaylistRoutes:
         assert data["name"] == "Test Playlist"
 
     def test_get_playlist_not_found(self):
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=None)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -468,16 +455,12 @@ class TestPlaylistRoutes:
 
     def test_sync_playlist_success(self):
         playlist = _make_playlist(id=3)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=playlist)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
         mock_module = MagicMock()
-        mock_module.sync_playlist_from_spotify = AsyncMock(
-            return_value={"tracks_synced": 25}
-        )
+        mock_module.sync_playlist_from_spotify = AsyncMock(return_value={"tracks_synced": 25})
         with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
             response = client.post("/api/playlists/3/sync")
 
@@ -488,9 +471,7 @@ class TestPlaylistRoutes:
         assert data["playlist_id"] == 3
 
     def test_sync_playlist_not_found(self):
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=None)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -499,9 +480,7 @@ class TestPlaylistRoutes:
 
     def test_sync_playlist_spotify_failure(self):
         playlist = _make_playlist(id=7)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=playlist)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -523,16 +502,12 @@ class TestPlaylistRoutes:
 
     def test_deduplicate_playlist_success(self):
         playlist = _make_playlist(id=4)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=playlist)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
         mock_module = MagicMock()
-        mock_module.deduplicate_playlist_tracks = AsyncMock(
-            return_value={"duplicates_removed": 3}
-        )
+        mock_module.deduplicate_playlist_tracks = AsyncMock(return_value={"duplicates_removed": 3})
         with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
             response = client.post("/api/playlists/4/deduplicate")
 
@@ -543,9 +518,7 @@ class TestPlaylistRoutes:
         assert data["playlist_id"] == 4
 
     def test_deduplicate_playlist_not_found(self):
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=None)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -554,9 +527,7 @@ class TestPlaylistRoutes:
 
     def test_deduplicate_playlist_failure(self):
         playlist = _make_playlist(id=6)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=playlist)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -578,9 +549,7 @@ class TestPlaylistRoutes:
 
     def test_update_playlist_success(self):
         playlist = _make_playlist(id=2)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=playlist)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -597,9 +566,7 @@ class TestPlaylistRoutes:
         assert data["name"] == "Updated Name"
 
     def test_update_playlist_not_found(self):
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=None)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -657,9 +624,7 @@ class TestDiscoveryRoutes:
         mock_module.get_top_tracks = AsyncMock(return_value=[])
 
         with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.get(
-                "/api/discover/top-tracks?time_range=short_term&limit=10"
-            )
+            response = client.get("/api/discover/top-tracks?time_range=short_term&limit=10")
 
         assert response.status_code == 200
         mock_module.get_top_tracks.assert_called_once()
@@ -679,9 +644,7 @@ class TestDiscoveryRoutes:
         client = TestClient(app, raise_server_exceptions=False)
 
         mock_module = MagicMock()
-        mock_module.get_top_tracks = AsyncMock(
-            side_effect=Exception("Spotify rate limit")
-        )
+        mock_module.get_top_tracks = AsyncMock(side_effect=Exception("Spotify rate limit"))
 
         with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
             response = client.get("/api/discover/top-tracks")
@@ -758,9 +721,7 @@ class TestDiscoveryRoutes:
         mock_module.create_genre_based_playlist = AsyncMock(return_value=playlist)
 
         with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.post(
-                "/api/discover/genre-playlist?genre=indie-rock&limit=20"
-            )
+            response = client.post("/api/discover/genre-playlist?genre=indie-rock&limit=20")
 
         assert response.status_code == 201
         data = response.json()
@@ -775,9 +736,7 @@ class TestDiscoveryRoutes:
         mock_module.create_time_capsule_playlist = AsyncMock(return_value=playlist)
 
         with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.post(
-                "/api/discover/time-capsule?year=2020"
-            )
+            response = client.post("/api/discover/time-capsule?year=2020")
 
         assert response.status_code == 201
         data = response.json()
@@ -794,9 +753,7 @@ class TestScheduleRoutes:
 
     def test_list_schedules_returns_list(self):
         job = _make_scheduled_job()
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(items=[job])]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[job])])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -834,10 +791,12 @@ class TestScheduleRoutes:
         # the ``models`` module before the app is constructed.
         from pydantic import BaseModel, ConfigDict
         from pydantic import Field as PydanticField
+
         from spotifyforge.models import models as models_mod
 
         class _RelaxedJobCreate(BaseModel):
             """Non-strict copy of ScheduledJobCreate for test use."""
+
             model_config = ConfigDict(strict=False)
             name: str = PydanticField(min_length=1, max_length=256)
             job_type: JobType
@@ -847,9 +806,7 @@ class TestScheduleRoutes:
             enabled: bool = True
 
         playlist = _make_playlist(id=1)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=playlist)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
 
         mock_scheduler_module = MagicMock()
         mock_scheduler_module.register_job = MagicMock()
@@ -857,6 +814,7 @@ class TestScheduleRoutes:
         # Swap the model in both the models module and the routes module
         # BEFORE building the test app so the FastAPI endpoint uses it.
         import spotifyforge.web.routes as routes_mod
+
         orig_routes = routes_mod.ScheduledJobCreate
         orig_models = models_mod.ScheduledJobCreate
 
@@ -913,6 +871,7 @@ class TestScheduleRoutes:
     def test_create_schedule_playlist_not_found(self):
         from pydantic import BaseModel, ConfigDict
         from pydantic import Field as PydanticField
+
         from spotifyforge.models import models as models_mod
 
         class _RelaxedJobCreate(BaseModel):
@@ -924,11 +883,10 @@ class TestScheduleRoutes:
             cron_expression: str = PydanticField(min_length=1, max_length=128)
             enabled: bool = True
 
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=None)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
 
         import spotifyforge.web.routes as routes_mod
+
         orig_routes = routes_mod.ScheduledJobCreate
         orig_models = models_mod.ScheduledJobCreate
 
@@ -959,6 +917,7 @@ class TestScheduleRoutes:
         """A job with no playlist_id should skip the playlist lookup."""
         from pydantic import BaseModel, ConfigDict
         from pydantic import Field as PydanticField
+
         from spotifyforge.models import models as models_mod
 
         class _RelaxedJobCreate(BaseModel):
@@ -976,6 +935,7 @@ class TestScheduleRoutes:
         mock_scheduler_module.register_job = MagicMock()
 
         import spotifyforge.web.routes as routes_mod
+
         orig_routes = routes_mod.ScheduledJobCreate
         orig_models = models_mod.ScheduledJobCreate
 
@@ -1025,9 +985,7 @@ class TestScheduleRoutes:
 
     def test_delete_schedule_success(self):
         job = _make_scheduled_job(id=10)
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=job)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=job)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -1043,9 +1001,7 @@ class TestScheduleRoutes:
         assert response.status_code == 204
 
     def test_delete_schedule_not_found(self):
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=None)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -1062,9 +1018,7 @@ class TestScheduleRoutes:
     def test_toggle_schedule_enable(self):
         job = _make_scheduled_job(id=15)
         job.enabled = False  # Start disabled
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=job)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=job)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -1084,9 +1038,7 @@ class TestScheduleRoutes:
         assert data["enabled"] is True
 
     def test_toggle_schedule_not_found(self):
-        session = _FakeSession(
-            execute_results=[_FakeExecuteResult(first_item=None)]
-        )
+        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
         app = _build_test_app(session=session)
         client = TestClient(app, raise_server_exceptions=False)
 

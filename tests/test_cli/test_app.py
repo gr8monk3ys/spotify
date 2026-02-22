@@ -20,7 +20,6 @@ import json
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from typer.testing import CliRunner
 
 from spotifyforge.cli.app import app
@@ -31,6 +30,7 @@ runner = CliRunner()
 # ---------------------------------------------------------------------------
 # Helper: build a fake module that Python's import machinery will accept
 # ---------------------------------------------------------------------------
+
 
 def _fake_module(name: str, **attrs) -> types.ModuleType:
     """Create a real ``ModuleType`` with the given attributes.
@@ -102,14 +102,16 @@ class TestAuthCommands:
 
     def test_auth_status_logged_in(self):
         mock_auth_instance = MagicMock()
-        mock_auth_instance.status = AsyncMock(return_value={
-            "logged_in": True,
-            "display_name": "Test User",
-            "email": "test@example.com",
-            "user_id": "abc123",
-            "token_expiry": "2026-12-31T23:59:59",
-            "token_valid": True,
-        })
+        mock_auth_instance.status = AsyncMock(
+            return_value={
+                "logged_in": True,
+                "display_name": "Test User",
+                "email": "test@example.com",
+                "user_id": "abc123",
+                "token_expiry": "2026-12-31T23:59:59",
+                "token_valid": True,
+            }
+        )
         MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
 
         fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
@@ -221,22 +223,24 @@ class TestPlaylistCommands:
 
     def test_playlist_list_with_playlists(self):
         mock_manager = MagicMock()
-        mock_manager.get_user_playlists = AsyncMock(return_value=[
-            {
-                "name": "Chill Vibes",
-                "track_count": 42,
-                "public": True,
-                "followers": 10,
-                "id": "pl_001",
-            },
-            {
-                "name": "Workout Mix",
-                "track_count": 30,
-                "public": False,
-                "followers": 0,
-                "id": "pl_002",
-            },
-        ])
+        mock_manager.get_user_playlists = AsyncMock(
+            return_value=[
+                {
+                    "name": "Chill Vibes",
+                    "track_count": 42,
+                    "public": True,
+                    "followers": 10,
+                    "id": "pl_001",
+                },
+                {
+                    "name": "Workout Mix",
+                    "track_count": 30,
+                    "public": False,
+                    "followers": 0,
+                    "id": "pl_002",
+                },
+            ]
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -275,10 +279,12 @@ class TestPlaylistCommands:
 
     def test_playlist_create_success(self):
         mock_manager = MagicMock()
-        mock_manager.create_playlist = AsyncMock(return_value={
-            "name": "My New Playlist",
-            "id": "pl_new_001",
-        })
+        mock_manager.create_playlist = AsyncMock(
+            return_value={
+                "name": "My New Playlist",
+                "id": "pl_new_001",
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -293,17 +299,17 @@ class TestPlaylistCommands:
 
     def test_playlist_create_private(self):
         mock_manager = MagicMock()
-        mock_manager.create_playlist = AsyncMock(return_value={
-            "name": "Secret Mix",
-            "id": "pl_priv_001",
-        })
+        mock_manager.create_playlist = AsyncMock(
+            return_value={
+                "name": "Secret Mix",
+                "id": "pl_priv_001",
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
         with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(
-                app, ["playlist", "create", "Secret Mix", "--private"]
-            )
+            result = runner.invoke(app, ["playlist", "create", "Secret Mix", "--private"])
 
         assert result.exit_code == 0
         assert "Private" in result.output
@@ -323,10 +329,12 @@ class TestPlaylistCommands:
 
     def test_playlist_deduplicate_found_duplicates(self):
         mock_manager = MagicMock()
-        mock_manager.deduplicate = AsyncMock(return_value={
-            "removed": 5,
-            "remaining": 35,
-        })
+        mock_manager.deduplicate = AsyncMock(
+            return_value={
+                "removed": 5,
+                "remaining": 35,
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -364,10 +372,12 @@ class TestPlaylistCommands:
 
     def test_playlist_sync_success(self):
         mock_manager = MagicMock()
-        mock_manager.sync_playlist = AsyncMock(return_value={
-            "name": "Synced Playlist",
-            "tracks_synced": 55,
-        })
+        mock_manager.sync_playlist = AsyncMock(
+            return_value={
+                "name": "Synced Playlist",
+                "tracks_synced": 55,
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -382,30 +392,32 @@ class TestPlaylistCommands:
 
     def test_playlist_show_success(self):
         mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(return_value={
-            "meta": {
-                "name": "Test Playlist",
-                "description": "A test description",
-                "owner": "testuser",
-                "track_count": 3,
-                "followers": 100,
-                "public": True,
-            },
-            "tracks": [
-                {
-                    "name": "Track One",
-                    "artist": "Artist A",
-                    "album": "Album X",
-                    "duration_ms": 210000,
+        mock_manager.get_playlist_details = AsyncMock(
+            return_value={
+                "meta": {
+                    "name": "Test Playlist",
+                    "description": "A test description",
+                    "owner": "testuser",
+                    "track_count": 3,
+                    "followers": 100,
+                    "public": True,
                 },
-                {
-                    "name": "Track Two",
-                    "artist": "Artist B",
-                    "album": "Album Y",
-                    "duration_ms": 180000,
-                },
-            ],
-        })
+                "tracks": [
+                    {
+                        "name": "Track One",
+                        "artist": "Artist A",
+                        "album": "Album X",
+                        "duration_ms": 210000,
+                    },
+                    {
+                        "name": "Track Two",
+                        "artist": "Artist B",
+                        "album": "Album Y",
+                        "duration_ms": 180000,
+                    },
+                ],
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -418,17 +430,19 @@ class TestPlaylistCommands:
 
     def test_playlist_show_empty_tracks(self):
         mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(return_value={
-            "meta": {
-                "name": "Empty Playlist",
-                "description": "",
-                "owner": "testuser",
-                "track_count": 0,
-                "followers": 0,
-                "public": False,
-            },
-            "tracks": [],
-        })
+        mock_manager.get_playlist_details = AsyncMock(
+            return_value={
+                "meta": {
+                    "name": "Empty Playlist",
+                    "description": "",
+                    "owner": "testuser",
+                    "track_count": 0,
+                    "followers": 0,
+                    "public": False,
+                },
+                "tracks": [],
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -458,17 +472,17 @@ class TestPlaylistCommands:
             },
         ]
         mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(return_value={
-            "meta": {"name": "Export Playlist"},
-            "tracks": tracks_data,
-        })
+        mock_manager.get_playlist_details = AsyncMock(
+            return_value={
+                "meta": {"name": "Export Playlist"},
+                "tracks": tracks_data,
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
         with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(
-                app, ["playlist", "export", "pl_export_001", "--format", "json"]
-            )
+            result = runner.invoke(app, ["playlist", "export", "pl_export_001", "--format", "json"])
 
         assert result.exit_code == 0
         assert "Song A" in result.output
@@ -486,17 +500,17 @@ class TestPlaylistCommands:
             },
         ]
         mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(return_value={
-            "meta": {"name": "CSV Export"},
-            "tracks": tracks_data,
-        })
+        mock_manager.get_playlist_details = AsyncMock(
+            return_value={
+                "meta": {"name": "CSV Export"},
+                "tracks": tracks_data,
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
         with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(
-                app, ["playlist", "export", "pl_export_002", "--format", "csv"]
-            )
+            result = runner.invoke(app, ["playlist", "export", "pl_export_002", "--format", "csv"])
 
         assert result.exit_code == 0
         assert "name" in result.output
@@ -513,10 +527,12 @@ class TestPlaylistCommands:
             },
         ]
         mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(return_value={
-            "meta": {"name": "File Export"},
-            "tracks": tracks_data,
-        })
+        mock_manager.get_playlist_details = AsyncMock(
+            return_value={
+                "meta": {"name": "File Export"},
+                "tracks": tracks_data,
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -525,9 +541,13 @@ class TestPlaylistCommands:
             result = runner.invoke(
                 app,
                 [
-                    "playlist", "export", "pl_file_001",
-                    "--format", "json",
-                    "--output", str(output_file),
+                    "playlist",
+                    "export",
+                    "pl_file_001",
+                    "--format",
+                    "json",
+                    "--output",
+                    str(output_file),
                 ],
             )
 
@@ -549,10 +569,12 @@ class TestPlaylistCommands:
             },
         ]
         mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(return_value={
-            "meta": {"name": "CSV File Export"},
-            "tracks": tracks_data,
-        })
+        mock_manager.get_playlist_details = AsyncMock(
+            return_value={
+                "meta": {"name": "CSV File Export"},
+                "tracks": tracks_data,
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
@@ -561,9 +583,13 @@ class TestPlaylistCommands:
             result = runner.invoke(
                 app,
                 [
-                    "playlist", "export", "pl_csv_001",
-                    "--format", "csv",
-                    "--output", str(output_file),
+                    "playlist",
+                    "export",
+                    "pl_csv_001",
+                    "--format",
+                    "csv",
+                    "--output",
+                    str(output_file),
                 ],
             )
 
@@ -576,17 +602,17 @@ class TestPlaylistCommands:
 
     def test_playlist_export_empty_playlist(self):
         mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(return_value={
-            "meta": {"name": "Empty"},
-            "tracks": [],
-        })
+        mock_manager.get_playlist_details = AsyncMock(
+            return_value={
+                "meta": {"name": "Empty"},
+                "tracks": [],
+            }
+        )
         MockPM = MagicMock(return_value=mock_manager)
         fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
 
         with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(
-                app, ["playlist", "export", "pl_empty", "--format", "json"]
-            )
+            result = runner.invoke(app, ["playlist", "export", "pl_empty", "--format", "json"])
 
         assert result.exit_code == 1
 
@@ -611,20 +637,22 @@ class TestDiscoverCommands:
 
     def test_discover_top_tracks_success(self):
         mock_discovery = MagicMock()
-        mock_discovery.get_top_tracks = AsyncMock(return_value=[
-            {
-                "name": "Hit Song",
-                "artist": "Pop Star",
-                "album": "Greatest Hits",
-                "popularity": 95,
-            },
-            {
-                "name": "Another Hit",
-                "artist": "Rock Band",
-                "album": "Rock Album",
-                "popularity": 80,
-            },
-        ])
+        mock_discovery.get_top_tracks = AsyncMock(
+            return_value=[
+                {
+                    "name": "Hit Song",
+                    "artist": "Pop Star",
+                    "album": "Greatest Hits",
+                    "popularity": 95,
+                },
+                {
+                    "name": "Another Hit",
+                    "artist": "Rock Band",
+                    "album": "Rock Album",
+                    "popularity": 80,
+                },
+            ]
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
@@ -638,9 +666,16 @@ class TestDiscoverCommands:
 
     def test_discover_top_tracks_with_options(self):
         mock_discovery = MagicMock()
-        mock_discovery.get_top_tracks = AsyncMock(return_value=[
-            {"name": "Recent Track", "artist": "New Artist", "album": "New Album", "popularity": 70},
-        ])
+        mock_discovery.get_top_tracks = AsyncMock(
+            return_value=[
+                {
+                    "name": "Recent Track",
+                    "artist": "New Artist",
+                    "album": "New Album",
+                    "popularity": 70,
+                },
+            ]
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
@@ -681,13 +716,25 @@ class TestDiscoverCommands:
 
     def test_discover_deep_cuts_success(self):
         mock_discovery = MagicMock()
-        mock_discovery.find_deep_cuts = AsyncMock(return_value={
-            "artist_name": "Indie Band",
-            "tracks": [
-                {"name": "Hidden Gem", "album": "Obscure Album", "popularity": 12, "duration_ms": 240000},
-                {"name": "B-Side Track", "album": "Rare Vinyl", "popularity": 5, "duration_ms": 195000},
-            ],
-        })
+        mock_discovery.find_deep_cuts = AsyncMock(
+            return_value={
+                "artist_name": "Indie Band",
+                "tracks": [
+                    {
+                        "name": "Hidden Gem",
+                        "album": "Obscure Album",
+                        "popularity": 12,
+                        "duration_ms": 240000,
+                    },
+                    {
+                        "name": "B-Side Track",
+                        "album": "Rare Vinyl",
+                        "popularity": 5,
+                        "duration_ms": 195000,
+                    },
+                ],
+            }
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
@@ -700,10 +747,12 @@ class TestDiscoverCommands:
 
     def test_discover_deep_cuts_none_found(self):
         mock_discovery = MagicMock()
-        mock_discovery.find_deep_cuts = AsyncMock(return_value={
-            "artist_name": "Famous Singer",
-            "tracks": [],
-        })
+        mock_discovery.find_deep_cuts = AsyncMock(
+            return_value={
+                "artist_name": "Famous Singer",
+                "tracks": [],
+            }
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
@@ -715,12 +764,14 @@ class TestDiscoverCommands:
 
     def test_discover_deep_cuts_with_threshold(self):
         mock_discovery = MagicMock()
-        mock_discovery.find_deep_cuts = AsyncMock(return_value={
-            "artist_name": "Some Artist",
-            "tracks": [
-                {"name": "Ultra Deep", "album": "Rare", "popularity": 2, "duration_ms": 180000},
-            ],
-        })
+        mock_discovery.find_deep_cuts = AsyncMock(
+            return_value={
+                "artist_name": "Some Artist",
+                "tracks": [
+                    {"name": "Ultra Deep", "album": "Rare", "popularity": 2, "duration_ms": 180000},
+                ],
+            }
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
@@ -736,13 +787,15 @@ class TestDiscoverCommands:
 
     def test_discover_genre_success(self):
         mock_discovery = MagicMock()
-        mock_discovery.build_genre_playlist = AsyncMock(return_value={
-            "playlist": {"name": "Indie Rock Vibes", "id": "pl_genre_001"},
-            "tracks": [
-                {"name": "Indie Song 1", "artist": "Band A"},
-                {"name": "Indie Song 2", "artist": "Band B"},
-            ],
-        })
+        mock_discovery.build_genre_playlist = AsyncMock(
+            return_value={
+                "playlist": {"name": "Indie Rock Vibes", "id": "pl_genre_001"},
+                "tracks": [
+                    {"name": "Indie Song 1", "artist": "Band A"},
+                    {"name": "Indie Song 2", "artist": "Band B"},
+                ],
+            }
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
@@ -768,10 +821,12 @@ class TestDiscoverCommands:
 
     def test_discover_time_capsule_success(self):
         mock_discovery = MagicMock()
-        mock_discovery.create_time_capsule = AsyncMock(return_value={
-            "playlist": {"name": "Time Capsule 2024", "id": "pl_tc_001"},
-            "track_count": 25,
-        })
+        mock_discovery.create_time_capsule = AsyncMock(
+            return_value={
+                "playlist": {"name": "Time Capsule 2024", "id": "pl_tc_001"},
+                "track_count": 25,
+            }
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
@@ -784,17 +839,17 @@ class TestDiscoverCommands:
 
     def test_discover_time_capsule_with_time_range(self):
         mock_discovery = MagicMock()
-        mock_discovery.create_time_capsule = AsyncMock(return_value={
-            "playlist": {"name": "Short Term Capsule", "id": "pl_tc_002"},
-            "track_count": 15,
-        })
+        mock_discovery.create_time_capsule = AsyncMock(
+            return_value={
+                "playlist": {"name": "Short Term Capsule", "id": "pl_tc_002"},
+                "track_count": 15,
+            }
+        )
         MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
         fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
         with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(
-                app, ["discover", "time-capsule", "--time-range", "short_term"]
-            )
+            result = runner.invoke(app, ["discover", "time-capsule", "--time-range", "short_term"])
 
         assert result.exit_code == 0
         assert "Last 4 Weeks" in result.output
@@ -820,26 +875,28 @@ class TestScheduleCommands:
 
     def test_schedule_list_with_jobs(self):
         mock_scheduler = MagicMock()
-        mock_scheduler.list_jobs = AsyncMock(return_value=[
-            {
-                "id": "job_001",
-                "name": "Weekly Sync",
-                "type": "sync",
-                "playlist_id": "pl_001",
-                "cron": "0 8 * * 1",
-                "next_run": "2026-02-23 08:00",
-                "status": "active",
-            },
-            {
-                "id": "job_002",
-                "name": "Daily Dedup",
-                "type": "deduplicate",
-                "playlist_id": "pl_002",
-                "cron": "0 0 * * *",
-                "next_run": "2026-02-17 00:00",
-                "status": "paused",
-            },
-        ])
+        mock_scheduler.list_jobs = AsyncMock(
+            return_value=[
+                {
+                    "id": "job_001",
+                    "name": "Weekly Sync",
+                    "type": "sync",
+                    "playlist_id": "pl_001",
+                    "cron": "0 8 * * 1",
+                    "next_run": "2026-02-23 08:00",
+                    "status": "active",
+                },
+                {
+                    "id": "job_002",
+                    "name": "Daily Dedup",
+                    "type": "deduplicate",
+                    "playlist_id": "pl_002",
+                    "cron": "0 0 * * *",
+                    "next_run": "2026-02-17 00:00",
+                    "status": "paused",
+                },
+            ]
+        )
         MockScheduler = MagicMock(return_value=mock_scheduler)
         fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
 
@@ -882,10 +939,12 @@ class TestScheduleCommands:
 
     def test_schedule_add_success(self):
         mock_scheduler = MagicMock()
-        mock_scheduler.add_job = AsyncMock(return_value={
-            "id": "job_new_001",
-            "next_run": "2026-02-23 08:00",
-        })
+        mock_scheduler.add_job = AsyncMock(
+            return_value={
+                "id": "job_new_001",
+                "next_run": "2026-02-23 08:00",
+            }
+        )
         MockScheduler = MagicMock(return_value=mock_scheduler)
         fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
 
@@ -893,11 +952,16 @@ class TestScheduleCommands:
             result = runner.invoke(
                 app,
                 [
-                    "schedule", "add",
-                    "--name", "My Sync Job",
-                    "--type", "sync",
-                    "--playlist", "pl_001",
-                    "--cron", "0 8 * * 1",
+                    "schedule",
+                    "add",
+                    "--name",
+                    "My Sync Job",
+                    "--type",
+                    "sync",
+                    "--playlist",
+                    "pl_001",
+                    "--cron",
+                    "0 8 * * 1",
                 ],
             )
 
@@ -915,11 +979,16 @@ class TestScheduleCommands:
             result = runner.invoke(
                 app,
                 [
-                    "schedule", "add",
-                    "--name", "Bad Job",
-                    "--type", "sync",
-                    "--playlist", "pl_001",
-                    "--cron", "invalid",
+                    "schedule",
+                    "add",
+                    "--name",
+                    "Bad Job",
+                    "--type",
+                    "sync",
+                    "--playlist",
+                    "pl_001",
+                    "--cron",
+                    "invalid",
                 ],
             )
 

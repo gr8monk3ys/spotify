@@ -68,7 +68,9 @@ class User(SQLModel, table=True):
     email: str | None = Field(default=None, max_length=320)
 
     # OAuth tokens — stored encrypted (Fernet) in the database.
-    access_token_enc: str | None = Field(default=None, sa_column=Column(Text, nullable=True, index=True))
+    access_token_enc: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True, index=True)
+    )
     refresh_token_enc: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     token_expiry: datetime | None = Field(default=None)
     token_hash: str | None = Field(default=None, index=True)
@@ -268,9 +270,7 @@ class CurationRule(SQLModel, table=True):
             nullable=False,
         )
     )
-    conditions: dict[str, Any] | None = Field(
-        default=None, sa_column=Column(JSON, nullable=True)
-    )
+    conditions: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     actions: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     enabled: bool = Field(default=True)
     priority: int = Field(default=0)

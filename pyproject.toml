@@ -49,6 +49,24 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 
+[tool.ruff.lint.per-file-ignores]
+# Alembic-generated migration files use long sa.Column() chains that are
+# intentionally kept on single lines for readability.
+"alembic/env.py" = ["E501"]
+"alembic/versions/*.py" = ["E501"]
+# Tests use PascalCase Mock* names (e.g. MockPM, MockScheduler) that mirror
+# the class they stand in for; renaming them to lowercase would hurt clarity.
+# Inline test-data dicts are allowed to exceed the line limit for legibility.
+# E741: lambda `l` in sorted() key is a common idiom in tests.
+"tests/*.py" = ["N806", "E741", "E501"]
+"tests/**/*.py" = ["N806", "E741", "E501"]
+# web/app.py: constants defined inside a closure use UPPER_CASE intentionally;
+# the HTML template strings include long inline CSS that cannot be wrapped.
+"spotifyforge/web/app.py" = ["N806", "E402", "E501"]
+# web/routes.py: import is deliberately placed after the router objects it
+# depends on to break a circular import cycle.
+"spotifyforge/web/routes.py" = ["E402", "E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
@@ -56,3 +74,20 @@ asyncio_mode = "auto"
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+module = "tekore.*"
+ignore_missing_imports = true
+
+# Test files and conftest: relax strict type checking for test utilities.
+# Parametrized test methods receive dynamically-typed pytest fixtures and
+# arguments; requiring full annotations would add noise without safety value.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[[tool.mypy.overrides]]
+module = "conftest"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false

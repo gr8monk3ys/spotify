@@ -12,8 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import tekore as tk
 
-from spotifyforge.core.playlist_manager import PlaylistManager, _CHUNK_SIZE
-
+from spotifyforge.core.playlist_manager import _CHUNK_SIZE, PlaylistManager
 
 # ---------------------------------------------------------------------------
 # Helpers – lightweight stand-ins for Tekore response objects
@@ -120,9 +119,7 @@ class TestAddTracks:
         result = await manager.add_tracks("pl1", uris)
 
         assert result == "snap_1"
-        mock_spotify.playlist_add.assert_awaited_once_with(
-            "pl1", uris, position=None
-        )
+        mock_spotify.playlist_add.assert_awaited_once_with("pl1", uris, position=None)
 
     async def test_add_exactly_100_tracks(self, manager, mock_spotify):
         """Exactly _CHUNK_SIZE tracks should produce one API call."""
@@ -157,8 +154,8 @@ class TestAddTracks:
         await manager.add_tracks("pl1", uris, position=10)
 
         calls = mock_spotify.playlist_add.call_args_list
-        assert calls[0].kwargs["position"] == 10       # first chunk at 10
-        assert calls[1].kwargs["position"] == 110      # second chunk at 10+100
+        assert calls[0].kwargs["position"] == 10  # first chunk at 10
+        assert calls[1].kwargs["position"] == 110  # second chunk at 10+100
 
     async def test_add_tracks_empty_list(self, manager, mock_spotify):
         """An empty URI list should make zero API calls and return ''."""
@@ -286,9 +283,7 @@ class TestGetPlaylistTracks:
 
     async def test_none_items_in_page(self, manager, mock_spotify):
         """If page.items is None, treat as empty."""
-        mock_spotify.playlist_items.return_value = SimpleNamespace(
-            items=None, next=None, total=0
-        )
+        mock_spotify.playlist_items.return_value = SimpleNamespace(items=None, next=None, total=0)
 
         result = await manager.get_playlist_tracks("pl1")
 
@@ -627,8 +622,7 @@ class TestEdgeCases:
         """If dedup produces >100 duplicates, remove_tracks should chunk them."""
         # Build 150 unique items, then 150 duplicates of the first ones.
         unique_items = [
-            _make_playlist_item(_make_track(f"t{i}", uri=f"spotify:track:t{i}"))
-            for i in range(150)
+            _make_playlist_item(_make_track(f"t{i}", uri=f"spotify:track:t{i}")) for i in range(150)
         ]
         duplicate_items = [
             _make_playlist_item(_make_track(f"t{i}_dup", uri=f"spotify:track:t{i}"))

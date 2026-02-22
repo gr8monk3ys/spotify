@@ -7,8 +7,8 @@ that the caller controls transaction boundaries.  All queries use SQLModel's
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from sqlmodel import Session, select
 
@@ -21,19 +21,20 @@ from spotifyforge.models.models import (
     Track,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _utcnow() -> datetime:
     """Return the current UTC timestamp (timezone-aware)."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
 # TrackRepository
 # ---------------------------------------------------------------------------
+
 
 class TrackRepository:
     """CRUD operations for :class:`Track` with cache-awareness."""
@@ -105,9 +106,7 @@ class TrackRepository:
 
     def get_stale(self, ttl_seconds: int) -> list[Track]:
         """Return tracks whose ``cached_at`` is older than *ttl_seconds*."""
-        cutoff = datetime.fromtimestamp(
-            _utcnow().timestamp() - ttl_seconds, tz=timezone.utc
-        )
+        cutoff = datetime.fromtimestamp(_utcnow().timestamp() - ttl_seconds, tz=UTC)
         statement = select(Track).where(Track.cached_at < cutoff)
         return list(self.session.exec(statement).all())
 
@@ -125,6 +124,7 @@ class TrackRepository:
 # ---------------------------------------------------------------------------
 # ArtistRepository
 # ---------------------------------------------------------------------------
+
 
 class ArtistRepository:
     """CRUD operations for :class:`Artist` with cache-awareness."""
@@ -193,9 +193,7 @@ class ArtistRepository:
 
     def get_stale(self, ttl_seconds: int) -> list[Artist]:
         """Return artists whose ``cached_at`` is older than *ttl_seconds*."""
-        cutoff = datetime.fromtimestamp(
-            _utcnow().timestamp() - ttl_seconds, tz=timezone.utc
-        )
+        cutoff = datetime.fromtimestamp(_utcnow().timestamp() - ttl_seconds, tz=UTC)
         statement = select(Artist).where(Artist.cached_at < cutoff)
         return list(self.session.exec(statement).all())
 
@@ -213,6 +211,7 @@ class ArtistRepository:
 # ---------------------------------------------------------------------------
 # PlaylistRepository
 # ---------------------------------------------------------------------------
+
 
 class PlaylistRepository:
     """CRUD and synchronisation operations for :class:`Playlist`."""
@@ -273,9 +272,7 @@ class PlaylistRepository:
         """
         # Remove existing links
         existing_links = self.session.exec(
-            select(PlaylistTrack).where(
-                PlaylistTrack.playlist_id == playlist_id
-            )
+            select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist_id)
         ).all()
         for link in existing_links:
             self.session.delete(link)
@@ -312,6 +309,7 @@ class PlaylistRepository:
 # ---------------------------------------------------------------------------
 # AudioFeaturesRepository
 # ---------------------------------------------------------------------------
+
 
 class AudioFeaturesRepository:
     """CRUD operations for :class:`AudioFeatures`."""
@@ -368,9 +366,7 @@ class AudioFeaturesRepository:
 
     def get_by_track_id(self, track_id: int) -> AudioFeatures | None:
         """Return audio features for a given track, or ``None``."""
-        statement = select(AudioFeatures).where(
-            AudioFeatures.track_id == track_id
-        )
+        statement = select(AudioFeatures).where(AudioFeatures.track_id == track_id)
         return self.session.exec(statement).first()
 
     def get_missing_track_ids(self, track_ids: list[int]) -> list[int]:
@@ -387,6 +383,7 @@ class AudioFeaturesRepository:
 # ---------------------------------------------------------------------------
 # ScheduledJobRepository
 # ---------------------------------------------------------------------------
+
 
 class ScheduledJobRepository:
     """CRUD operations for :class:`ScheduledJob`."""

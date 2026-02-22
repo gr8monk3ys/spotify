@@ -13,11 +13,9 @@ import asyncio
 import csv
 import io
 import json
-import sys
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich import box
@@ -39,6 +37,7 @@ err_console = Console(stderr=True)
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _error_panel(message: str, *, title: str = "Error") -> None:
     """Display a Rich error panel on *stderr* and exit with code 1."""
     err_console.print(Panel(message, title=title, border_style="red", expand=False))
@@ -53,9 +52,7 @@ def _run(coro):
 def _version_callback(value: bool) -> None:
     """Print the version string and exit."""
     if value:
-        console.print(
-            f"[bold]SpotifyForge[/bold] version [cyan]{spotifyforge.__version__}[/cyan]"
-        )
+        console.print(f"[bold]SpotifyForge[/bold] version [cyan]{spotifyforge.__version__}[/cyan]")
         raise typer.Exit()
 
 
@@ -72,7 +69,7 @@ app = typer.Typer(
 
 @app.callback()
 def main(
-    version: Optional[bool] = typer.Option(  # noqa: UP007
+    version: bool | None = typer.Option(  # noqa: UP007
         None,
         "--version",
         "-V",
@@ -247,9 +244,7 @@ def playlist_list() -> None:
     table.add_column("ID", style="dim")
 
     for idx, pl in enumerate(playlists, start=1):
-        visibility = (
-            "[green]Public[/green]" if pl.get("public") else "[yellow]Private[/yellow]"
-        )
+        visibility = "[green]Public[/green]" if pl.get("public") else "[yellow]Private[/yellow]"
         table.add_row(
             str(idx),
             pl.get("name", "—"),
@@ -352,7 +347,9 @@ def playlist_create(
     ) as progress:
         progress.add_task("Creating playlist...", total=None)
         try:
-            result = _run(manager.create_playlist(name=name, description=description, public=public))
+            result = _run(
+                manager.create_playlist(name=name, description=description, public=public)
+            )
         except Exception as exc:
             _error_panel(f"Failed to create playlist: {exc}")
 
@@ -401,7 +398,7 @@ def playlist_sync(
             f"[green]Playlist synced to local cache.[/green]\n\n"
             f"  Playlist: [bold]{result.get('name', playlist_id)}[/bold]\n"
             f"  Tracks synced: {tracks_synced}\n"
-            f"  Last synced: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            f"  Last synced: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
             title="Sync Complete",
             border_style="green",
             expand=False,
@@ -456,8 +453,9 @@ def playlist_deduplicate(
         )
 
 
-class ExportFormat(str, Enum):
+class ExportFormat(StrEnum):
     """Supported playlist export formats."""
+
     csv = "csv"
     json = "json"
 
@@ -472,7 +470,7 @@ def playlist_export(
         help="Export format: csv or json.",
         case_sensitive=False,
     ),
-    output: Optional[Path] = typer.Option(  # noqa: UP007
+    output: Path | None = typer.Option(  # noqa: UP007
         None,
         "--output",
         "-o",
@@ -516,9 +514,7 @@ def playlist_export(
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(export_data, encoding="utf-8")
-        console.print(
-            f"[green]Exported {len(tracks)} tracks to[/green] [bold]{output}[/bold]"
-        )
+        console.print(f"[green]Exported {len(tracks)} tracks to[/green] [bold]{output}[/bold]")
     else:
         console.print(export_data)
 
@@ -534,8 +530,9 @@ discover_app = typer.Typer(
 app.add_typer(discover_app)
 
 
-class TimeRange(str, Enum):
+class TimeRange(StrEnum):
     """Spotify time range for personalization endpoints."""
+
     short_term = "short_term"
     medium_term = "medium_term"
     long_term = "long_term"
@@ -616,9 +613,7 @@ def discover_top_tracks(
 
 @discover_app.command("deep-cuts")
 def discover_deep_cuts(
-    artist: str = typer.Argument(
-        ..., help="Artist name or Spotify artist ID."
-    ),
+    artist: str = typer.Argument(..., help="Artist name or Spotify artist ID."),
     threshold: int = typer.Option(
         30,
         "--threshold",
@@ -794,7 +789,7 @@ def discover_time_capsule(
             f"  ID:         {playlist.get('id', 'N/A')}\n"
             f"  Tracks:     {track_count}\n"
             f"  Time range: {range_labels.get(time_range.value, time_range.value)}\n"
-            f"  Created:    {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            f"  Created:    {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
             title="Time Capsule",
             border_style="magenta",
             expand=False,
@@ -885,9 +880,7 @@ def schedule_add(
         "-t",
         help="Job type (e.g. 'sync', 'deduplicate', 'discover', 'time-capsule').",
     ),
-    playlist: str = typer.Option(
-        ..., "--playlist", "-p", help="Target Spotify playlist ID."
-    ),
+    playlist: str = typer.Option(..., "--playlist", "-p", help="Target Spotify playlist ID."),
     cron: str = typer.Option(
         ...,
         "--cron",
@@ -904,9 +897,7 @@ def schedule_add(
     scheduler = Scheduler()
 
     try:
-        result = _run(
-            scheduler.add_job(name=name, job_type=type, playlist_id=playlist, cron=cron)
-        )
+        result = _run(scheduler.add_job(name=name, job_type=type, playlist_id=playlist, cron=cron))
     except Exception as exc:
         _error_panel(f"Failed to add scheduled job: {exc}")
 
@@ -1020,6 +1011,7 @@ def config_show() -> None:
         # Determine source — environment variable or default.
         env_key = f"SPOTIFYFORGE_{field_name.upper()}"
         import os
+
         source = "env" if os.environ.get(env_key) else "default"
 
         table.add_row(field_name, display_value, source)

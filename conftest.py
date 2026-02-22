@@ -6,15 +6,16 @@ rollback, a mock Spotify client, and reusable sample data factories.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import AsyncGenerator
+from collections.abc import Generator
+from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import event
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlmodel import SQLModel, Session, create_engine
-
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import SessionTransaction
+from sqlmodel import Session, SQLModel, create_engine
 
 # ---------------------------------------------------------------------------
 # Database fixtures
@@ -22,7 +23,7 @@ from sqlmodel import SQLModel, Session, create_engine
 
 
 @pytest.fixture()
-def db_engine():
+def db_engine() -> Generator[Engine, None, None]:
     """Create a synchronous in-memory SQLite engine with all tables.
 
     A fresh database is created for each test that requests this fixture,
@@ -46,7 +47,7 @@ def db_engine():
 
 
 @pytest.fixture()
-def db_session(db_engine):
+def db_session(db_engine: Engine) -> Generator[Session, None, None]:
     """Yield a SQLModel ``Session`` that rolls back after each test.
 
     This fixture wraps the session in a transaction that is always rolled
@@ -69,7 +70,7 @@ def db_session(db_engine):
     nested = connection.begin_nested()
 
     @event.listens_for(session, "after_transaction_end")
-    def restart_savepoint(session, transaction_inner):  # noqa: N803
+    def restart_savepoint(session: Session, transaction_inner: SessionTransaction) -> None:  # noqa: N803
         nonlocal nested
         if transaction_inner.nested and not transaction_inner.parent.nested:
             nested = connection.begin_nested()
@@ -186,7 +187,7 @@ def mock_spotify_client() -> AsyncMock:
 
 
 @pytest.fixture()
-def sample_track_data() -> dict:
+def sample_track_data() -> dict[str, Any]:
     """Return a dictionary of sample track data matching the Track model schema.
 
     Useful for constructing ``Track`` model instances or simulating API
@@ -204,12 +205,12 @@ def sample_track_data() -> dict:
         "duration_ms": 354947,
         "popularity": 89,
         "isrc": "GBUM71029604",
-        "cached_at": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
+        "cached_at": datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC),
     }
 
 
 @pytest.fixture()
-def sample_playlist_data() -> dict:
+def sample_playlist_data() -> dict[str, Any]:
     """Return a dictionary of sample playlist data matching the Playlist model schema.
 
     Useful for constructing ``Playlist`` model instances or simulating API
@@ -228,7 +229,7 @@ def sample_playlist_data() -> dict:
         "snapshot_id": "MTY4ODQ2MDAwMCwwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA",
         "follower_count": 35_000_000,
         "track_count": 50,
-        "last_synced_at": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
-        "created_at": datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
-        "updated_at": datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
+        "last_synced_at": datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC),
+        "created_at": datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC),
+        "updated_at": datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC),
     }

@@ -206,12 +206,8 @@ class SchedulerService:
                 return
 
             job_type: str = scheduled_job.job_type
-            playlist_id: str | None = self._resolve_playlist_spotify_id(
-                session, scheduled_job
-            )
-            config: dict[str, Any] = (
-                scheduled_job.config if scheduled_job.config else {}
-            )
+            playlist_id: str | None = self._resolve_playlist_spotify_id(session, scheduled_job)
+            config: dict[str, Any] = scheduled_job.config if scheduled_job.config else {}
 
         # Dispatch to the appropriate handler.
         try:
@@ -279,14 +275,10 @@ class SchedulerService:
 
         source_id = config.get("source_playlist_id")
         if not source_id:
-            logger.error(
-                "discover_weekly_archive requires 'source_playlist_id' in config"
-            )
+            logger.error("discover_weekly_archive requires 'source_playlist_id' in config")
             return
         if not playlist_id:
-            logger.error(
-                "discover_weekly_archive requires a target playlist_id"
-            )
+            logger.error("discover_weekly_archive requires a target playlist_id")
             return
 
         manager = PlaylistManager(self._sp)
@@ -299,9 +291,7 @@ class SchedulerService:
 
         if uris:
             await manager.add_tracks(playlist_id, uris)
-            logger.info(
-                "Archived %d tracks from %s to %s", len(uris), source_id, playlist_id
-            )
+            logger.info("Archived %d tracks from %s to %s", len(uris), source_id, playlist_id)
         else:
             logger.warning("No tracks found in source playlist %s", source_id)
 
@@ -318,9 +308,7 @@ class SchedulerService:
         from spotifyforge.core.playlist_manager import PlaylistManager
 
         time_range = config.get("time_range", "short_term")
-        name_template = config.get(
-            "playlist_name_template", "Time Capsule - {date}"
-        )
+        name_template = config.get("playlist_name_template", "Time Capsule - {date}")
 
         engine = DiscoveryEngine(self._sp)
         tracks = await engine.build_time_capsule(time_range=time_range)
@@ -329,9 +317,7 @@ class SchedulerService:
             logger.warning("No tracks returned for time capsule (%s)", time_range)
             return
 
-        playlist_name = name_template.format(
-            date=datetime.utcnow().strftime("%Y-%m-%d")
-        )
+        playlist_name = name_template.format(date=datetime.utcnow().strftime("%Y-%m-%d"))
 
         manager = PlaylistManager(self._sp)
         new_playlist = await manager.create_playlist(
@@ -344,9 +330,7 @@ class SchedulerService:
         if uris:
             await manager.add_tracks(new_playlist.spotify_id, uris)
 
-        logger.info(
-            "Created time capsule '%s' with %d tracks", playlist_name, len(uris)
-        )
+        logger.info("Created time capsule '%s' with %d tracks", playlist_name, len(uris))
 
     async def _handle_deduplicate(self, playlist_id: str | None) -> None:
         """Remove duplicate tracks from a playlist."""
