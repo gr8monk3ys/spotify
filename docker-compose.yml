@@ -1,0 +1,50 @@
+# =============================================================================
+# SpotifyForge — Docker Compose (local development)
+# =============================================================================
+# Usage:
+#   docker compose up --build        # Build and start all services
+#   docker compose up -d             # Start in background
+#   docker compose logs -f           # Follow logs
+#   docker compose down              # Stop and remove containers
+
+services:
+  spotifyforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spotifyforge
+    env_file:
+      - .env
+    ports:
+      - "${SPOTIFYFORGE_WEB_PORT:-8000}:8000"
+    volumes:
+      # Persist the SQLite database across container restarts
+      - spotifyforge-data:/home/spotifyforge/.spotifyforge
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # -------------------------------------------------------------------
+  # Redis — uncomment when migrating background jobs to Celery
+  # -------------------------------------------------------------------
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: spotifyforge-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 3
+
+volumes:
+  spotifyforge-data:
+  # redis-data:
