@@ -14,3 +14,5 @@ Include:
 - Initial acknowledgement: within 72 hours
 - Triage decision: within 7 days
 - Fix timeline: depends on severity and complexity
+
+For private disclosure, use GitHub Security Advisories: [https://github.com/gr8monk3ys/spotify/security/advisories](https://github.com/gr8monk3ys/spotify/security/advisories).
