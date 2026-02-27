@@ -229,6 +229,41 @@ class TestConvenienceEmitters:
         assert received[0].payload["alert_type"] == "staleness"
 
 
+class TestEdgeCases:
+    def test_unsubscribe_nonexistent_callback(self, bus: EventBus):
+        """Unsubscribing a callback that was never subscribed should not raise."""
+        async def h(event):
+            pass
+
+        bus.unsubscribe(EventType.JOB_COMPLETED, h)  # no-op, should not raise
+
+    def test_unsubscribe_all_nonexistent_callback(self, bus: EventBus):
+        """Unsubscribing a global callback that was never subscribed should not raise."""
+        async def h(event):
+            pass
+
+        bus.unsubscribe_all(h)  # no-op, should not raise
+
+    @pytest.mark.asyncio
+    async def test_emit_sync_with_running_loop(self, bus: EventBus):
+        """emit_sync should schedule the task when there's a running loop."""
+        import asyncio
+
+        received = []
+
+        async def handler(event):
+            received.append(event)
+
+        bus.subscribe(EventType.JOB_COMPLETED, handler)
+        bus.emit_sync(Event(EventType.JOB_COMPLETED, user_id=1))
+        await asyncio.sleep(0.05)  # let the task run
+        assert len(received) == 1
+
+    def test_emit_sync_without_loop(self, bus: EventBus):
+        """emit_sync without a running event loop should not raise."""
+        bus.emit_sync(Event(EventType.JOB_COMPLETED))  # should not raise
+
+
 class TestGlobalSingleton:
     def test_get_event_bus_returns_same_instance(self):
         bus1 = get_event_bus()

@@ -123,3 +123,12 @@ class TestGlobalRegistry:
         cb1 = get_breaker("service_a")
         cb2 = get_breaker("service_b")
         assert cb1 is not cb2
+
+    def test_get_all_breakers(self):
+        from spotifyforge.core.circuit_breaker import get_all_breakers
+
+        get_breaker("svc_x")
+        get_breaker("svc_y")
+        all_b = get_all_breakers()
+        assert "svc_x" in all_b
+        assert "svc_y" in all_b

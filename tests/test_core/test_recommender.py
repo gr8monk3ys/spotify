@@ -232,3 +232,40 @@ class TestRecommendPlaylistExpansion:
     def test_empty_playlist_returns_empty(self):
         results = recommend_playlist_expansion([], [(_track(1), _af())], limit=5)
         assert results == []
+
+
+class TestExplanation:
+    def test_no_matching_features_gives_general_reason(self):
+        """When no features are close, return 'General audio profile match'."""
+        target = _af(energy=0.1, valence=0.1, danceability=0.1, acousticness=0.1, instrumentalness=0.1)
+        candidate = _af(energy=0.9, valence=0.9, danceability=0.9, acousticness=0.9, instrumentalness=0.9)
+        results = recommend_similar_tracks(target, [(_track(1), candidate)], limit=1)
+        assert any("General audio profile match" in r for r in results[0]["reasons"])
+
+    def test_missing_feature_skipped_in_explanation(self):
+        """Features missing from target or candidate should not cause errors."""
+        target = {"energy": 0.5}
+        candidate = {"energy": 0.52}
+        results = recommend_similar_tracks(target, [(_track(1), candidate)], limit=1)
+        assert len(results) == 1
+
+    def test_low_value_feature_uses_low_word(self):
+        """Features below 0.5 should use the 'low' word variant."""
+        from spotifyforge.core.recommender import _explain_similarity
+
+        target = _af(valence=0.3)
+        candidate = _af(valence=0.28)
+        reasons = _explain_similarity(target, candidate)
+        assert any("melancholic" in r for r in reasons)
+
+
+class TestMMREdgeCases:
+    def test_mmr_empty_input(self):
+        results = recommend_similar_tracks(_af(), [], limit=5)
+        assert results == []
+
+    def test_mmr_limit_exceeds_candidates(self):
+        target = _af()
+        candidates = [(_track(1), _af()), (_track(2), _af())]
+        results = recommend_similar_tracks(target, candidates, limit=10, diversity=0.0)
+        assert len(results) == 2

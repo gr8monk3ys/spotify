@@ -299,3 +299,89 @@ class TestDryRun:
         report = dry_run([], {}, rules)
         assert report["original_count"] == 0
         assert report["result_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Edge cases for coverage
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    def test_added_before_days_missing_added_at(self):
+        track = {"id": 1, "name": "T", "popularity": 50}
+        assert not track_matches_conditions(track, None, {"added_before_days": 7})
+
+    def test_added_after_days_missing_added_at(self):
+        track = {"id": 1, "name": "T", "popularity": 50}
+        assert not track_matches_conditions(track, None, {"added_after_days": 7})
+
+    def test_added_before_days_invalid_date_string(self):
+        track = {"id": 1, "name": "T", "popularity": 50, "added_at": "not-a-date"}
+        assert not track_matches_conditions(track, None, {"added_before_days": 7})
+
+    def test_added_after_days_invalid_date_string(self):
+        track = {"id": 1, "name": "T", "popularity": 50, "added_at": "not-a-date"}
+        assert not track_matches_conditions(track, None, {"added_after_days": 7})
+
+    def test_added_before_days_naive_datetime(self):
+        """Naive datetimes (no tzinfo) should be handled."""
+        from datetime import datetime
+
+        old = datetime(2020, 1, 1)
+        track = {"id": 1, "name": "T", "popularity": 50, "added_at": old.isoformat()}
+        assert track_matches_conditions(track, None, {"added_before_days": 7})
+
+    def test_rule_error_is_logged(self):
+        """A rule that raises internally should be captured in the eval log."""
+        tracks = [_track(tid=1)]
+        # Force an error by giving bad conditions type via a filter with bad data
+        bad_rule = _rule(
+            name="bad_rule",
+            rule_type="filter",
+            conditions={"energy_range": "not-a-list"},  # should be [lo, hi]
+        )
+        result, log = apply_rules(tracks, {1: _af()}, [bad_rule])
+        assert len(log) == 1
+        assert log[0]["status"] == "error"
+
+    def test_sort_by_missing_audio_feature(self):
+        """Sort by audio feature when track has no features."""
+        tracks = [_track(tid=1), _track(tid=2)]
+        af_map = {}  # no audio features
+        rules = [_rule(rule_type="sort", actions={"sort_by": "energy", "order": "asc"})]
+        result, _ = apply_rules(tracks, af_map, rules)
+        assert len(result) == 2
+
+    def test_sort_by_non_numeric_field(self):
+        """Sort by a field that's not numeric (e.g. name)."""
+        tracks = [_track(tid=1, name="Zebra"), _track(tid=2, name="Apple")]
+        rules = [_rule(rule_type="sort", actions={"sort_by": "name", "order": "asc"})]
+        result, _ = apply_rules(tracks, {}, rules)
+        assert len(result) == 2
+
+    def test_sort_missing_field_value(self):
+        """Tracks with None values for the sort field should not crash."""
+        tracks = [{"id": 1, "name": "T", "popularity": None}, _track(tid=2, popularity=50)]
+        rules = [_rule(rule_type="sort", actions={"sort_by": "popularity", "order": "desc"})]
+        result, _ = apply_rules(tracks, {}, rules)
+        assert len(result) == 2
+
+    def test_audio_feature_range_missing_value(self):
+        """Audio feature range check when the feature value is None."""
+        af = {"energy": None, "danceability": 0.5}
+        track = _track()
+        assert not track_matches_conditions(track, af, {"energy_range": [0.3, 0.8]})
+
+    def test_add_tracks_max_add_zero(self):
+        """max_add=0 should add nothing."""
+        tracks = [_track(tid=1)]
+        candidates = [_track(tid=10, spotify_id="sp_10")]
+        rules = [_rule(rule_type="add_tracks", actions={"candidates": candidates, "max_add": 0})]
+        result, _ = apply_rules(tracks, {}, rules)
+        assert len(result) == 1
+
+    def test_add_tracks_empty_candidates(self):
+        tracks = [_track(tid=1)]
+        rules = [_rule(rule_type="add_tracks", actions={"candidates": [], "max_add": 5})]
+        result, _ = apply_rules(tracks, {}, rules)
+        assert len(result) == 1
