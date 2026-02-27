@@ -102,7 +102,8 @@ def apply_rules(
                     "tracks_before": before_count,
                     "tracks_after": len(current),
                     "status": "error",
-                    "error": str(exc),
+                    # Do not expose internal exception messages to clients.
+                    "error": "Rule execution failed. See server logs for details.",
                 }
             )
 
