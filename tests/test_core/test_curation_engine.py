@@ -164,7 +164,9 @@ class TestFilterRule:
     def test_keep_mode(self):
         tracks = [_track(tid=1, popularity=70), _track(tid=2, popularity=30)]
         af_map = {}
-        rules = [_rule(rule_type="filter", conditions={"popularity_above": 50}, actions={"mode": "keep"})]
+        rules = [
+            _rule(rule_type="filter", conditions={"popularity_above": 50}, actions={"mode": "keep"})
+        ]
         result, log = apply_rules(tracks, af_map, rules)
         assert len(result) == 1
         assert result[0]["id"] == 1
@@ -172,7 +174,11 @@ class TestFilterRule:
 
     def test_remove_mode(self):
         tracks = [_track(tid=1, popularity=70), _track(tid=2, popularity=30)]
-        rules = [_rule(rule_type="filter", conditions={"popularity_below": 40}, actions={"mode": "remove"})]
+        rules = [
+            _rule(
+                rule_type="filter", conditions={"popularity_below": 40}, actions={"mode": "remove"}
+            )
+        ]
         result, log = apply_rules(tracks, {}, rules)
         assert len(result) == 1
         assert result[0]["id"] == 1
@@ -180,7 +186,11 @@ class TestFilterRule:
 
 class TestSortRule:
     def test_sort_by_popularity_desc(self):
-        tracks = [_track(tid=1, popularity=30), _track(tid=2, popularity=80), _track(tid=3, popularity=50)]
+        tracks = [
+            _track(tid=1, popularity=30),
+            _track(tid=2, popularity=80),
+            _track(tid=3, popularity=50),
+        ]
         rules = [_rule(rule_type="sort", actions={"sort_by": "popularity", "order": "desc"})]
         result, _ = apply_rules(tracks, {}, rules)
         assert [t["id"] for t in result] == [2, 3, 1]
@@ -256,8 +266,18 @@ class TestRulePipeline:
     def test_rules_chain_in_priority_order(self):
         tracks = [_track(tid=i, popularity=i * 10) for i in range(1, 11)]
         rules = [
-            _rule(name="filter_low", rule_type="remove_tracks", conditions={"popularity_below": 30}, priority=1),
-            _rule(name="sort", rule_type="sort", actions={"sort_by": "popularity", "order": "desc"}, priority=2),
+            _rule(
+                name="filter_low",
+                rule_type="remove_tracks",
+                conditions={"popularity_below": 30},
+                priority=1,
+            ),
+            _rule(
+                name="sort",
+                rule_type="sort",
+                actions={"sort_by": "popularity", "order": "desc"},
+                priority=2,
+            ),
             _rule(name="limit", rule_type="limit", actions={"limit": 3}, priority=3),
         ]
         result, log = apply_rules(tracks, {}, rules)

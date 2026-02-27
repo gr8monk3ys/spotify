@@ -1019,11 +1019,13 @@ async def dry_run_curation(
 
     # Fetch rules
     result = await db.execute(
-        select(CurationRule).where(
+        select(CurationRule)
+        .where(
             CurationRule.playlist_id == playlist_id,
             CurationRule.user_id == current_user.id,
             CurationRule.enabled == True,  # noqa: E712
-        ).order_by(CurationRule.priority)  # type: ignore[arg-type]
+        )
+        .order_by(CurationRule.priority)  # type: ignore[arg-type]
     )
     rules = list(result.scalars().all())
 

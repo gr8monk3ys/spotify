@@ -118,14 +118,10 @@ class EventBus:
                     await result
                 notified += 1
             except Exception:
-                logger.exception(
-                    "Event subscriber failed for %s", event.event_type
-                )
+                logger.exception("Event subscriber failed for %s", event.event_type)
 
         if notified > 0:
-            logger.debug(
-                "Emitted %s to %d subscriber(s)", event.event_type, notified
-            )
+            logger.debug("Emitted %s to %d subscriber(s)", event.event_type, notified)
 
         return notified
 
@@ -138,9 +134,7 @@ class EventBus:
             loop = asyncio.get_running_loop()
             loop.create_task(self.emit(event))
         except RuntimeError:
-            logger.debug(
-                "No event loop available for sync emit of %s", event.event_type
-            )
+            logger.debug("No event loop available for sync emit of %s", event.event_type)
 
     def subscriber_count(self, event_type: EventType | None = None) -> int:
         """Return the number of subscribers for a given event type."""
@@ -185,11 +179,13 @@ async def emit_job_completed(
 ) -> None:
     """Emit a JOB_COMPLETED event."""
     bus = get_event_bus()
-    await bus.emit(Event(
-        event_type=EventType.JOB_COMPLETED,
-        user_id=user_id,
-        payload={"job_name": job_name, "job_type": job_type, **(details or {})},
-    ))
+    await bus.emit(
+        Event(
+            event_type=EventType.JOB_COMPLETED,
+            user_id=user_id,
+            payload={"job_name": job_name, "job_type": job_type, **(details or {})},
+        )
+    )
 
 
 async def emit_job_failed(
@@ -200,11 +196,13 @@ async def emit_job_failed(
 ) -> None:
     """Emit a JOB_FAILED event."""
     bus = get_event_bus()
-    await bus.emit(Event(
-        event_type=EventType.JOB_FAILED,
-        user_id=user_id,
-        payload={"job_name": job_name, "job_type": job_type, "error": error},
-    ))
+    await bus.emit(
+        Event(
+            event_type=EventType.JOB_FAILED,
+            user_id=user_id,
+            payload={"job_name": job_name, "job_type": job_type, "error": error},
+        )
+    )
 
 
 async def emit_playlist_changed(
@@ -215,11 +213,13 @@ async def emit_playlist_changed(
 ) -> None:
     """Emit a PLAYLIST_CHANGED event."""
     bus = get_event_bus()
-    await bus.emit(Event(
-        event_type=EventType.PLAYLIST_CHANGED,
-        user_id=user_id,
-        payload={"playlist_id": playlist_id, "change_type": change_type, **(details or {})},
-    ))
+    await bus.emit(
+        Event(
+            event_type=EventType.PLAYLIST_CHANGED,
+            user_id=user_id,
+            payload={"playlist_id": playlist_id, "change_type": change_type, **(details or {})},
+        )
+    )
 
 
 async def emit_health_alert(
@@ -230,12 +230,14 @@ async def emit_health_alert(
 ) -> None:
     """Emit a HEALTH_ALERT event."""
     bus = get_event_bus()
-    await bus.emit(Event(
-        event_type=EventType.HEALTH_ALERT,
-        user_id=user_id,
-        payload={
-            "playlist_id": playlist_id,
-            "alert_type": alert_type,
-            "message": message,
-        },
-    ))
+    await bus.emit(
+        Event(
+            event_type=EventType.HEALTH_ALERT,
+            user_id=user_id,
+            payload={
+                "playlist_id": playlist_id,
+                "alert_type": alert_type,
+                "message": message,
+            },
+        )
+    )

@@ -55,8 +55,13 @@ class TestJSONFormatter:
         correlation_id_var.set("abc123def456")
         formatter = JSONFormatter()
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname="", lineno=1,
-            msg="test", args=(), exc_info=None,
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=1,
+            msg="test",
+            args=(),
+            exc_info=None,
         )
         output = formatter.format(record)
         data = json.loads(output)
@@ -67,8 +72,13 @@ class TestJSONFormatter:
         correlation_id_var.set("")
         formatter = JSONFormatter()
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname="", lineno=1,
-            msg="test", args=(), exc_info=None,
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=1,
+            msg="test",
+            args=(),
+            exc_info=None,
         )
         output = formatter.format(record)
         data = json.loads(output)
@@ -77,8 +87,13 @@ class TestJSONFormatter:
     def test_includes_extra_fields(self):
         formatter = JSONFormatter()
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname="", lineno=1,
-            msg="test", args=(), exc_info=None,
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=1,
+            msg="test",
+            args=(),
+            exc_info=None,
         )
         record.user_id = 42  # type: ignore[attr-defined]
         record.status_code = 200  # type: ignore[attr-defined]
@@ -97,8 +112,13 @@ class TestJSONFormatter:
             exc_info = sys.exc_info()
 
         record = logging.LogRecord(
-            name="test", level=logging.ERROR, pathname="", lineno=1,
-            msg="error", args=(), exc_info=exc_info,
+            name="test",
+            level=logging.ERROR,
+            pathname="",
+            lineno=1,
+            msg="error",
+            args=(),
+            exc_info=exc_info,
         )
         output = formatter.format(record)
         data = json.loads(output)

@@ -197,11 +197,13 @@ def recommend_similar_tracks(
     results = []
     for track, af, score in selected:
         reasons = _explain_similarity(target_af, af)
-        results.append({
-            "track": track,
-            "score": score,
-            "reasons": reasons,
-        })
+        results.append(
+            {
+                "track": track,
+                "score": score,
+                "reasons": reasons,
+            }
+        )
 
     return results
 

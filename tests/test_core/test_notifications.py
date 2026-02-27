@@ -232,6 +232,7 @@ class TestConvenienceEmitters:
 class TestEdgeCases:
     def test_unsubscribe_nonexistent_callback(self, bus: EventBus):
         """Unsubscribing a callback that was never subscribed should not raise."""
+
         async def h(event):
             pass
 
@@ -239,6 +240,7 @@ class TestEdgeCases:
 
     def test_unsubscribe_all_nonexistent_callback(self, bus: EventBus):
         """Unsubscribing a global callback that was never subscribed should not raise."""
+
         async def h(event):
             pass
 

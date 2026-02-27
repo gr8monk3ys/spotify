@@ -84,23 +84,27 @@ def apply_rules(
                 logger.warning("Unknown rule type '%s' in rule '%s'", rule_type, rule_name)
                 continue
 
-            eval_log.append({
-                "rule_name": rule_name,
-                "rule_type": rule_type,
-                "tracks_before": before_count,
-                "tracks_after": len(current),
-                "status": "applied",
-            })
+            eval_log.append(
+                {
+                    "rule_name": rule_name,
+                    "rule_type": rule_type,
+                    "tracks_before": before_count,
+                    "tracks_after": len(current),
+                    "status": "applied",
+                }
+            )
         except Exception as exc:
             logger.error("Rule '%s' failed: %s", rule_name, exc)
-            eval_log.append({
-                "rule_name": rule_name,
-                "rule_type": rule_type,
-                "tracks_before": before_count,
-                "tracks_after": len(current),
-                "status": "error",
-                "error": str(exc),
-            })
+            eval_log.append(
+                {
+                    "rule_name": rule_name,
+                    "rule_type": rule_type,
+                    "tracks_before": before_count,
+                    "tracks_after": len(current),
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
 
     return current, eval_log
 
@@ -129,15 +133,15 @@ def _check_condition(
     value: Any,
 ) -> bool:
     """Evaluate a single condition against a track."""
-    pop = track.get("popularity") or 0
+    pop: int = int(track.get("popularity") or 0)
 
     if key == "popularity_below":
-        return pop < value
+        return bool(pop < value)
     if key == "popularity_above":
-        return pop >= value
+        return bool(pop >= value)
     if key == "popularity_between":
         lo, hi = value
-        return lo <= pop <= hi
+        return bool(lo <= pop <= hi)
 
     if key == "added_before_days":
         added_at = track.get("added_at")
@@ -169,9 +173,14 @@ def _check_condition(
 
     # Audio feature range conditions
     audio_feature_ranges = {
-        "energy_range", "danceability_range", "valence_range",
-        "tempo_range", "acousticness_range", "instrumentalness_range",
-        "speechiness_range", "liveness_range",
+        "energy_range",
+        "danceability_range",
+        "valence_range",
+        "tempo_range",
+        "acousticness_range",
+        "instrumentalness_range",
+        "speechiness_range",
+        "liveness_range",
     }
     if key in audio_feature_ranges:
         if af is None:
@@ -181,7 +190,7 @@ def _check_condition(
         if feat_val is None:
             return False
         lo, hi = value
-        return lo <= feat_val <= hi
+        return bool(lo <= feat_val <= hi)
 
     # Genre match (checks if any artist genre contains the target)
     if key == "genre_match":
@@ -190,9 +199,9 @@ def _check_condition(
         return any(target in g.lower() for g in genres)
 
     if key == "duration_above_ms":
-        return (track.get("duration_ms") or 0) >= value
+        return bool(int(track.get("duration_ms") or 0) >= value)
     if key == "duration_below_ms":
-        return (track.get("duration_ms") or 0) < value
+        return bool(int(track.get("duration_ms") or 0) < value)
 
     logger.debug("Unknown condition key: %s", key)
     return True  # unknown conditions are permissive
@@ -237,13 +246,21 @@ def _apply_sort(
     reverse = order == "desc"
 
     audio_keys = {
-        "energy", "danceability", "valence", "tempo", "acousticness",
-        "instrumentalness", "speechiness", "liveness", "loudness",
+        "energy",
+        "danceability",
+        "valence",
+        "tempo",
+        "acousticness",
+        "instrumentalness",
+        "speechiness",
+        "liveness",
+        "loudness",
     }
 
     def sort_key(track: TrackData) -> float:
         if sort_by in audio_keys:
-            af = af_map.get(track.get("id"))
+            tid = track.get("id")
+            af = af_map.get(tid) if isinstance(tid, int) else None
             if af:
                 val = af.get(sort_by)
                 if val is not None:

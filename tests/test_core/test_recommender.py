@@ -112,10 +112,12 @@ class TestTasteProfile:
         assert profile["valence"] == 0.6
 
     def test_multiple_tracks_averaged(self):
-        profile = compute_taste_profile([
-            _af(energy=0.6),
-            _af(energy=0.8),
-        ])
+        profile = compute_taste_profile(
+            [
+                _af(energy=0.6),
+                _af(energy=0.8),
+            ]
+        )
         assert profile["energy"] == pytest.approx(0.7)
 
     def test_empty_list(self):
@@ -205,8 +207,7 @@ class TestRecommendSimilarTracks:
         target = _af(energy=0.8, valence=0.8)
         # All similar candidates
         candidates = [
-            (_track(i), _af(energy=0.75 + i * 0.01, valence=0.75 + i * 0.01))
-            for i in range(10)
+            (_track(i), _af(energy=0.75 + i * 0.01, valence=0.75 + i * 0.01)) for i in range(10)
         ]
         results_no_div = recommend_similar_tracks(target, candidates, limit=5, diversity=0.0)
         results_high_div = recommend_similar_tracks(target, candidates, limit=5, diversity=0.8)
@@ -237,8 +238,12 @@ class TestRecommendPlaylistExpansion:
 class TestExplanation:
     def test_no_matching_features_gives_general_reason(self):
         """When no features are close, return 'General audio profile match'."""
-        target = _af(energy=0.1, valence=0.1, danceability=0.1, acousticness=0.1, instrumentalness=0.1)
-        candidate = _af(energy=0.9, valence=0.9, danceability=0.9, acousticness=0.9, instrumentalness=0.9)
+        target = _af(
+            energy=0.1, valence=0.1, danceability=0.1, acousticness=0.1, instrumentalness=0.1
+        )
+        candidate = _af(
+            energy=0.9, valence=0.9, danceability=0.9, acousticness=0.9, instrumentalness=0.9
+        )
         results = recommend_similar_tracks(target, [(_track(1), candidate)], limit=1)
         assert any("General audio profile match" in r for r in results[0]["reasons"])
 

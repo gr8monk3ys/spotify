@@ -26,9 +26,7 @@ class RetryExhaustedError(Exception):
     def __init__(self, attempts: int, last_exception: Exception) -> None:
         self.attempts = attempts
         self.last_exception = last_exception
-        super().__init__(
-            f"All {attempts} retry attempts exhausted. Last error: {last_exception}"
-        )
+        super().__init__(f"All {attempts} retry attempts exhausted. Last error: {last_exception}")
 
 
 def with_retry(
@@ -76,7 +74,11 @@ def with_retry(
                     delay = _compute_delay(attempt, base_delay, max_delay, jitter)
                     logger.warning(
                         "[%s] Attempt %d/%d failed: %s. Retrying in %.2fs",
-                        svc, attempt, max_attempts, exc, delay,
+                        svc,
+                        attempt,
+                        max_attempts,
+                        exc,
+                        delay,
                     )
                     await asyncio.sleep(delay)
 
@@ -99,7 +101,11 @@ def with_retry(
                     delay = _compute_delay(attempt, base_delay, max_delay, jitter)
                     logger.warning(
                         "[%s] Attempt %d/%d failed: %s. Retrying in %.2fs",
-                        svc, attempt, max_attempts, exc, delay,
+                        svc,
+                        attempt,
+                        max_attempts,
+                        exc,
+                        delay,
                     )
                     time.sleep(delay)
 
@@ -124,4 +130,4 @@ def _compute_delay(
     delay = base_delay * (2 ** (attempt - 1))
     delay = min(delay, max_delay)
     jitter_amount = delay * jitter * random.random()  # noqa: S311
-    return delay + jitter_amount
+    return float(delay + jitter_amount)
