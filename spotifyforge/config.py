@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     cache_ttl_artist_data: int = 86400  # 24 hours
     cache_ttl_playlist_contents: int = 3600  # 1 hour
 
+    # Structured logging format ("text" or "json")
+    log_format: str = "text"
+
+    # Circuit breaker
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_cooldown: int = 30
+
+    # Notifications
+    notifications_enabled: bool = True
+    webhook_timeout: int = 10
+
     @model_validator(mode="after")
     def _validate_config(self) -> "Settings":
         """Validate that required settings are present for production."""
