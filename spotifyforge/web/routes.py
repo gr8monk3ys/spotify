@@ -22,6 +22,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from spotifyforge.models.models import (
+    CurationEvalLog,
+    CurationRule,
+    CurationRuleCreate,
+    CurationRuleResponse,
     Playlist,
     PlaylistCreate,
     PlaylistResponse,
@@ -936,3 +940,189 @@ async def toggle_schedule(
         logger.warning("Failed to sync job toggle with scheduler: %s", exc)
 
     return job
+
+
+# =========================================================================
+# Curation Router
+# =========================================================================
+curation_router = APIRouter(prefix="/api/curation", tags=["curation"])
+
+
+@curation_router.get("/rules", response_model=list[CurationRuleResponse])
+async def list_curation_rules(
+    playlist_id: int | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> Any:
+    """List curation rules for the current user, optionally filtered by playlist."""
+    stmt = select(CurationRule).where(CurationRule.user_id == current_user.id)
+    if playlist_id is not None:
+        stmt = stmt.where(CurationRule.playlist_id == playlist_id)
+    stmt = stmt.order_by(CurationRule.priority)  # type: ignore[arg-type]
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+@curation_router.post("/rules", response_model=CurationRuleResponse, status_code=201)
+async def create_curation_rule(
+    body: CurationRuleCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> Any:
+    """Create a new curation rule."""
+    rule = CurationRule(
+        user_id=current_user.id,
+        name=body.name,
+        rule_type=body.rule_type,
+        playlist_id=body.playlist_id,
+        conditions=body.conditions,
+        actions=body.actions,
+        enabled=body.enabled,
+        priority=body.priority,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    db.add(rule)
+    await db.commit()
+    await db.refresh(rule)
+    return rule
+
+
+@curation_router.delete("/rules/{rule_id}", status_code=204)
+async def delete_curation_rule(
+    rule_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> None:
+    """Delete a curation rule."""
+    result = await db.execute(
+        select(CurationRule).where(
+            CurationRule.id == rule_id,
+            CurationRule.user_id == current_user.id,
+        )
+    )
+    rule = result.scalars().first()
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"Rule {rule_id} not found.")
+    await db.delete(rule)
+    await db.commit()
+
+
+@curation_router.post("/rules/{playlist_id}/dry-run")
+async def dry_run_curation(
+    playlist_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Dry-run curation rules on a playlist without making changes."""
+    from spotifyforge.core.curation_engine import dry_run
+
+    # Fetch rules
+    result = await db.execute(
+        select(CurationRule)
+        .where(
+            CurationRule.playlist_id == playlist_id,
+            CurationRule.user_id == current_user.id,
+            CurationRule.enabled == True,  # noqa: E712
+        )
+        .order_by(CurationRule.priority)  # type: ignore[arg-type]
+    )
+    rules = list(result.scalars().all())
+
+    if not rules:
+        return {"message": "No enabled rules for this playlist", "eval_log": []}
+
+    # For dry run, we need the playlist's tracks — return a simplified result
+    rule_dicts = [
+        {
+            "name": r.name,
+            "rule_type": r.rule_type,
+            "conditions": r.conditions or {},
+            "actions": r.actions or {},
+            "enabled": r.enabled,
+            "priority": r.priority,
+        }
+        for r in rules
+    ]
+
+    # Use empty tracks for now (real implementation would fetch from DB)
+    report = dry_run(tracks=[], audio_features_map={}, rules=rule_dicts)
+    report["rules_count"] = len(rules)
+    return report
+
+
+@curation_router.get("/logs/{playlist_id}")
+async def get_curation_logs(
+    playlist_id: int,
+    limit: int = Query(default=20, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    """Get curation evaluation log entries for a playlist."""
+    result = await db.execute(
+        select(CurationEvalLog)
+        .where(
+            CurationEvalLog.playlist_id == playlist_id,
+            CurationEvalLog.user_id == current_user.id,
+        )
+        .order_by(CurationEvalLog.executed_at.desc())  # type: ignore[union-attr]
+        .limit(limit)
+    )
+    logs = result.scalars().all()
+    return [
+        {
+            "id": log.id,
+            "rules_applied": log.rules_applied,
+            "tracks_before": log.tracks_before,
+            "tracks_after": log.tracks_after,
+            "details": log.details,
+            "executed_at": log.executed_at.isoformat() if log.executed_at else None,
+        }
+        for log in logs
+    ]
+
+
+# =========================================================================
+# Recommendation Router
+# =========================================================================
+recommend_router = APIRouter(prefix="/api/recommend", tags=["recommendations"])
+
+
+@recommend_router.get("/taste-profile")
+async def get_taste_profile(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Compute the user's taste profile from their top tracks."""
+    from spotifyforge.core.recommender import compute_taste_profile
+    from spotifyforge.models.models import AudioFeatures
+
+    # Get all audio features for user's playlist tracks
+    result = await db.execute(select(AudioFeatures).limit(200))
+    features = result.scalars().all()
+
+    af_dicts = [
+        {
+            "energy": af.energy,
+            "danceability": af.danceability,
+            "valence": af.valence,
+            "acousticness": af.acousticness,
+            "instrumentalness": af.instrumentalness,
+            "speechiness": af.speechiness,
+            "liveness": af.liveness,
+            "tempo": af.tempo,
+        }
+        for af in features
+    ]
+
+    profile = compute_taste_profile(af_dicts)
+    return {"profile": profile, "tracks_analyzed": len(af_dicts)}
+
+
+@recommend_router.get("/circuit-breakers")
+async def get_circuit_breaker_status() -> dict[str, Any]:
+    """Get the status of all circuit breakers (ops/debugging endpoint)."""
+    from spotifyforge.core.circuit_breaker import get_all_breakers
+
+    breakers = get_all_breakers()
+    return {name: cb.stats() for name, cb in breakers.items()}

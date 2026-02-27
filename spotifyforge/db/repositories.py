@@ -15,10 +15,13 @@ from sqlmodel import Session, select
 from spotifyforge.models.models import (
     Artist,
     AudioFeatures,
+    CurationEvalLog,
+    CurationRule,
     Playlist,
     PlaylistTrack,
     ScheduledJob,
     Track,
+    WebhookConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -441,4 +444,115 @@ class ScheduledJobRepository:
     def delete(self, job: ScheduledJob) -> None:
         """Remove a scheduled job from the database."""
         self.session.delete(job)
+        self.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# CurationRuleRepository
+# ---------------------------------------------------------------------------
+
+
+class CurationRuleRepository:
+    """CRUD operations for :class:`CurationRule`."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, data: dict) -> CurationRule:
+        rule = CurationRule(**data)
+        self.session.add(rule)
+        self.session.commit()
+        self.session.refresh(rule)
+        return rule
+
+    def get_by_id(self, rule_id: int) -> CurationRule | None:
+        return self.session.get(CurationRule, rule_id)
+
+    def get_by_user(self, user_id: int) -> list[CurationRule]:
+        stmt = select(CurationRule).where(CurationRule.user_id == user_id)
+        return list(self.session.exec(stmt).all())
+
+    def get_by_playlist(self, playlist_id: int, enabled_only: bool = True) -> list[CurationRule]:
+        stmt = select(CurationRule).where(CurationRule.playlist_id == playlist_id)
+        if enabled_only:
+            stmt = stmt.where(CurationRule.enabled == True)  # noqa: E712
+        stmt = stmt.order_by(CurationRule.priority)  # type: ignore[arg-type]
+        return list(self.session.exec(stmt).all())
+
+    def update(self, rule: CurationRule, data: dict) -> CurationRule:
+        for key, value in data.items():
+            setattr(rule, key, value)
+        rule.updated_at = _utcnow()
+        self.session.add(rule)
+        self.session.commit()
+        self.session.refresh(rule)
+        return rule
+
+    def delete(self, rule: CurationRule) -> None:
+        self.session.delete(rule)
+        self.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# CurationEvalLogRepository
+# ---------------------------------------------------------------------------
+
+
+class CurationEvalLogRepository:
+    """CRUD operations for :class:`CurationEvalLog`."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, data: dict) -> CurationEvalLog:
+        log = CurationEvalLog(**data)
+        self.session.add(log)
+        self.session.commit()
+        self.session.refresh(log)
+        return log
+
+    def get_by_playlist(self, playlist_id: int, limit: int = 20) -> list[CurationEvalLog]:
+        stmt = (
+            select(CurationEvalLog)
+            .where(CurationEvalLog.playlist_id == playlist_id)
+            .order_by(CurationEvalLog.executed_at.desc())  # type: ignore[union-attr]
+            .limit(limit)
+        )
+        return list(self.session.exec(stmt).all())
+
+
+# ---------------------------------------------------------------------------
+# WebhookConfigRepository
+# ---------------------------------------------------------------------------
+
+
+class WebhookConfigRepository:
+    """CRUD operations for :class:`WebhookConfig`."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, data: dict) -> WebhookConfig:
+        config = WebhookConfig(**data)
+        self.session.add(config)
+        self.session.commit()
+        self.session.refresh(config)
+        return config
+
+    def get_by_user(self, user_id: int) -> list[WebhookConfig]:
+        stmt = select(WebhookConfig).where(WebhookConfig.user_id == user_id)
+        return list(self.session.exec(stmt).all())
+
+    def get_enabled_for_event(self, user_id: int, event_type: str) -> list[WebhookConfig]:
+        """Return enabled webhooks for a user that subscribe to an event type."""
+        stmt = select(WebhookConfig).where(
+            WebhookConfig.user_id == user_id,
+            WebhookConfig.enabled == True,  # noqa: E712
+        )
+        configs = list(self.session.exec(stmt).all())
+        # Filter by event type (None means all events)
+        return [c for c in configs if c.events is None or event_type in c.events]
+
+    def delete(self, config: WebhookConfig) -> None:
+        self.session.delete(config)
         self.session.commit()

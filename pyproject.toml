@@ -104,5 +104,6 @@ module = [
     "spotifyforge.web.app",
     "spotifyforge.web.deps",
     "spotifyforge.web.routes",
+    "spotifyforge.web.websocket",
 ]
 ignore_errors = true
