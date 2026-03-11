@@ -38,6 +38,7 @@ class JobType(enum.StrEnum):
     discovery_refresh = "discovery_refresh"
     stats_snapshot = "stats_snapshot"
     health_check = "health_check"
+    curation_apply = "curation_apply"
 
 
 class RuleType(enum.StrEnum):
@@ -433,3 +434,61 @@ class CurationRuleResponse(BaseModel):
     priority: int
     created_at: datetime
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# New models for curation logging and webhooks
+# ---------------------------------------------------------------------------
+
+
+class CurationEvalLog(SQLModel, table=True):
+    """Audit log entry for a curation rule evaluation run."""
+
+    __tablename__ = "curation_eval_logs"
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    playlist_id: int = Field(foreign_key="playlists.id", index=True)
+    rules_applied: int = Field(default=0)
+    tracks_before: int = Field(default=0)
+    tracks_after: int = Field(default=0)
+    details: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    executed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class WebhookConfig(SQLModel, table=True):
+    """User-configured webhook for outbound event notifications."""
+
+    __tablename__ = "webhook_configs"
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    url: str = Field(max_length=2048)
+    events: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    secret: str | None = Field(default=None, max_length=256)
+    enabled: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Recommendation schemas
+# ---------------------------------------------------------------------------
+
+
+class RecommendationRequest(BaseModel):
+    """Request schema for track recommendations."""
+
+    model_config = ConfigDict(strict=True)
+
+    playlist_id: int | None = None
+    track_spotify_ids: list[str] | None = None
+    limit: int = 20
+    diversity: float = PydanticField(default=0.3, ge=0.0, le=1.0)
+
+
+class RecommendationResponse(BaseModel):
+    """A single track recommendation with score and reasoning."""
+
+    track: dict[str, Any]
+    score: float
+    reasons: list[str]

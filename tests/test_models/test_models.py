@@ -70,7 +70,7 @@ class TestAudioFeaturesSourceEnum:
 
 
 class TestJobTypeEnum:
-    """JobType should expose exactly six members."""
+    """JobType should expose exactly seven members."""
 
     EXPECTED = {
         "playlist_update",
@@ -79,10 +79,11 @@ class TestJobTypeEnum:
         "discovery_refresh",
         "stats_snapshot",
         "health_check",
+        "curation_apply",
     }
 
     def test_member_count(self) -> None:
-        assert len(JobType) == 6
+        assert len(JobType) == 7
 
     def test_member_values(self) -> None:
         assert {m.value for m in JobType} == self.EXPECTED
@@ -96,6 +97,7 @@ class TestJobTypeEnum:
             "discovery_refresh",
             "stats_snapshot",
             "health_check",
+            "curation_apply",
         ],
     )
     def test_lookup_by_value(self, name) -> None:

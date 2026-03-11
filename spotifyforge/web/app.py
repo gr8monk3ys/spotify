@@ -255,11 +255,26 @@ def create_app() -> FastAPI:
         )
         return response
 
+    # ------------------------------------------------------------------
+    # Correlation ID middleware (for structured logging)
+    # ------------------------------------------------------------------
+    from spotifyforge.logging_config import correlation_id_var, new_correlation_id
+
+    @app.middleware("http")
+    async def correlation_id_middleware(request: Request, call_next):
+        cid = request.headers.get("X-Correlation-ID") or new_correlation_id()
+        correlation_id_var.set(cid)
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = cid
+        return response
+
     # Include routers from the routes module
     from spotifyforge.web.routes import (
         auth_router,
+        curation_router,
         discovery_router,
         playlist_router,
+        recommend_router,
         schedule_router,
     )
 
@@ -267,6 +282,19 @@ def create_app() -> FastAPI:
     app.include_router(playlist_router)
     app.include_router(discovery_router)
     app.include_router(schedule_router)
+    app.include_router(curation_router)
+    app.include_router(recommend_router)
+
+    # WebSocket endpoint for real-time notifications
+    from fastapi import WebSocket as _WebSocket
+
+    from spotifyforge.web.websocket import setup_ws_bridge, websocket_endpoint
+
+    setup_ws_bridge()
+
+    @app.websocket("/ws/notifications")
+    async def ws_notifications(websocket: _WebSocket):
+        await websocket_endpoint(websocket)
 
     # ------------------------------------------------------------------
     # Top-level endpoints (outside any router)
