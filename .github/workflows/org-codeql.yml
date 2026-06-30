@@ -28,4 +28,4 @@ jobs:
         uses: github/codeql-action/autobuild@45580472a5bb82c4681c4ac726cfdb60060c2ee1
 
       - name: Analyze
-        uses: github/codeql-action/analyze@45580472a5bb82c4681c4ac726cfdb60060c2ee1
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e
