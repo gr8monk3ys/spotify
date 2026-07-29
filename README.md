@@ -1,5 +1,9 @@
 # SpotifyForge
 
+<p align="center">
+  <img src="docs/assets/hero.png" alt="spotify preview" width="640">
+</p>
+
 The all-in-one platform for serious Spotify playlist curators.
 
 SpotifyForge gives you a powerful CLI and REST API to manage, curate, discover,
