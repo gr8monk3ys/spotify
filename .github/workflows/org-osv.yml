@@ -7,17 +7,25 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions: read-all
+# The reusable workflow declares `security-events: write`. A called workflow can
+# never receive more permission than its caller holds, so `read-all` here makes
+# GitHub reject the call at startup (startup_failure, no job, no log).
+permissions:
+  actions: read
+  contents: read
+  security-events: write
 
 jobs:
+  # `google/osv-scanner-action/scan-repo` does not exist — that action ships
+  # `action.yml` at its root plus `osv-scanner-action/` and
+  # `osv-reporter-action/`. Every run died at resolution with
+  # "Can't find 'action.yml' ... for action .../scan-repo".
+  #
+  # `fail-on-vuln` and `upload-sarif` are inputs of the REUSABLE WORKFLOW, not
+  # of the action, so calling it is the intended shape — and the one upstream
+  # recommends over using the scanner action directly.
   osv:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-
-      - name: Run OSV Scanner
-        uses: google/osv-scanner-action/scan-repo@c5996e0193a3df57d695c1b8a1dec2a4c62e8730
-        with:
-          fail-on-vuln: false
-          upload-sarif: false
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@c5996e0193a3df57d695c1b8a1dec2a4c62e8730
+    with:
+      fail-on-vuln: false
+      upload-sarif: false
