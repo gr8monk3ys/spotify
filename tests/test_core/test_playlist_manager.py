@@ -9,7 +9,7 @@ error propagation.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import tekore as tk
@@ -596,3 +596,59 @@ class TestSyncPlaylist:
 
         with pytest.raises(tk.HTTPError):
             await mock_manager.sync_playlist("pl1", owner_id=1)
+
+
+class TestTimeoutRetryingSender:
+    """Transport failures get no response, so tekore's RetryingSender
+    never sees them — this is what keeps a bulk run alive."""
+
+    async def test_retries_a_transport_error_then_succeeds(self):
+        import httpx
+
+        from spotifyforge.core.clients import TimeoutRetryingSender
+
+        class Flaky:
+            is_async = True
+
+            def __init__(self):
+                self.calls = 0
+
+            async def send(self, request):
+                self.calls += 1
+                if self.calls == 1:
+                    raise httpx.ReadTimeout("")
+                return "response"
+
+            def close(self):
+                return None
+
+        inner = Flaky()
+        sender = TimeoutRetryingSender(inner, retries=2)
+        sender.retries = 2
+        with patch("asyncio.sleep", new=AsyncMock()):
+            assert await sender.send("req") == "response"
+        assert inner.calls == 2
+
+    async def test_gives_up_after_the_retry_budget(self):
+        import httpx
+
+        from spotifyforge.core.clients import TimeoutRetryingSender
+
+        class Dead:
+            is_async = True
+
+            def __init__(self):
+                self.calls = 0
+
+            async def send(self, request):
+                self.calls += 1
+                raise httpx.ConnectError("down")
+
+            def close(self):
+                return None
+
+        inner = Dead()
+        sender = TimeoutRetryingSender(inner, retries=1)
+        with patch("asyncio.sleep", new=AsyncMock()), pytest.raises(httpx.ConnectError):
+            await sender.send("req")
+        assert inner.calls == 2
