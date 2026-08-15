@@ -162,8 +162,9 @@ def _run_spotify(status_msg: str, error_msg: str, coro_fn):
 def _db_user_id() -> int:
     """Return the local DB user id for the logged-in CLI user, or exit.
 
-    The row is created at login; if it is missing (e.g. the database was
-    deleted), the user is asked to log in again.
+    The row is created at login. If it is missing but the keyring still
+    holds a usable token (e.g. the database file was deleted), it is
+    rebuilt from that token rather than forcing a full re-authorization.
     """
     from sqlmodel import Session, select
 
@@ -174,15 +175,41 @@ def _db_user_id() -> int:
     spotify_user_id = _current_spotify_user_id()
     with Session(get_engine()) as session:
         user = session.exec(select(User).where(User.spotify_id == spotify_user_id)).first()
-        if user is None or user.id is None:
-            _error_panel(
-                "Local user record not found. Run [bold]spotifyforge auth login[/bold] again.",
-                title="Authentication Required",
-            )
-        return user.id
+        if user is not None and user.id is not None:
+            return user.id
+
+    return _rebuild_db_user(spotify_user_id)
 
 
-def _upsert_db_user(profile: dict[str, Any], token: tekore.Token) -> int:
+def _rebuild_db_user(spotify_user_id: str) -> int:
+    """Recreate the local User row from the keyring token, or exit."""
+    from spotifyforge.auth.oauth import get_spotify_user
+
+    auth = _make_auth()
+    try:
+        token = _load_token(auth, spotify_user_id)
+    except Exception:
+        _error_panel(
+            "Local user record not found and no stored credentials to rebuild it.\n"
+            "Run [bold]spotifyforge auth login[/bold] to authenticate.",
+            title="Authentication Required",
+        )
+
+    with console.status("Rebuilding local user record..."):
+        try:
+            profile = _run(get_spotify_user(token.access_token))
+        except Exception as exc:
+            _error_panel(f"Could not rebuild local user record: {exc}")
+
+    user_id = _upsert_db_user(profile["id"], profile, token)
+    console.print(
+        "[yellow]Local database was rebuilt from your stored credentials.[/yellow] "
+        "Playlists and schedules it held were not restored."
+    )
+    return user_id
+
+
+def _upsert_db_user(spotify_id: str, profile: dict[str, Any], token: tekore.Token) -> int:
     """Create or update the local User row (with encrypted tokens).
 
     Tokens are persisted so scheduled jobs (which authenticate from the
@@ -196,9 +223,9 @@ def _upsert_db_user(profile: dict[str, Any], token: tekore.Token) -> int:
 
     init_db()
     with Session(get_engine()) as session:
-        user = session.exec(select(User).where(User.spotify_id == profile["user_id"])).first()
+        user = session.exec(select(User).where(User.spotify_id == spotify_id)).first()
         if user is None:
-            user = User(spotify_id=profile["user_id"])
+            user = User(spotify_id=spotify_id)
         apply_user_profile(user, profile)
         apply_user_tokens(user, token.access_token, token.refresh_token, token.expires_at)
         session.add(user)
@@ -268,7 +295,7 @@ def auth_login(
     try:
         profile = auth.complete_login(redirect_url, expected_state=state)
         token = auth.token_store.load_token(profile["user_id"])
-        _upsert_db_user(profile, token)
+        _upsert_db_user(profile["user_id"], profile, token)
     except Exception as exc:
         _error_panel(f"Login failed: {exc}", title="Authentication Error")
 
@@ -865,6 +892,208 @@ def discover_time_capsule(
             expand=False,
         )
     )
+
+
+# ╔═════════════════════════════════════════════════════════════════════════╗
+# ║  CURATE                                                                ║
+# ╚═════════════════════════════════════════════════════════════════════════╝
+curate_app = typer.Typer(
+    name="curate",
+    help="Forge a catalogue of niche playlists from your liked songs.",
+    no_args_is_help=True,
+)
+app.add_typer(curate_app)
+
+# Shared option definitions so `plan`, `forge` and `reflow` cannot drift
+# apart — a plan that previewed different clusters than the forge creates
+# would make the preview worthless.
+_MIN_SIZE = typer.Option(
+    12, "--min-size", min=2, help="Smallest genre cluster that becomes a playlist."
+)
+_MAX_SIZE = typer.Option(
+    60, "--max-size", min=10, help="Clusters larger than this are split by decade."
+)
+_MAX_TRACKS = typer.Option(
+    None, "--max-tracks", min=1, help="Only scan the first N liked songs (quick preview)."
+)
+_EXCLUSIVE = typer.Option(
+    False,
+    "--exclusive",
+    help="Put each track in only its rarest genre (fewer, sharper playlists).",
+)
+
+
+def _curation_options(min_size, max_size, max_tracks, exclusive):
+    from spotifyforge.core.curation import CurationOptions
+
+    return CurationOptions(
+        min_size=min_size, max_size=max_size, max_tracks=max_tracks, exclusive=exclusive
+    )
+
+
+def _specs_table(specs) -> Table:
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Playlist", style="white", no_wrap=True, max_width=45)
+    table.add_column("Genre", style="green", no_wrap=True, max_width=30)
+    table.add_column("Era", style="magenta")
+    table.add_column("Tracks", justify="right")
+    for idx, spec in enumerate(specs, start=1):
+        table.add_row(
+            str(idx),
+            spec.title,
+            spec.genre_label,
+            f"{spec.decade}s" if spec.decade else "\u2014",
+            str(len(spec.tracks)),
+        )
+    return table
+
+
+@curate_app.command("plan")
+def curate_plan(
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+) -> None:
+    """Preview the playlist catalogue your liked songs would produce (no writes)."""
+    from spotifyforge.core.curation import plan_catalogue
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    plan = _run_spotify(
+        "Scanning your liked songs...",
+        "Failed to plan curation",
+        lambda sp: plan_catalogue(sp, opts),
+    )
+
+    console.print(
+        Panel(
+            f"Liked songs scanned:   [bold]{plan.liked_count}[/bold]\n"
+            f"Unique songs:          [bold]{plan.unique_count}[/bold] "
+            f"({plan.collapsed_count} duplicate versions collapsed)\n"
+            f"Playlists planned:     [bold]{len(plan.specs)}[/bold]\n"
+            f"Songs placed:          [bold]{plan.placed_count}[/bold] of {plan.unique_count} "
+            f"({plan.unique_count - plan.placed_count} in genres too small to fill a playlist)\n"
+            f"Playlist entries:      [bold]{plan.entry_count}[/bold] "
+            "(a song can belong to more than one genre)",
+            title="Curation Plan",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    if plan.specs:
+        console.print(_specs_table(plan.specs))
+        console.print(
+            "\nRun [bold]spotifyforge curate forge --limit N[/bold] to create them "
+            "(already-created titles are skipped, so repeated runs continue the catalogue)."
+        )
+
+
+@curate_app.command("forge")
+def curate_forge(
+    limit: int = typer.Option(
+        5, "--limit", "-l", min=1, help="Maximum playlists to create this run."
+    ),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    private: bool = typer.Option(
+        False, "--private", help="Create the playlists as private instead of public."
+    ),
+) -> None:
+    """Create the next batch of planned playlists on Spotify (resumable)."""
+    from spotifyforge.core.curation import forge_next, plan_catalogue
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    owner_id = _db_user_id()
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+
+    async def _forge(sp):
+        plan = await plan_catalogue(sp, opts)
+        created, pending = await forge_next(
+            PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
+        )
+        return created, pending, len(plan.specs)
+
+    created, pending, total = _run_spotify(
+        "Forging playlists from your liked songs...",
+        "Failed to forge playlists",
+        _forge,
+    )
+
+    if not created:
+        console.print(
+            Panel(
+                f"All {total} planned playlists already exist \u2014 nothing to create.",
+                title="Catalogue complete",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[green]Created {len(created)} playlist(s).[/green]\n"
+            f"Remaining in plan: [bold]{pending - len(created)}[/bold] of {total} \u2014 "
+            "run the same command again to continue.",
+            title="Forge",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(_specs_table([spec for spec, _ in created]))
+
+
+@curate_app.command("reflow")
+def curate_reflow(
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+) -> None:
+    """Re-sequence playlists you already forged, keeping their URLs and followers."""
+    from spotifyforge.core.curation import plan_catalogue, reflow
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+
+    async def _reflow(sp):
+        plan = await plan_catalogue(sp, opts)
+        return await reflow(PlaylistManager(sp), sp, plan.specs), len(plan.specs)
+
+    rewritten, total = _run_spotify(
+        "Re-sequencing your forged playlists...", "Failed to reflow playlists", _reflow
+    )
+
+    if not rewritten:
+        console.print(
+            Panel(
+                f"All {total} planned playlists are already in the right order.",
+                title="Nothing to reflow",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Playlist", style="white", no_wrap=True, max_width=55)
+    table.add_column("Tracks", justify="right")
+    for idx, (title, count) in enumerate(rewritten, start=1):
+        table.add_row(str(idx), title, str(count))
+
+    console.print(
+        Panel(
+            f"[green]Re-sequenced {len(rewritten)} playlist(s)[/green] of {total} planned.",
+            title="Reflow",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(table)
 
 
 # ╔═════════════════════════════════════════════════════════════════════════╗

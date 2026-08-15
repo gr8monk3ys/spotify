@@ -39,13 +39,15 @@ def _full_artist(artist_id: str, name: str, popularity: int = 50, genres: list[s
     return {
         **_artist(artist_id, name),
         "followers": {"href": None, "total": 1000},
-        "genres": genres or ["indie-rock"],
+        "genres": genres if genres is not None else ["indie-rock"],
         "images": [],
         "popularity": popularity,
     }
 
 
-def _album(album_id: str, name: str, artist: dict[str, Any]) -> dict[str, Any]:
+def _album(
+    album_id: str, name: str, artist: dict[str, Any], release_date: str = "2024-01-01"
+) -> dict[str, Any]:
     return {
         "album_type": "album",
         "artists": [artist],
@@ -55,7 +57,7 @@ def _album(album_id: str, name: str, artist: dict[str, Any]) -> dict[str, Any]:
         "id": album_id,
         "images": [],
         "name": name,
-        "release_date": "2024-01-01",
+        "release_date": release_date,
         "release_date_precision": "day",
         "total_tracks": 10,
         "type": "album",
@@ -78,6 +80,9 @@ class FakeSpotify:
         self.artist_albums: dict[str, list[str]] = {}  # artist -> album ids
         self.album_tracks: dict[str, list[str]] = {}  # album -> track ids
         self.albums: dict[str, dict[str, Any]] = {}
+        self.saved_tracks: dict[str, list[str]] = {}  # user -> liked track ids
+        self.artist_genres: dict[str, list[str]] = {}
+        self.artist_names: dict[str, str] = {}
 
         self.valid_tokens: set[str] = set()
         self.valid_codes: dict[str, str] = {}  # auth code -> spotify user id
@@ -119,9 +124,11 @@ class FakeSpotify:
         artist_name: str = "Artist One",
         album_id: str = "alb1",
         album_name: str = "Album One",
+        release_date: str = "2024-01-01",
     ) -> str:
         artist = _artist(artist_id, artist_name)
-        self.albums.setdefault(album_id, _album(album_id, album_name, artist))
+        self.artist_names[artist_id] = artist_name
+        self.albums.setdefault(album_id, _album(album_id, album_name, artist, release_date))
         self.tracks[track_id] = {
             "album": self.albums[album_id],
             "artists": [artist],
@@ -177,6 +184,14 @@ class FakeSpotify:
             "refresh_token": refresh,
             "scope": "playlist-modify-public playlist-modify-private",
         }
+
+    def save_track(self, user_id: str, track_id: str) -> None:
+        """Add *track_id* to *user_id*'s liked songs."""
+        self.saved_tracks.setdefault(user_id, []).append(track_id)
+
+    def set_artist_genres(self, artist_id: str, genres: list[str]) -> None:
+        """Set the genre list returned for *artist_id* by ``GET /v1/artists``."""
+        self.artist_genres[artist_id] = list(genres)
 
     def issue_code(self, user_id: str) -> str:
         """Mint a one-time authorization code for *user_id*."""
@@ -401,6 +416,14 @@ class FakeSpotify:
                             len(track_ids),
                         ),
                     )
+                if request.method == "PUT":  # replace the whole track list
+                    body = json.loads(request.content)
+                    self.playlist_tracks[playlist_id] = [
+                        u.rsplit(":", 1)[-1] for u in body.get("uris", [])
+                    ]
+                    return httpx.Response(
+                        201, json={"snapshot_id": self._snapshot_bump(playlist_id)}
+                    )
                 if request.method == "POST":  # add
                     body = json.loads(request.content)
                     uris = body.get("uris", [])
@@ -425,6 +448,29 @@ class FakeSpotify:
                     return httpx.Response(
                         200, json={"snapshot_id": self._snapshot_bump(playlist_id)}
                     )
+
+        if path == "/v1/me/tracks":
+            ids = self.saved_tracks.get(me, [])
+            items = [
+                {"added_at": "2024-01-01T00:00:00Z", "track": self.tracks[t]}
+                for t in ids[offset : offset + limit]
+            ]
+            return httpx.Response(
+                200, json=self._paging(f"{API}/me/tracks", items, limit, offset, len(ids))
+            )
+
+        if path == "/v1/artists":
+            ids = query.get("ids", "").split(",")
+            artists = [
+                _full_artist(
+                    aid,
+                    self.artist_names.get(aid, f"Artist {aid}"),
+                    genres=self.artist_genres.get(aid, []),
+                )
+                for aid in ids
+                if aid
+            ]
+            return httpx.Response(200, json={"artists": artists})
 
         if path == "/v1/me/top/tracks":
             ids = self.top_tracks.get(me, [])
