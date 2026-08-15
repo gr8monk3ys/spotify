@@ -23,22 +23,34 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from spotifyforge import __version__
+
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = "SpotifyForge/1.0 (https://github.com/gr8monk3ys/spotify)"
+# MusicBrainz requires a truthful User-Agent and blocks clients that
+# misreport, so this tracks the real package version.
+_USER_AGENT = f"SpotifyForge/{__version__} (https://github.com/gr8monk3ys/spotify)"
 
 # MusicBrainz asks unauthenticated clients for at most one request per
 # second and blocks clients that ignore it.
 _MUSICBRAINZ_INTERVAL = 1.05
+
+# ISRCs resolved per MusicBrainz search, and recordings analysed per
+# AcousticBrainz call. Both APIs accept batches; asking one at a time
+# turns a whole library from minutes into hours.
+_MB_BATCH = 25
+_AB_BATCH = 25
 
 # Write the cache to disk every this many lookups, so an interrupted run
 # keeps the work it has already paid for.
@@ -69,6 +81,15 @@ class AudioFeature:
             key=self.key if self.key is not None else other.key,
             mode=self.mode if self.mode is not None else other.mode,
         )
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> AudioFeature:
+        """Read a feature out of its cached JSON shape."""
+        return cls(tempo=raw.get("tempo"), key=raw.get("key"), mode=raw.get("mode"))
+
+    def write_into(self, raw: dict[str, Any]) -> None:
+        """Write this feature into a cache entry, leaving other keys alone."""
+        raw["tempo"], raw["key"], raw["mode"] = self.tempo, self.key, self.mode
 
 
 def parse_key(key_name: str | None, scale: str | None) -> tuple[int | None, int | None]:
@@ -110,9 +131,7 @@ class FeatureCache:
 
     def get(self, isrc: str) -> AudioFeature | None:
         raw = self._data.get(isrc)
-        if raw is None:
-            return None
-        return AudioFeature(tempo=raw.get("tempo"), key=raw.get("key"), mode=raw.get("mode"))
+        return None if raw is None else AudioFeature.from_raw(raw)
 
     def tried(self, isrc: str, provider: str) -> bool:
         """Has *provider* already been asked about *isrc*?"""
@@ -120,10 +139,7 @@ class FeatureCache:
 
     def all(self) -> dict[str, AudioFeature]:
         """Every cached reading, keyed by ISRC."""
-        return {
-            isrc: AudioFeature(tempo=raw.get("tempo"), key=raw.get("key"), mode=raw.get("mode"))
-            for isrc, raw in self._data.items()
-        }
+        return {isrc: AudioFeature.from_raw(raw) for isrc, raw in self._data.items()}
 
     def put(self, isrc: str, feature: AudioFeature, provider: str) -> None:
         """Merge a provider's reading in, remembering that it was asked.
@@ -133,23 +149,51 @@ class FeatureCache:
         playlist because two sources disagree by half a BPM.
         """
         entry = self._data.setdefault(isrc, {"sources": []})
-        merged = AudioFeature(entry.get("tempo"), entry.get("key"), entry.get("mode")).merged_with(
-            feature
-        )
-        entry["tempo"], entry["key"], entry["mode"] = merged.tempo, merged.key, merged.mode
+        AudioFeature.from_raw(entry).merged_with(feature).write_into(entry)
         sources = entry.setdefault("sources", [])
         if provider not in sources:
             sources.append(provider)
 
     def save(self) -> None:
+        """Write the cache out atomically.
+
+        Checkpointing during a long run means many writes; a plain
+        ``write_text`` truncates first, so an interrupt lands in exactly
+        the window it was added to protect. Write a sibling file and
+        rename — ``os.replace`` is atomic on POSIX and Windows.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data))
-        logger.info("Wrote %d cached features to %s", len(self._data), self.path)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self._data))
+        os.replace(tmp, self.path)
+        logger.debug("Wrote %d cached features to %s", len(self._data), self.path)
 
 
 # ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
+
+
+class _RateLimiter:
+    """Enforce a minimum gap between calls, counting time already spent.
+
+    A flat ``sleep(interval)`` after every request pays the full gap even
+    when the request itself took longer than the gap — which, against
+    MusicBrainz, it almost always does. Waiting only for the remainder
+    honours the same limit at a fraction of the wall clock.
+    """
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._last = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            gap = time.monotonic() - self._last
+            if gap < self._interval:
+                await asyncio.sleep(self._interval - gap)
+            self._last = time.monotonic()
 
 
 class DeezerProvider:
@@ -158,46 +202,111 @@ class DeezerProvider:
     name = "deezer"
     concurrency = 4
 
-    async def fetch(self, client: httpx.AsyncClient, isrc: str) -> AudioFeature:
-        response = await client.get(f"https://api.deezer.com/track/isrc:{isrc}")
-        if response.status_code != 200:
-            return AudioFeature()
-        bpm = response.json().get("bpm")
-        # Deezer reports 0 when it has not analysed the track.
-        return AudioFeature(tempo=float(bpm)) if bpm else AudioFeature()
+    async def stream(
+        self, client: httpx.AsyncClient, isrcs: Sequence[str]
+    ) -> AsyncIterator[tuple[str, AudioFeature]]:
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def one(isrc: str) -> tuple[str, AudioFeature]:
+            async with semaphore:
+                try:
+                    response = await client.get(f"https://api.deezer.com/track/isrc:{isrc}")
+                    if response.status_code != 200:
+                        return isrc, AudioFeature()
+                    bpm = response.json().get("bpm")
+                    # Deezer reports 0 when it has not analysed the track.
+                    return isrc, (AudioFeature(tempo=float(bpm)) if bpm else AudioFeature())
+                except (httpx.HTTPError, ValueError, KeyError) as exc:
+                    logger.debug("deezer failed for %s: %s", isrc, exc)
+                    return isrc, AudioFeature()
+
+        for finished in asyncio.as_completed([one(i) for i in isrcs]):
+            yield await finished
 
 
 class AcousticBrainzProvider:
-    """Key and BPM via MusicBrainz → AcousticBrainz. Slow but complete."""
+    """Key and BPM via MusicBrainz -> AcousticBrainz, in batches.
+
+    Both hops are batched, which is what makes a whole library viable:
+    one MusicBrainz search resolves up to ``_MB_BATCH`` ISRCs at once,
+    and one AcousticBrainz call returns the analysis for that many
+    recordings — projected down to the three fields actually read, which
+    is ~90x less data than the full analysis dump.
+    """
 
     name = "acousticbrainz"
-    concurrency = 1  # MusicBrainz rate limit governs the whole chain
+    # Only these three of AcousticBrainz's several hundred fields are
+    # used. The API separates requested paths with ';' — a comma is
+    # accepted but silently returns nothing except metadata.
+    _FIELDS = "tonal.key_key;tonal.key_scale;rhythm.bpm"
 
-    async def fetch(self, client: httpx.AsyncClient, isrc: str) -> AudioFeature:
-        await asyncio.sleep(_MUSICBRAINZ_INTERVAL)
-        lookup = await client.get(
-            f"https://musicbrainz.org/ws/2/isrc/{isrc}",
-            params={"fmt": "json"},
+    def __init__(self) -> None:
+        self._limiter = _RateLimiter(_MUSICBRAINZ_INTERVAL)
+
+    async def stream(
+        self, client: httpx.AsyncClient, isrcs: Sequence[str]
+    ) -> AsyncIterator[tuple[str, AudioFeature]]:
+        for offset in range(0, len(isrcs), _MB_BATCH):
+            batch = list(isrcs[offset : offset + _MB_BATCH])
+            try:
+                by_isrc = await self._resolve(client, batch)
+                analyses = await self._analyse(client, set(by_isrc.values()))
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                logger.debug("acousticbrainz batch failed: %s", exc)
+                by_isrc, analyses = {}, {}
+            for isrc in batch:
+                mbid = by_isrc.get(isrc)
+                yield isrc, analyses.get(mbid or "", AudioFeature())
+
+    async def _resolve(self, client: httpx.AsyncClient, isrcs: Sequence[str]) -> dict[str, str]:
+        """Map ISRC -> MusicBrainz recording id for a batch of ISRCs."""
+        await self._limiter.wait()
+        response = await client.get(
+            "https://musicbrainz.org/ws/2/recording",
+            params={
+                "query": " OR ".join(f"isrc:{i}" for i in isrcs),
+                "inc": "isrcs",
+                "fmt": "json",
+                "limit": 100,
+            },
             headers={"User-Agent": _USER_AGENT},
         )
-        if lookup.status_code != 200:
-            return AudioFeature()
-        recordings = lookup.json().get("recordings") or []
+        if response.status_code != 200:
+            return {}
+        wanted = set(isrcs)
+        found: dict[str, str] = {}
+        for recording in response.json().get("recordings") or []:
+            for isrc in recording.get("isrcs") or []:
+                if isrc in wanted and isrc not in found:
+                    found[isrc] = recording["id"]
+        return found
 
-        for recording in recordings[:2]:
-            analysis = await client.get(
-                f"https://acousticbrainz.org/api/v1/{recording['id']}/low-level"
+    async def _analyse(self, client: httpx.AsyncClient, mbids: set[str]) -> dict[str, AudioFeature]:
+        """Fetch key and tempo for a set of MusicBrainz recording ids."""
+        ordered = [m for m in mbids if m]
+        out: dict[str, AudioFeature] = {}
+        for offset in range(0, len(ordered), _AB_BATCH):
+            chunk = ordered[offset : offset + _AB_BATCH]
+            response = await client.get(
+                "https://acousticbrainz.org/api/v1/low-level",
+                params={"recording_ids": ";".join(chunk), "features": self._FIELDS},
             )
-            if analysis.status_code != 200:
+            if response.status_code != 200:
                 continue
-            body = analysis.json()
-            key, mode = parse_key(
-                body.get("tonal", {}).get("key_key"),
-                body.get("tonal", {}).get("key_scale"),
-            )
-            tempo = body.get("rhythm", {}).get("bpm")
-            return AudioFeature(tempo=float(tempo) if tempo else None, key=key, mode=mode)
-        return AudioFeature()
+            for mbid, payload in response.json().items():
+                if mbid == "mbid_mapping" or not isinstance(payload, dict):
+                    continue
+                # A recording maps to numbered submissions; take the first.
+                body: dict[str, Any] = payload.get("0") or next(iter(payload.values()), {})
+                if not isinstance(body, dict):
+                    continue
+                key, mode = parse_key(
+                    body.get("tonal", {}).get("key_key"),
+                    body.get("tonal", {}).get("key_scale"),
+                )
+                tempo = body.get("rhythm", {}).get("bpm")
+                out[mbid] = AudioFeature(tempo=float(tempo) if tempo else None, key=key, mode=mode)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +319,7 @@ async def fetch_features(
     providers: Sequence[DeezerProvider | AcousticBrainzProvider],
     cache: FeatureCache,
     client: httpx.AsyncClient | None = None,
-    progress: object = None,
+    progress: Callable[[], None] | None = None,
 ) -> dict[str, AudioFeature]:
     """Look up *isrcs* through *providers*, filling and using *cache*.
 
@@ -221,42 +330,28 @@ async def fetch_features(
     top up entries an earlier quick pass created.
     """
     owns_client = client is None
-    client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
+    client = client or httpx.AsyncClient(timeout=60, follow_redirects=True)
     try:
         for provider in providers:
             pending = [i for i in isrcs if i and not cache.tried(i, provider.name)]
             logger.info("%s: %d ISRCs to look up", provider.name, len(pending))
-            semaphore = asyncio.Semaphore(provider.concurrency)
-            done = {"n": 0}
-
-            async def _one(
-                isrc: str,
-                provider: DeezerProvider | AcousticBrainzProvider = provider,
-                semaphore: asyncio.Semaphore = semaphore,
-            ) -> None:
-                async with semaphore:
-                    try:
-                        feature = await provider.fetch(client, isrc)
-                    except (httpx.HTTPError, ValueError, KeyError) as exc:
-                        logger.debug("%s failed for %s: %s", provider.name, isrc, exc)
-                        return
+            done = 0
+            try:
+                async for isrc, feature in provider.stream(client, pending):
+                    # Record misses as well as hits: a recording no
+                    # database knows must not be re-queried forever.
                     cache.put(isrc, feature, provider.name)
-                    done["n"] += 1
-                    # Checkpoint as we go. The deep provider is limited to
-                    # about one track per second, so a full library is
-                    # nearly an hour of work — losing all of it to an
-                    # interrupted run would be the worst failure here.
-                    if done["n"] % _CHECKPOINT_EVERY == 0:
+                    done += 1
+                    if done % _CHECKPOINT_EVERY == 0:
                         cache.save()
-                    if callable(progress):
+                    if progress is not None:
                         progress()
-
-            await asyncio.gather(*(_one(i) for i in pending))
+            finally:
+                cache.save()
     finally:
         if owns_client:
             await client.aclose()
 
-    cache.save()
     return {i: cache.get(i) or AudioFeature() for i in isrcs if i}
 
 
@@ -298,3 +393,55 @@ def key_distance(a: AudioFeature, b: AudioFeature) -> int:
     if ring == 1 and pa[1] == pb[1]:
         return 1
     return 1 + ring + (pa[1] != pb[1])
+
+
+# ---------------------------------------------------------------------------
+# Cache location and library-wide gathering
+# ---------------------------------------------------------------------------
+
+
+def feature_cache_path() -> Path:
+    """Where the tempo/key cache lives: ``<db_path parent>/audio_features.json``.
+
+    A sidecar file rather than the ``audio_features`` table on purpose —
+    this is keyed by ISRC, a global fact about a recording, and curation
+    reads the whole liked library without ever creating local ``Track``
+    rows to hang a foreign key on.
+
+    Note it follows ``db_path`` even when ``database_url`` points the
+    application at another database entirely, so under Postgres it still
+    lands in the local config directory.
+    """
+    from spotifyforge.config import settings
+
+    return settings.db_path.parent / "audio_features.json"
+
+
+async def gather_features(
+    isrcs: Sequence[str],
+    deep: bool = False,
+    progress: Callable[[], None] | None = None,
+) -> tuple[dict[str, AudioFeature], int]:
+    """Fetch and cache tempo/key for *isrcs*, returning (features, learned).
+
+    Deezer alone supplies tempo quickly. *deep* adds the
+    MusicBrainz/AcousticBrainz walk, which is the only source of musical
+    key but is rate-limited to roughly one track per second.
+    """
+    cache = FeatureCache(feature_cache_path())
+    wanted = sorted(set(isrcs))
+    # Count recordings that actually gained data, not new cache rows: a
+    # deep pass adds keys to entries a tempo pass already created, so
+    # measuring the row count would report zero for a run that worked.
+    before = {i: cache.get(i) for i in wanted}
+    providers: list[DeezerProvider | AcousticBrainzProvider] = [DeezerProvider()]
+    if deep:
+        providers.append(AcousticBrainzProvider())
+    features = await fetch_features(wanted, providers, cache, progress=progress)
+    learned = sum(1 for i in wanted if features.get(i) != before.get(i))
+    return features, learned
+
+
+def load_cached_features() -> dict[str, AudioFeature]:
+    """Every tempo/key reading gathered so far. Never hits the network."""
+    return FeatureCache(feature_cache_path()).all()

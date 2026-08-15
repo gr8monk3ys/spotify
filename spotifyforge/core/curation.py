@@ -29,19 +29,12 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import tekore as tk
 
-from spotifyforge.core.audio_features import (
-    AcousticBrainzProvider,
-    AudioFeature,
-    DeezerProvider,
-    FeatureCache,
-    fetch_features,
-    key_distance,
-)
+from spotifyforge.core.audio_features import AudioFeature, key_distance
+from spotifyforge.core.playlist_manager import extract_isrc
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -105,6 +98,10 @@ class PlaylistSpec:
     genre: str | None  # None = no genre Spotify would name
     decade: int | None
     tracks: list[CurationTrack] = field(default_factory=list)
+    # How the tracks were sequenced. Coverage is judged per playlist, so
+    # --harmonic can apply to some and not others; without this the flag
+    # would have no visible effect to check.
+    ordering: str = "arc"
 
     @property
     def genre_label(self) -> str:
@@ -144,6 +141,11 @@ class CurationPlan:
     def entry_count(self) -> int:
         """Total playlist slots (a song can belong to several genres)."""
         return sum(len(s.tracks) for s in self.specs)
+
+    @property
+    def harmonic_count(self) -> int:
+        """Playlists with enough key data to be sequenced harmonically."""
+        return sum(1 for s in self.specs if s.ordering == "harmonic")
 
 
 # ---------------------------------------------------------------------------
@@ -266,15 +268,8 @@ def _to_curation_track(track: Any) -> CurationTrack:
         artist_names=tuple(a.name for a in track.artists or [] if a.name),
         release_year=release_year,
         popularity=track.popularity if track.popularity is not None else 0,
-        isrc=_extract_isrc(track),
+        isrc=extract_isrc(track),
     )
-
-
-def _extract_isrc(track: Any) -> str | None:
-    external = getattr(track, "external_ids", None)
-    if isinstance(external, dict):
-        return external.get("isrc")
-    return getattr(external, "isrc", None)
 
 
 # ---------------------------------------------------------------------------
@@ -454,11 +449,19 @@ def order_for_flow(
     analysed; a track with no analysis still takes part, it just carries
     no key preference.
     """
+    return order_with_mode(tracks, features)[0]
+
+
+def order_with_mode(
+    tracks: list[CurationTrack],
+    features: dict[str, AudioFeature] | None = None,
+) -> tuple[list[CurationTrack], str]:
+    """Like :func:`order_for_flow`, but also report which mode was used."""
     if len(tracks) <= 2:
-        return list(tracks)
+        return list(tracks), "arc"
     if features and _harmonic_coverage(tracks, features) >= _HARMONIC_MIN_COVERAGE:
-        return _order_harmonic(tracks, features)
-    return _space_artists(_popularity_arc(tracks))
+        return _order_harmonic(tracks, features), "harmonic"
+    return _space_artists(_popularity_arc(tracks)), "arc"
 
 
 def _harmonic_coverage(tracks: list[CurationTrack], features: dict[str, AudioFeature]) -> float:
@@ -466,7 +469,7 @@ def _harmonic_coverage(tracks: list[CurationTrack], features: dict[str, AudioFea
     known = sum(
         1 for t in tracks if t.isrc and (f := features.get(t.isrc)) is not None and f.has_key
     )
-    return known / len(tracks) if tracks else 0.0
+    return known / len(tracks)
 
 
 def _order_harmonic(
@@ -588,13 +591,18 @@ def _make_spec(
     if decade:
         title = f"{title} ('{decade % 100:02d}s)"
     era = f" from the {decade}s" if decade else ""
-    ordered = order_for_flow(members, features)
+    ordered, ordering = order_with_mode(members, features)
     description = (
         f"{len(ordered)} {subject}{era}, sequenced for flow. "
         "Forged from my liked songs by SpotifyForge."
     )
     return PlaylistSpec(
-        title=title, description=description, genre=genre, decade=decade, tracks=ordered
+        title=title,
+        description=description,
+        genre=genre,
+        decade=decade,
+        tracks=ordered,
+        ordering=ordering,
     )
 
 
@@ -625,43 +633,6 @@ async def plan_catalogue(
         features=features,
     )
     return CurationPlan(liked_count=len(liked), unique_count=len(unique), specs=specs)
-
-
-def feature_cache_path() -> Path:
-    """Where the tempo/key cache lives — beside the local database."""
-    from spotifyforge.config import settings
-
-    return settings.db_path.parent / "audio_features.json"
-
-
-def load_features() -> dict[str, AudioFeature]:
-    """Return every tempo/key reading already cached on disk.
-
-    Never hits the network: ordering uses whatever ``curate features``
-    has gathered so far, and simply falls back where it has nothing.
-    """
-    return FeatureCache(feature_cache_path()).all()
-
-
-async def gather_features(
-    tracks: list[CurationTrack],
-    deep: bool = False,
-    progress: object = None,
-) -> tuple[dict[str, AudioFeature], int]:
-    """Fetch and cache tempo/key for *tracks*, returning (features, new).
-
-    Deezer alone supplies tempo quickly. *deep* adds the
-    MusicBrainz/AcousticBrainz walk, which is the only source of musical
-    key but is rate-limited to roughly one track per second.
-    """
-    cache = FeatureCache(feature_cache_path())
-    before = len(cache)
-    isrcs = sorted({t.isrc for t in tracks if t.isrc})
-    providers: list[DeezerProvider | AcousticBrainzProvider] = [DeezerProvider()]
-    if deep:
-        providers.append(AcousticBrainzProvider())
-    features = await fetch_features(isrcs, providers, cache, progress=progress)
-    return features, len(cache) - before
 
 
 async def forge_next(

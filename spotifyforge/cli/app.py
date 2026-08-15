@@ -932,9 +932,9 @@ def _features_or_warn(harmonic: bool):
     """Load cached tempo/key data, explaining if there is none yet."""
     if not harmonic:
         return None
-    from spotifyforge.core.curation import load_features
+    from spotifyforge.core.audio_features import load_cached_features
 
-    features = load_features()
+    features = load_cached_features()
     if not features:
         _error_panel(
             "No tempo/key data cached yet.\n"
@@ -1162,36 +1162,37 @@ def curate_features(
     looked up by ISRC. Results are cached, so this is slow once and
     instant afterwards; re-run it after liking new music.
     """
-    from spotifyforge.core.curation import CurationEngine, feature_cache_path, gather_features
+    from spotifyforge.core.audio_features import feature_cache_path, gather_features
+    from spotifyforge.core.curation import CurationEngine
 
     async def _fetch(sp):
         return await CurationEngine(sp).fetch_liked(max_tracks=max_tracks)
 
     tracks = _run_spotify("Reading your liked songs...", "Failed to read library", _fetch)
-    with_isrc = [t for t in tracks if t.isrc]
+    isrcs = sorted({t.isrc for t in tracks if t.isrc})
 
     if deep:
         console.print(
-            f"[yellow]Deep lookup is rate-limited to about one track per second, "
-            f"so this may take a while for {len(with_isrc)} tracks.[/yellow]"
+            f"[yellow]Deep lookup resolves {len(isrcs)} recordings in batches of 25, "
+            "pausing between MusicBrainz calls as their rate limit asks.[/yellow]"
         )
 
     from rich.progress import Progress
 
     with Progress(transient=True) as progress:
-        task = progress.add_task("Looking up tempo/key...", total=len(with_isrc))
-        features, added = _run(
-            gather_features(with_isrc, deep=deep, progress=lambda: progress.advance(task))
+        task = progress.add_task("Looking up tempo/key...", total=len(isrcs))
+        features, learned = _run(
+            gather_features(isrcs, deep=deep, progress=lambda: progress.advance(task))
         )
 
     analysed = sum(1 for f in features.values() if f.tempo is not None)
     keyed = sum(1 for f in features.values() if f.has_key)
     console.print(
         Panel(
-            f"Tracks with an ISRC:  [bold]{len(with_isrc)}[/bold] of {len(tracks)}\n"
-            f"New lookups this run: [bold]{added}[/bold]\n"
-            f"Tempo known:          [bold]{analysed}[/bold]\n"
-            f"Key known:            [bold]{keyed}[/bold]"
+            f"Recordings with an ISRC: [bold]{len(isrcs)}[/bold] from {len(tracks)} tracks\n"
+            f"Newly resolved:          [bold]{learned}[/bold]\n"
+            f"Tempo known:             [bold]{analysed}[/bold]\n"
+            f"Key known:               [bold]{keyed}[/bold]"
             + ("" if deep else "  [dim](use --deep to fetch keys)[/dim]")
             + f"\nCache: {feature_cache_path()}",
             title="Audio features",

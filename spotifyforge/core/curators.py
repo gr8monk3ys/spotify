@@ -16,7 +16,8 @@ and the following stay with them.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import tekore as tk
@@ -40,9 +41,7 @@ class Curator:
     display_name: str
     shared_tracks: int = 0
     playlists_seen: int = 0
-    genres: set[str] = field(default_factory=set)
     example_playlist: str = ""
-    example_playlist_id: str = ""
 
     @property
     def url(self) -> str:
@@ -90,11 +89,9 @@ async def find_curators(
                 ),
             )
             curator.playlists_seen += 1
-            curator.genres.add(genre)
             if shared > curator.shared_tracks:
                 curator.shared_tracks = shared
                 curator.example_playlist = playlist.name or ""
-                curator.example_playlist_id = playlist.id
 
     ranked = sorted(
         curators.values(),
@@ -122,8 +119,6 @@ def _track_id(item: Any) -> str | None:
 def top_genres(tracks: Sequence[Any], count: int = 12) -> list[str]:
     """The genres worth searching: common enough to have a scene, rare
     enough to be a niche rather than a chart."""
-    from collections import Counter
-
     counts: Counter[str] = Counter(g for t in tracks for g in t.genres)
     # Skip the handful of catch-all labels; their playlists are dominated
     # by editorial accounts and tell us nothing about peers.

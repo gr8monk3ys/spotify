@@ -222,7 +222,7 @@ class PlaylistManager:
                         album_id=track_obj.album.id if track_obj.album else None,
                         duration_ms=track_obj.duration_ms,
                         popularity=track_obj.popularity,
-                        isrc=_extract_isrc(track_obj),
+                        isrc=extract_isrc(track_obj),
                     )
                     session.add(db_track)
                     await session.flush()
@@ -567,15 +567,17 @@ class PlaylistManager:
 # ---------------------------------------------------------------------------
 
 
-def _extract_isrc(track: Any) -> str | None:
-    """Safely extract the ISRC from a Tekore track's external_ids."""
-    try:
-        ext_ids = track.external_ids
-        if ext_ids and hasattr(ext_ids, "isrc"):
-            return ext_ids.isrc
-    except AttributeError:
-        pass
-    return None
+def extract_isrc(track: Any) -> str | None:
+    """Return a Tekore track's ISRC, the global recording identifier.
+
+    Tekore parses ``external_ids`` into a plain dict; the attribute form
+    is accepted too so any model shape works. The ISRC is the join key
+    for tempo/key lookups, so this must stay the only definition.
+    """
+    external = getattr(track, "external_ids", None)
+    if isinstance(external, dict):
+        return external.get("isrc")
+    return getattr(external, "isrc", None)
 
 
 def _parse_added_at(item: Any) -> datetime | None:

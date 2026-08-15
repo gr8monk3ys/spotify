@@ -6,6 +6,7 @@ request-building and JSON parsing run without touching the network.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -16,6 +17,7 @@ from spotifyforge.core.audio_features import (
     AudioFeature,
     DeezerProvider,
     FeatureCache,
+    _RateLimiter,
     camelot,
     fetch_features,
     key_distance,
@@ -86,71 +88,155 @@ def test_key_distance_is_neutral_when_a_key_is_unknown():
 # ---------------------------------------------------------------------------
 
 
+async def _collect(provider, handler, isrcs):
+    async with _client(handler) as client:
+        return {isrc: f async for isrc, f in provider.stream(client, isrcs)}
+
+
 async def test_deezer_provider_reads_bpm():
     def handler(request):
         assert request.url.path == "/track/isrc:GBUM71301234"
         return httpx.Response(200, json={"bpm": 132.1, "title": "White Noise"})
 
-    async with _client(handler) as client:
-        feature = await DeezerProvider().fetch(client, "GBUM71301234")
-    assert feature.tempo == pytest.approx(132.1)
-    assert not feature.has_key
+    out = await _collect(DeezerProvider(), handler, ["GBUM71301234"])
+    assert out["GBUM71301234"].tempo == pytest.approx(132.1)
+    assert not out["GBUM71301234"].has_key
 
 
 async def test_deezer_zero_bpm_means_unanalysed_not_zero_tempo():
-    async with _client(lambda r: httpx.Response(200, json={"bpm": 0})) as client:
-        assert await DeezerProvider().fetch(client, "X") == AudioFeature()
+    out = await _collect(DeezerProvider(), lambda r: httpx.Response(200, json={"bpm": 0}), ["X"])
+    assert out["X"] == AudioFeature()
 
 
 async def test_deezer_survives_a_missing_track():
-    async with _client(lambda r: httpx.Response(404, json={"error": {}})) as client:
-        assert await DeezerProvider().fetch(client, "X") == AudioFeature()
+    out = await _collect(DeezerProvider(), lambda r: httpx.Response(404, json={}), ["X"])
+    assert out["X"] == AudioFeature()
 
 
-async def test_acousticbrainz_provider_reads_key_and_bpm():
+async def test_deezer_reports_every_isrc_even_on_transport_failure():
     def handler(request):
+        if request.url.path.endswith("BAD"):
+            raise httpx.ConnectError("boom")
+        return httpx.Response(200, json={"bpm": 100})
+
+    out = await _collect(DeezerProvider(), handler, ["GOOD", "BAD"])
+    # Both must come back, so the failure is cached as "asked, nothing found"
+    # rather than being retried on every future run.
+    assert set(out) == {"GOOD", "BAD"}
+    assert out["GOOD"].tempo == 100
+    assert out["BAD"] == AudioFeature()
+
+
+async def test_acousticbrainz_resolves_a_batch_in_one_pair_of_calls():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url)
         if "musicbrainz" in request.url.host:
-            return httpx.Response(200, json={"recordings": [{"id": MBID}]})
-        assert request.url.path == f"/api/v1/{MBID}/low-level"
+            return httpx.Response(
+                200,
+                json={
+                    "recordings": [
+                        {"id": MBID, "isrcs": ["ISRC1"]},
+                        {"id": "mbid-two", "isrcs": ["ISRC2"]},
+                    ]
+                },
+            )
         return httpx.Response(
             200,
-            json={"tonal": {"key_key": "F", "key_scale": "minor"}, "rhythm": {"bpm": 131.97}},
+            json={
+                MBID: {
+                    "0": {
+                        "tonal": {"key_key": "F", "key_scale": "minor"},
+                        "rhythm": {"bpm": 131.97},
+                    }
+                },
+                "mbid-two": {
+                    "0": {"tonal": {"key_key": "C", "key_scale": "major"}, "rhythm": {"bpm": 90}}
+                },
+                "mbid_mapping": {},
+            },
         )
 
-    async with _client(handler) as client:
-        feature = await AcousticBrainzProvider().fetch(client, "GBUM71301234")
+    out = await _collect(AcousticBrainzProvider(), handler, ["ISRC1", "ISRC2"])
 
-    assert feature.tempo == pytest.approx(131.97)
-    assert (feature.key, feature.mode) == (5, 0)  # F minor
-    assert camelot(feature) == (4, "A")
-
-
-async def test_acousticbrainz_returns_nothing_when_isrc_is_unknown():
-    def handler(request):
-        return httpx.Response(200, json={"recordings": []})
-
-    async with _client(handler) as client:
-        assert await AcousticBrainzProvider().fetch(client, "X") == AudioFeature()
+    # Two ISRCs cost one MusicBrainz search plus one AcousticBrainz call,
+    # not two of each — batching is what makes a whole library viable.
+    assert len(calls) == 2
+    assert (out["ISRC1"].key, out["ISRC1"].mode) == (5, 0)  # F minor
+    assert out["ISRC1"].tempo == pytest.approx(131.97)
+    assert (out["ISRC2"].key, out["ISRC2"].mode) == (0, 1)  # C major
 
 
-async def test_acousticbrainz_tries_the_next_recording_when_one_has_no_analysis():
-    seen = []
+async def test_acousticbrainz_projects_only_the_fields_it_reads():
+    seen = {}
 
     def handler(request):
         if "musicbrainz" in request.url.host:
-            return httpx.Response(200, json={"recordings": [{"id": "first"}, {"id": "second"}]})
-        seen.append(request.url.path)
-        if "first" in request.url.path:
-            return httpx.Response(404, json={})
-        return httpx.Response(
-            200, json={"tonal": {"key_key": "C", "key_scale": "major"}, "rhythm": {"bpm": 90}}
-        )
+            return httpx.Response(200, json={"recordings": [{"id": MBID, "isrcs": ["ISRC1"]}]})
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json={MBID: {"0": {"rhythm": {"bpm": 100}}}})
 
-    async with _client(handler) as client:
-        feature = await AcousticBrainzProvider().fetch(client, "X")
+    await _collect(AcousticBrainzProvider(), handler, ["ISRC1"])
 
-    assert len(seen) == 2
-    assert (feature.key, feature.mode) == (0, 1)
+    # AcousticBrainz separates requested paths with ';'. A comma is
+    # accepted but silently returns metadata only, so this is the
+    # difference between 576 bytes and 53 KB per recording.
+    assert seen["features"] == "tonal.key_key;tonal.key_scale;rhythm.bpm"
+    assert ";" in seen["features"] and "," not in seen["features"]
+
+
+async def test_acousticbrainz_yields_unknown_isrcs_as_empty():
+    def handler(request):
+        if "musicbrainz" in request.url.host:
+            return httpx.Response(200, json={"recordings": []})
+        return httpx.Response(200, json={})
+
+    out = await _collect(AcousticBrainzProvider(), handler, ["NOPE"])
+    assert out["NOPE"] == AudioFeature()
+
+
+async def test_acousticbrainz_survives_a_musicbrainz_error():
+    def handler(request):
+        if "musicbrainz" in request.url.host:
+            return httpx.Response(503, json={})
+        return httpx.Response(200, json={})
+
+    out = await _collect(AcousticBrainzProvider(), handler, ["A", "B"])
+    assert out == {"A": AudioFeature(), "B": AudioFeature()}
+
+
+async def test_acousticbrainz_splits_work_into_batches():
+    searches = []
+
+    def handler(request):
+        if "musicbrainz" in request.url.host:
+            searches.append(request.url.params["query"])
+            return httpx.Response(200, json={"recordings": []})
+        return httpx.Response(200, json={})
+
+    isrcs = [f"ISRC{i:03d}" for i in range(60)]
+    out = await _collect(AcousticBrainzProvider(), handler, isrcs)
+
+    assert len(out) == 60
+    assert len(searches) == 3  # 60 ISRCs at 25 per search
+    assert searches[0].count(" OR ") == 24
+
+
+async def test_rate_limiter_only_waits_for_the_remaining_gap(monkeypatch):
+    """The politeness gap must count time already spent on the request."""
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    limiter = _RateLimiter(1.0)
+    await limiter.wait()  # first call: no wait
+    await limiter.wait()  # immediately after: must wait nearly the full gap
+
+    assert slept == [] or slept[0] > 0.9
+    assert len(slept) <= 1
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +287,17 @@ async def test_a_later_deep_run_tops_up_entries_a_quick_run_created(tmp_path):
         if "deezer" in request.url.host:
             return httpx.Response(200, json={"bpm": 128})
         if "musicbrainz" in request.url.host:
-            return httpx.Response(200, json={"recordings": [{"id": MBID}]})
+            return httpx.Response(200, json={"recordings": [{"id": MBID, "isrcs": ["A"]}]})
         return httpx.Response(
-            200, json={"tonal": {"key_key": "A", "key_scale": "minor"}, "rhythm": {"bpm": 127.5}}
+            200,
+            json={
+                MBID: {
+                    "0": {
+                        "tonal": {"key_key": "A", "key_scale": "minor"},
+                        "rhythm": {"bpm": 127.5},
+                    }
+                }
+            },
         )
 
     path = tmp_path / "f.json"
