@@ -539,8 +539,9 @@ async def test_reflow_rewrites_a_scrambled_playlist_in_place(fake_spotify, clien
     # Scramble the playlist behind the tool's back.
     fake_spotify.playlist_tracks[playlist.spotify_id] = list(reversed(wanted))
 
-    rewritten = await reflow(manager, sp, plan.specs, delay=0)
+    rewritten, failed = await reflow(manager, sp, plan.specs, delay=0)
 
+    assert failed == []
     assert [title for title, _ in rewritten] == [spec.title]
     assert fake_spotify.playlist_tracks[playlist.spotify_id] == wanted
     # The playlist kept its identity — same id, not recreated.
@@ -557,7 +558,7 @@ async def test_reflow_is_a_no_op_when_order_already_matches(fake_spotify, client
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
     await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
 
-    assert await reflow(manager, sp, plan.specs, delay=0) == []
+    assert await reflow(manager, sp, plan.specs, delay=0) == ([], [])
 
 
 async def test_reflow_handles_playlists_longer_than_one_request(
@@ -579,6 +580,39 @@ async def test_reflow_handles_playlists_longer_than_one_request(
 
     await reflow(manager, sp, plan.specs, delay=0)
     assert fake_spotify.playlist_tracks[playlist.spotify_id] == [t.id for t in spec.tracks]
+
+
+async def test_reflow_keeps_going_when_one_playlist_fails(fake_spotify, client_for, isolated_db):
+    """A timeout on one playlist must not discard hundreds of others."""
+    import httpx
+
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    _seed_library(fake_spotify, count=40)
+    owner_id = _db_user()
+    sp = client_for("user1")
+    manager = PlaylistManager(sp)
+    plan = await plan_catalogue(sp, CurationOptions(min_size=10))
+    created, _ = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    assert len(created) >= 2
+
+    for _, playlist in created:
+        fake_spotify.playlist_tracks[playlist.spotify_id] = []
+
+    doomed = created[0][0].title
+    original_replace = sp.playlist_replace
+
+    async def flaky(playlist_id, uris):
+        by_title = {p["name"]: p["id"] for p in await manager.get_user_playlists()}
+        if by_title.get(doomed) == playlist_id:
+            raise httpx.ReadTimeout("")
+        return await original_replace(playlist_id, uris)
+
+    sp.playlist_replace = flaky
+    rewritten, failed = await reflow(manager, sp, plan.specs, delay=0)
+
+    assert failed == [doomed]
+    assert len(rewritten) == len(created) - 1
 
 
 def test_catalogue_is_deterministic_regardless_of_library_order():

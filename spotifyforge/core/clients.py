@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import tekore as tk
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,10 +32,14 @@ _REFRESH_MARGIN = timedelta(seconds=60)
 # Retry 429/5xx responses this many times, honouring Retry-After.
 _RETRIES = 2
 
+# httpx defaults to 5s, which a bulk run trips on eventually: one slow
+# response then aborts hundreds of playlists' worth of work.
+_TIMEOUT = 30.0
+
 
 def build_spotify(access_token: str) -> tk.Spotify:
     """Wrap a plaintext access token in an async, retrying Spotify client."""
-    inner = make_sender(True) or tk.AsyncSender()
+    inner = make_sender(True) or tk.AsyncSender(client=httpx.AsyncClient(timeout=_TIMEOUT))
     sender = tk.RetryingSender(retries=_RETRIES, sender=inner)
     return tk.Spotify(access_token, sender=sender)
 

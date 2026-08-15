@@ -31,6 +31,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import tekore as tk
 
 from spotifyforge.core.audio_features import AudioFeature, key_distance
@@ -672,7 +673,7 @@ async def reflow(
     spotify: Spotify,
     specs: list[PlaylistSpec],
     delay: float = _FORGE_DELAY,
-) -> list[tuple[str, int]]:
+) -> tuple[list[tuple[str, int]], list[str]]:
     """Re-sequence already-created playlists to match their spec.
 
     Existing playlists keep their identity — same playlist, same
@@ -680,30 +681,39 @@ async def reflow(
     freshly ordered track list. Playlists already in the right order are
     left untouched, so a repeat run is cheap and quiet.
 
-    Returns ``(title, track_count)`` for each playlist actually rewritten.
+    Returns ``(rewritten, failed)`` — ``(title, track_count)`` pairs for
+    playlists actually rewritten, and the titles of any that could not
+    be. A single timed-out request must not discard the work already
+    done across hundreds of playlists, so failures are collected rather
+    than raised.
     """
     by_title = {p["name"]: p["id"] for p in await manager.get_user_playlists()}
     rewritten: list[tuple[str, int]] = []
+    failed: list[str] = []
 
     for spec in specs:
         playlist_id = by_title.get(spec.title)
         if playlist_id is None:
             continue
-        current = [
-            item.track.uri
-            for item in await manager.get_playlist_tracks(playlist_id)
-            if item.track is not None and item.track.uri
-        ]
         wanted = [t.uri for t in spec.tracks]
-        if current == wanted:
+        try:
+            current = [
+                item.track.uri
+                for item in await manager.get_playlist_tracks(playlist_id)
+                if item.track is not None and item.track.uri
+            ]
+            if current == wanted:
+                continue
+            await spotify.playlist_replace(playlist_id, wanted[:_REPLACE_CHUNK])
+            if len(wanted) > _REPLACE_CHUNK:
+                await manager.add_tracks(playlist_id, wanted[_REPLACE_CHUNK:])
+        except (tk.HTTPError, httpx.HTTPError) as exc:
+            logger.warning("Could not reflow %r: %s", spec.title, exc)
+            failed.append(spec.title)
             continue
-
-        await spotify.playlist_replace(playlist_id, wanted[:_REPLACE_CHUNK])
-        if len(wanted) > _REPLACE_CHUNK:
-            await manager.add_tracks(playlist_id, wanted[_REPLACE_CHUNK:])
         rewritten.append((spec.title, len(wanted)))
         if delay:
             await asyncio.sleep(delay)
 
-    logger.info("Reflowed %d playlist(s)", len(rewritten))
-    return rewritten
+    logger.info("Reflowed %d playlist(s), %d failed", len(rewritten), len(failed))
+    return rewritten, failed

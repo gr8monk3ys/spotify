@@ -156,7 +156,10 @@ def _run_spotify(status_msg: str, error_msg: str, coro_fn):
         try:
             return _run(_impl())
         except Exception as exc:
-            _error_panel(f"{error_msg}: {exc}")
+            # Some exceptions (httpx.ReadTimeout among them) stringify to
+            # "", which produced an error panel that named no error.
+            detail = str(exc) or type(exc).__name__
+            _error_panel(f"{error_msg}: {detail}")
 
 
 def _db_user_id() -> int:
@@ -1226,9 +1229,10 @@ def curate_reflow(
 
     async def _reflow(sp):
         plan = await plan_catalogue(sp, opts, features)
-        return await reflow(PlaylistManager(sp), sp, plan.specs), len(plan.specs)
+        rewritten, failed = await reflow(PlaylistManager(sp), sp, plan.specs)
+        return rewritten, failed, len(plan.specs)
 
-    rewritten, total = _run_spotify(
+    rewritten, failed, total = _run_spotify(
         "Re-sequencing your forged playlists...", "Failed to reflow playlists", _reflow
     )
 
@@ -1252,7 +1256,8 @@ def curate_reflow(
 
     console.print(
         Panel(
-            f"[green]Re-sequenced {len(rewritten)} playlist(s)[/green] of {total} planned.",
+            f"[green]Re-sequenced {len(rewritten)} playlist(s)[/green] of {total} planned."
+            + (f"\n[yellow]{len(failed)} could not be updated[/yellow]" if failed else ""),
             title="Reflow",
             border_style="green",
             expand=False,
