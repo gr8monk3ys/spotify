@@ -247,3 +247,27 @@ def test_cache_survives_a_corrupt_file(tmp_path):
     cache.put("A", AudioFeature(tempo=99.0), "deezer")
     cache.save()
     assert json.loads(path.read_text())["A"]["tempo"] == 99.0
+
+
+async def test_progress_is_checkpointed_so_an_interrupt_keeps_the_work(tmp_path, monkeypatch):
+    """A rate-limited deep run is ~an hour; losing it all would be brutal."""
+    monkeypatch.setattr("spotifyforge.core.audio_features._CHECKPOINT_EVERY", 2)
+    path = tmp_path / "f.json"
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        # After the first checkpoint should have landed, blow up.
+        if len(seen) == 3:
+            raise RuntimeError("interrupted mid-run")
+        return httpx.Response(200, json={"bpm": 111})
+
+    cache = FeatureCache(path)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        async with _client(handler) as client:
+            await fetch_features(["A", "B", "C", "D"], [DeezerProvider()], cache, client=client)
+
+    # The file exists with the completed lookups, despite never reaching
+    # the save() at the end of fetch_features.
+    assert path.exists()
+    assert len(FeatureCache(path)) >= 2

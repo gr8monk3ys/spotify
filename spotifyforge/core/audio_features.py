@@ -12,10 +12,10 @@ identifier, and other music databases are keyed by it:
   key and BPM. Authoritative but slow: MusicBrainz asks for one request
   per second, so a full library is a background job, not a page load.
 
-Results are cached on disk by ISRC, so the slow walk happens once and
-later runs are instant. Coverage is partial by nature — see
-:func:`key_distance` and the curation module for how ordering copes with tracks that have no
-analysis.
+Results are cached on disk by ISRC (checkpointed as it goes, so an
+interrupted run keeps its work), and the slow walk happens once. Coverage
+is partial by nature; :mod:`spotifyforge.core.curation` decides when
+there is enough of it to sequence harmonically at all.
 """
 
 from __future__ import annotations
@@ -39,6 +39,10 @@ _USER_AGENT = "SpotifyForge/1.0 (https://github.com/gr8monk3ys/spotify)"
 # MusicBrainz asks unauthenticated clients for at most one request per
 # second and blocks clients that ignore it.
 _MUSICBRAINZ_INTERVAL = 1.05
+
+# Write the cache to disk every this many lookups, so an interrupted run
+# keeps the work it has already paid for.
+_CHECKPOINT_EVERY = 50
 
 # Pitch classes in the order Spotify used, so a key name maps to the same
 # integer the Camelot table expects.
@@ -223,6 +227,7 @@ async def fetch_features(
             pending = [i for i in isrcs if i and not cache.tried(i, provider.name)]
             logger.info("%s: %d ISRCs to look up", provider.name, len(pending))
             semaphore = asyncio.Semaphore(provider.concurrency)
+            done = {"n": 0}
 
             async def _one(
                 isrc: str,
@@ -236,6 +241,13 @@ async def fetch_features(
                         logger.debug("%s failed for %s: %s", provider.name, isrc, exc)
                         return
                     cache.put(isrc, feature, provider.name)
+                    done["n"] += 1
+                    # Checkpoint as we go. The deep provider is limited to
+                    # about one track per second, so a full library is
+                    # nearly an hour of work — losing all of it to an
+                    # interrupted run would be the worst failure here.
+                    if done["n"] % _CHECKPOINT_EVERY == 0:
+                        cache.save()
                     if callable(progress):
                         progress()
 
