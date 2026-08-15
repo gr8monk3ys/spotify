@@ -1120,15 +1120,25 @@ def curate_curators(
         console.print("No curators with overlapping taste turned up. Try [bold]--genres 20[/bold].")
         return
 
+    # The profile URL rides on the curator's name as a terminal hyperlink
+    # rather than taking a column of its own — five columns do not fit an
+    # 80-character terminal, and the overlap count is the part to read.
     table = Table(box=box.SIMPLE, header_style="bold cyan")
     table.add_column("#", style="dim", justify="right")
-    table.add_column("Curator", style="white", no_wrap=True, max_width=28)
-    table.add_column("Shared", justify="right", style="green")
-    table.add_column("Their playlist", style="magenta", no_wrap=True, max_width=34)
-    table.add_column("Profile", style="dim", no_wrap=True)
+    table.add_column("Curator", style="white", overflow="ellipsis", max_width=30)
+    table.add_column("Shared", justify="right", style="bold green")
+    table.add_column("Their playlist", style="magenta", overflow="ellipsis", max_width=34)
     for idx, c in enumerate(curators, start=1):
-        table.add_row(str(idx), c.display_name, str(c.shared_tracks), c.example_playlist, c.url)
+        table.add_row(
+            str(idx),
+            f"[link={c.url}]{c.display_name}[/link]",
+            str(c.shared_tracks),
+            c.example_playlist,
+        )
     console.print(table)
+    console.print("\n[dim]Profiles:[/dim]")
+    for idx, c in enumerate(curators, start=1):
+        console.print(f"  [dim]{idx:>2}.[/dim] {c.url}")
     console.print(
         "\n[dim]'Shared' counts your own liked songs found in that curator's playlist. "
         "Open a profile and follow the ones you actually like — that is the kind of "
