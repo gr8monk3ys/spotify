@@ -48,68 +48,33 @@ CORS_ORIGINS: list[str] = [
 ] or _DEFAULT_ORIGINS
 
 # ---------------------------------------------------------------------------
-# Scheduler singleton (lazy import to avoid hard dep when scheduler disabled)
-# ---------------------------------------------------------------------------
-_scheduler = None
-
-
-def _get_scheduler():
-    """Return the APScheduler BackgroundScheduler singleton."""
-    global _scheduler  # noqa: PLW0603
-    if _scheduler is None:
-        from apscheduler.schedulers.background import BackgroundScheduler
-
-        _scheduler = BackgroundScheduler()
-    return _scheduler
-
-
-# ---------------------------------------------------------------------------
 # Lifespan (startup / shutdown)
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Application lifespan handler: initialize DB and start scheduler."""
+    """Application lifespan handler: initialize DB and start the scheduler."""
     # --- Startup ---
     logger.info("Initializing database...")
     init_db()
 
+    scheduler = None
     if settings.scheduler_enabled:
-        logger.info("Starting background scheduler...")
-        scheduler = _get_scheduler()
-        if not scheduler.running:
-            scheduler.start()
+        from spotifyforge.core.scheduler import get_scheduler_service
 
-        # Reload saved jobs from the database
-        try:
-            from sqlmodel import Session, select
-
-            from spotifyforge.core.scheduler import register_job
-            from spotifyforge.db.engine import get_engine
-            from spotifyforge.models.models import ScheduledJob
-
-            with Session(get_engine()) as session:
-                jobs = session.exec(
-                    select(ScheduledJob).where(ScheduledJob.enabled == True)  # noqa: E712
-                ).all()
-                for job in jobs:
-                    try:
-                        register_job(job)
-                    except Exception:
-                        logger.warning(
-                            "Failed to reload job %s (%s)", job.id, job.name, exc_info=True
-                        )
-                logger.info("Reloaded %d scheduled job(s) from database.", len(jobs))
-        except Exception:
-            logger.warning("Failed to reload scheduled jobs from database.", exc_info=True)
+        logger.info("Starting scheduler...")
+        scheduler = get_scheduler_service()
+        scheduler.start()
+        registered = await scheduler.load_jobs_from_db()
+        logger.info("Reloaded %d scheduled job(s) from database.", registered)
 
     yield
 
     # --- Shutdown ---
-    if settings.scheduler_enabled and _scheduler is not None and _scheduler.running:
+    if scheduler is not None and scheduler.is_running:
         logger.info("Shutting down scheduler...")
-        _scheduler.shutdown(wait=False)
+        scheduler.stop(wait=False)
 
     logger.info("SpotifyForge API stopped.")
 

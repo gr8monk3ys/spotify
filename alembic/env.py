@@ -1,4 +1,11 @@
-"""Alembic environment configuration for SpotifyForge."""
+"""Alembic environment configuration for SpotifyForge.
+
+Migrations run against the same database the application uses: the URL is
+resolved through ``spotifyforge.db.engine`` (``SPOTIFYFORGE_DATABASE_URL``
+or the configured ``db_path``), so ``alembic upgrade head`` always targets
+the DB the app will open. The ``sqlalchemy.url`` in ``alembic.ini`` is
+ignored.
+"""
 
 from logging.config import fileConfig
 
@@ -8,10 +15,13 @@ from sqlmodel import SQLModel
 # Import all models so metadata is populated
 import spotifyforge.models.models  # noqa: F401
 from alembic import context
+from spotifyforge.db.engine import _base_url
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+config.set_main_option("sqlalchemy.url", _base_url())
 
 target_metadata = SQLModel.metadata
 

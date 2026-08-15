@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import event
@@ -82,103 +81,122 @@ def db_session(db_engine: Engine) -> Generator[Session, None, None]:
     connection.close()
 
 
+@pytest.fixture(autouse=True)
+def _clear_crypto_caches():
+    """Reset cached secret/Fernet derivations between tests.
+
+    Production caches these for the process lifetime; tests monkeypatch
+    settings, so stale cache entries would leak across tests.
+    """
+    from spotifyforge import security
+
+    security._get_secret.cache_clear()
+    security._get_fernet.cache_clear()
+    yield
+    security._get_secret.cache_clear()
+    security._get_fernet.cache_clear()
+
+
 # ---------------------------------------------------------------------------
-# Mock Spotify client
+# Fake Spotify backend + isolated app database
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture()
-def mock_spotify_client() -> AsyncMock:
-    """Return an ``AsyncMock`` that mimics a ``tekore.Spotify`` client.
+def isolated_db(tmp_path, monkeypatch):
+    """Point the application at a fresh on-disk SQLite DB for this test.
 
-    Pre-configured return values cover the most commonly called methods so
-    tests can run without network access.  Individual tests can override
-    any method's ``return_value`` or ``side_effect`` as needed.
-
-    Returns:
-        An ``AsyncMock`` instance with sensible defaults for Spotify API calls.
+    Patches the settings singleton (env vars are read only at import time)
+    and resets the cached engines so both sync and async engines rebuild.
     """
-    client = AsyncMock(name="MockSpotifyClient")
+    from spotifyforge.config import settings
+    from spotifyforge.db import engine as engine_mod
 
-    # -- Current user profile --
-    client.current_user.return_value = AsyncMock(
-        id="test_user_123",
-        display_name="Test User",
-        email="test@example.com",
-        product="premium",
-    )
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{tmp_path}/app.db")
+    engine_mod.reset_engines()
+    engine_mod.init_db()
+    yield
+    engine_mod.reset_engines()
 
-    # -- Playlists --
-    mock_playlist = AsyncMock(
-        id="playlist_abc123",
-        name="Test Playlist",
-        description="A test playlist",
-        public=True,
-        collaborative=False,
-        snapshot_id="snap_001",
-        followers=AsyncMock(total=42),
-        tracks=AsyncMock(total=10),
-    )
-    client.playlist.return_value = mock_playlist
-    client.playlists.return_value = AsyncMock(items=[mock_playlist])
 
-    # -- Tracks --
-    mock_track = AsyncMock(
-        id="track_xyz789",
-        name="Test Track",
-        uri="spotify:track:track_xyz789",
-        duration_ms=210000,
-        popularity=65,
-        album=AsyncMock(
-            id="album_def456",
-            name="Test Album",
-            release_date="2024-01-15",
-        ),
-        artists=[
-            AsyncMock(id="artist_ghi012", name="Test Artist"),
-        ],
-    )
-    client.track.return_value = mock_track
-    client.tracks.return_value = [mock_track]
+@pytest.fixture()
+def fake_spotify():
+    """An in-memory Spotify backend, installed as the tekore sender seam.
 
-    # -- Audio features --
-    mock_audio_features = AsyncMock(
-        danceability=0.72,
-        energy=0.85,
-        valence=0.60,
-        tempo=120.0,
-        key=5,
-        mode=1,
-        loudness=-5.2,
-        speechiness=0.04,
-        acousticness=0.12,
-        instrumentalness=0.001,
-        liveness=0.09,
-    )
-    client.track_audio_features.return_value = mock_audio_features
+    Every internally constructed tekore client (OAuth exchange, token
+    refresh, profile fetch, API clients built by ``core.clients``) routes
+    through this fake for the duration of the test.
+    """
+    import httpx
+    import tekore as tk
 
-    # -- Top tracks / artists --
-    client.current_user_top_tracks.return_value = AsyncMock(items=[mock_track])
-    client.current_user_top_artists.return_value = AsyncMock(
-        items=[
-            AsyncMock(
-                id="artist_ghi012",
-                name="Test Artist",
-                genres=["indie-rock", "alternative"],
-                popularity=72,
-            ),
-        ]
-    )
+    from spotifyforge.auth import oauth
+    from tests.fake_spotify import FakeSpotify
 
-    # -- Playlist mutation methods --
-    client.playlist_create.return_value = mock_playlist
-    client.playlist_add.return_value = AsyncMock(snapshot_id="snap_002")
-    client.playlist_remove.return_value = AsyncMock(snapshot_id="snap_003")
+    fake = FakeSpotify()
 
-    # -- Recommendations --
-    client.recommendations.return_value = AsyncMock(tracks=[mock_track])
+    def factory(asynchronous: bool) -> tk.Sender:
+        if asynchronous:
+            return tk.AsyncSender(client=httpx.AsyncClient(transport=fake.transport()))
+        return tk.SyncSender(client=httpx.Client(transport=fake.transport()))
 
-    return client
+    oauth.set_sender_factory(factory)
+    yield fake
+    oauth.set_sender_factory(None)
+
+
+class MemoryTokenStore:
+    """A TokenStore backed by a plain dict — keyring stand-in for tests."""
+
+    def __init__(self) -> None:
+        self.tokens: dict[str, Any] = {}
+
+    def save_token(self, user_id: str, token: Any) -> None:
+        self.tokens[user_id] = token
+
+    def load_token(self, user_id: str) -> Any:
+        from spotifyforge.auth.oauth import TokenNotFoundError
+
+        try:
+            return self.tokens[user_id]
+        except KeyError:
+            raise TokenNotFoundError(f"No token for '{user_id}'") from None
+
+    def delete_token(self, user_id: str) -> None:
+        from spotifyforge.auth.oauth import TokenNotFoundError
+
+        try:
+            del self.tokens[user_id]
+        except KeyError:
+            raise TokenNotFoundError(f"No token for '{user_id}'") from None
+
+
+@pytest.fixture()
+def memory_token_store() -> MemoryTokenStore:
+    return MemoryTokenStore()
+
+
+@pytest.fixture()
+def app_env(isolated_db, fake_spotify, monkeypatch):
+    """Full app environment: fresh DB, fake Spotify, credentials, clean scheduler.
+
+    SpotifyAuth builds a fresh ``Settings()`` (env vars cover it); the
+    settings singleton covers every other code path. The scheduler
+    singleton is reset before and stopped after each test.
+    """
+    monkeypatch.setenv("SPOTIFYFORGE_SPOTIFY_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("SPOTIFYFORGE_SPOTIFY_CLIENT_SECRET", "test-client-secret")
+    from spotifyforge.config import settings
+    from spotifyforge.core import scheduler as scheduler_mod
+
+    monkeypatch.setattr(settings, "spotify_client_id", "test-client-id")
+    monkeypatch.setattr(settings, "spotify_client_secret", "test-client-secret")
+    monkeypatch.setattr(scheduler_mod, "_service", None)
+    yield fake_spotify
+    service = scheduler_mod._service
+    if service is not None and service.is_running:
+        service.stop(wait=False)
+    monkeypatch.setattr(scheduler_mod, "_service", None)
 
 
 # ---------------------------------------------------------------------------

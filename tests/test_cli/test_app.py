@@ -1,1148 +1,778 @@
-"""Comprehensive tests for the SpotifyForge Typer CLI application.
+"""Integration tests for the SpotifyForge Typer CLI.
 
-Uses ``typer.testing.CliRunner`` and ``unittest.mock.patch`` to exercise
-every command group (auth, playlist, discover, schedule, config) without
-making real network calls or touching a real database.
+These tests run the REAL CLI (``spotifyforge.cli.app``) against the
+in-memory :class:`FakeSpotify` backend from ``tests/fake_spotify.py``.
+Every request flows through tekore's real request/response machinery via
+``httpx.MockTransport`` — no spotifyforge module is replaced with a mock.
 
-The CLI functions use lazy imports of the form::
+Test doubles are limited to the process boundary:
 
-    from spotifyforge.core.playlist_manager import PlaylistManager
+* the OS keyring is replaced with an in-memory ``MemoryTokenStore``;
+* ``webbrowser.open`` is stubbed so login never opens a browser;
+* the CSRF state generator returns a fixed value so the test can build
+  the pasted redirect URL for ``auth login``.
 
-Because ``asyncio.run`` is invoked inside the CLI functions (via ``_run``),
-mocked async methods must return real coroutines.  We achieve this by using
-``unittest.mock.AsyncMock`` for async methods and patching at the
-``spotifyforge.cli.app._run`` level or the lazy-import module level.
+Everything else — OAuth code exchange, token storage/refresh, DB rows,
+playlist sync, discovery, scheduling — is the production code path.
 """
 
 from __future__ import annotations
 
 import json
-import types
-from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from sqlmodel import Session, select
 from typer.testing import CliRunner
 
 from spotifyforge.cli.app import app
+from spotifyforge.db.engine import get_engine
+from spotifyforge.models.models import JobType, Playlist, ScheduledJob, User
 
 runner = CliRunner()
 
+STATE = "teststate123"
+REDIRECT = "http://localhost:8000/api/auth/callback"
+
 
 # ---------------------------------------------------------------------------
-# Helper: build a fake module that Python's import machinery will accept
+# Environment fixture
 # ---------------------------------------------------------------------------
 
 
-def _fake_module(name: str, **attrs) -> types.ModuleType:
-    """Create a real ``ModuleType`` with the given attributes.
+@pytest.fixture()
+def cli_env(app_env, tmp_path, monkeypatch, memory_token_store):
+    """Full CLI environment: root app_env plus in-memory keyring.
 
-    ``patch.dict("sys.modules", ...)`` requires a real module (or at least
-    an object whose attribute access works normally) for ``from mod import X``
-    to succeed inside the patched block.
+    ``settings.db_path`` is redirected into ``tmp_path`` so the CLI's
+    ``current_user`` pointer file lands in the test sandbox (isolated_db
+    only patches ``database_url``).
     """
-    mod = types.ModuleType(name)
-    for k, v in attrs.items():
-        setattr(mod, k, v)
-    return mod
+    from spotifyforge.auth import oauth
+    from spotifyforge.config import settings
+
+    monkeypatch.setattr(settings, "db_path", tmp_path / "app.db")
+
+    # Keyring -> in-memory store (persists across commands within a test).
+    monkeypatch.setattr(oauth, "KeyringTokenStore", lambda: memory_token_store)
+    # Fixed CSRF state so the test can construct the pasted redirect URL.
+    monkeypatch.setattr(oauth, "generate_csrf_state", lambda: STATE)
+    # Never open a real browser.
+    monkeypatch.setattr("webbrowser.open", lambda url: True)
+
+    return app_env
 
 
-# =========================================================================
-# --version / --help
-# =========================================================================
+def _login(fake, user_id: str = "user1"):
+    """Drive the real interactive login against the fake accounts service."""
+    if user_id not in fake.users:
+        fake.add_user(user_id)
+    code = fake.issue_code(user_id)
+    result = runner.invoke(
+        app,
+        ["auth", "login", "--no-browser"],
+        input=f"{REDIRECT}?code={code}&state={STATE}\n",
+    )
+    assert result.exit_code == 0, f"login failed:\n{result.output}\n{result.stderr}"
+    return result
 
 
-class TestRootApp:
-    """Tests for the root ``spotifyforge`` command."""
+# ---------------------------------------------------------------------------
+# Root
+# ---------------------------------------------------------------------------
 
+
+class TestRoot:
     def test_version_flag(self):
+        import spotifyforge
+
         result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0
         assert "SpotifyForge" in result.output
-        assert "0.1.0" in result.output
+        assert spotifyforge.__version__ in result.output
 
-    def test_short_version_flag(self):
-        result = runner.invoke(app, ["-V"])
-        assert result.exit_code == 0
-        assert "0.1.0" in result.output
-
-    def test_help_flag(self):
-        result = runner.invoke(app, ["--help"])
-        assert result.exit_code == 0
-        # All command groups should appear in help output
-        assert "auth" in result.output
+    def test_no_args_shows_help(self):
+        result = runner.invoke(app, [])
         assert "playlist" in result.output
         assert "discover" in result.output
-        assert "schedule" in result.output
-        assert "config" in result.output
-
-    def test_no_args_shows_help_text(self):
-        """With no_args_is_help=True the CLI prints help and exits with code 0."""
-        result = runner.invoke(app, [])
-        # Typer may exit with 0 or 2 depending on version; the key is that
-        # usage information is printed.
-        assert "auth" in result.output
-        assert "playlist" in result.output
 
 
-# =========================================================================
-# AUTH commands
-# =========================================================================
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
 
 
-class TestAuthCommands:
-    """Tests for the ``auth`` sub-command group."""
+class TestAuthLogin:
+    def test_login_success(self, cli_env, memory_token_store, tmp_path):
+        fake = cli_env
+        result = _login(fake)
 
-    def test_auth_help(self):
-        result = runner.invoke(app, ["auth", "--help"])
-        assert result.exit_code == 0
-        assert "login" in result.output
-        assert "status" in result.output
-        assert "logout" in result.output
-
-    # -- auth status -------------------------------------------------------
-
-    def test_auth_status_logged_in(self):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.status = AsyncMock(
-            return_value={
-                "logged_in": True,
-                "display_name": "Test User",
-                "email": "test@example.com",
-                "user_id": "abc123",
-                "token_expiry": "2026-12-31T23:59:59",
-                "token_valid": True,
-            }
-        )
-        MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
-
-        fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
-
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": fake_mod}):
-            result = runner.invoke(app, ["auth", "status"])
-
-        assert result.exit_code == 0
+        assert "Successfully authenticated" in result.output
         assert "Test User" in result.output
-        assert "Auth Status" in result.output
 
-    def test_auth_status_not_logged_in(self):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.status = AsyncMock(return_value={"logged_in": False})
-        MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
+        # The current-user pointer file was written into the sandbox.
+        assert (tmp_path / "current_user").read_text() == "user1"
 
-        fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
+        # The token landed in the (in-memory) keyring and is valid.
+        token = memory_token_store.load_token("user1")
+        assert token.access_token in fake.valid_tokens
 
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": fake_mod}):
-            result = runner.invoke(app, ["auth", "status"])
+        # The local DB row exists with encrypted tokens (for scheduled jobs).
+        with Session(get_engine()) as session:
+            user = session.exec(select(User).where(User.spotify_id == "user1")).first()
+            assert user is not None
+            assert user.display_name == "Test User"
+            assert user.is_premium is True
+            assert user.access_token_enc
+            assert user.refresh_token_enc
+            # Tokens are stored encrypted, never plaintext.
+            assert token.access_token not in user.access_token_enc
 
+    def test_login_rejects_state_mismatch(self, cli_env, tmp_path):
+        fake = cli_env
+        fake.add_user("user1")
+        code = fake.issue_code("user1")
+        result = runner.invoke(
+            app,
+            ["auth", "login", "--no-browser"],
+            input=f"{REDIRECT}?code={code}&state=attacker-state\n",
+        )
+        assert result.exit_code == 1
+        assert "Login failed" in result.stderr
+        assert "state mismatch" in result.stderr
+        assert not (tmp_path / "current_user").exists()
+
+    def test_login_rejects_bad_code(self, cli_env, tmp_path):
+        fake = cli_env
+        fake.add_user("user1")
+        result = runner.invoke(
+            app,
+            ["auth", "login", "--no-browser"],
+            input=f"{REDIRECT}?code=bogus-code&state={STATE}\n",
+        )
+        assert result.exit_code == 1
+        assert "Login failed" in result.stderr
+        assert not (tmp_path / "current_user").exists()
+
+
+class TestAuthStatus:
+    def test_status_not_logged_in(self, cli_env):
+        result = runner.invoke(app, ["auth", "status"])
         assert result.exit_code == 0
         assert "Not logged in" in result.output
 
-    def test_auth_status_exception_shows_error(self):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.status = AsyncMock(side_effect=Exception("token expired"))
-        MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
-
-        fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
-
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": fake_mod}):
-            result = runner.invoke(app, ["auth", "status"])
-
-        assert result.exit_code == 1
-
-    # -- auth login --------------------------------------------------------
-
-    def test_auth_login_success(self):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.login = AsyncMock(return_value=None)
-        MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
-
-        fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
-
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": fake_mod}):
-            result = runner.invoke(app, ["auth", "login"])
-
+    def test_status_logged_in(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(app, ["auth", "status"])
         assert result.exit_code == 0
-        assert "Successfully authenticated" in result.output
+        assert "user1" in result.output
+        assert "Active" in result.output
 
-    def test_auth_login_failure(self):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.login = AsyncMock(side_effect=Exception("browser error"))
-        MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
+    def test_status_with_missing_token(self, cli_env, memory_token_store):
+        _login(cli_env)
+        memory_token_store.tokens.clear()  # keyring lost the token
+        result = runner.invoke(app, ["auth", "status"])
+        assert result.exit_code == 0
+        assert "no usable" in result.output
 
-        fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
 
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": fake_mod}):
-            result = runner.invoke(app, ["auth", "login"])
-
-        assert result.exit_code == 1
-
-    # -- auth logout -------------------------------------------------------
-
-    def test_auth_logout_success(self):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.logout = AsyncMock(return_value=None)
-        MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
-
-        fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
-
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": fake_mod}):
-            result = runner.invoke(app, ["auth", "logout"])
-
+class TestAuthLogout:
+    def test_logout_removes_everything(self, cli_env, memory_token_store, tmp_path):
+        _login(cli_env)
+        result = runner.invoke(app, ["auth", "logout"])
         assert result.exit_code == 0
         assert "Logged out successfully" in result.output
+        assert not (tmp_path / "current_user").exists()
+        assert memory_token_store.tokens == {}
 
-    def test_auth_logout_failure(self):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.logout = AsyncMock(side_effect=Exception("storage error"))
-        MockSpotifyAuth = MagicMock(return_value=mock_auth_instance)
-
-        fake_mod = _fake_module("spotifyforge.auth.oauth", SpotifyAuth=MockSpotifyAuth)
-
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": fake_mod}):
-            result = runner.invoke(app, ["auth", "logout"])
-
+        # Authenticated commands now refuse to run.
+        result = runner.invoke(app, ["playlist", "list"])
         assert result.exit_code == 1
+        assert "Not logged in" in result.stderr
 
-
-# =========================================================================
-# PLAYLIST commands
-# =========================================================================
-
-
-class TestPlaylistCommands:
-    """Tests for the ``playlist`` sub-command group."""
-
-    def test_playlist_help(self):
-        result = runner.invoke(app, ["playlist", "--help"])
+    def test_logout_when_not_logged_in(self, cli_env):
+        result = runner.invoke(app, ["auth", "logout"])
         assert result.exit_code == 0
-        assert "list" in result.output
-        assert "create" in result.output
-        assert "deduplicate" in result.output
-        assert "export" in result.output
+        assert "nothing to do" in result.output
 
-    # -- playlist list -----------------------------------------------------
 
-    def test_playlist_list_with_playlists(self):
-        mock_manager = MagicMock()
-        mock_manager.get_user_playlists = AsyncMock(
-            return_value=[
-                {
-                    "name": "Chill Vibes",
-                    "track_count": 42,
-                    "public": True,
-                    "followers": 10,
-                    "id": "pl_001",
-                },
-                {
-                    "name": "Workout Mix",
-                    "track_count": 30,
-                    "public": False,
-                    "followers": 0,
-                    "id": "pl_002",
-                },
-            ]
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
+# ---------------------------------------------------------------------------
+# Commands require login
+# ---------------------------------------------------------------------------
 
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "list"])
 
-        assert result.exit_code == 0
-        assert "Chill Vibes" in result.output
-        assert "Workout Mix" in result.output
-        assert "42" in result.output
-
-    def test_playlist_list_empty(self):
-        mock_manager = MagicMock()
-        mock_manager.get_user_playlists = AsyncMock(return_value=[])
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "list"])
-
-        assert result.exit_code == 0
-        assert "No playlists found" in result.output
-
-    def test_playlist_list_fetch_error(self):
-        mock_manager = MagicMock()
-        mock_manager.get_user_playlists = AsyncMock(side_effect=Exception("API error"))
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "list"])
-
+class TestRequiresLogin:
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["playlist", "list"],
+            ["playlist", "show", "pl1"],
+            ["playlist", "create", "New List"],
+            ["playlist", "sync", "pl1"],
+            ["playlist", "deduplicate", "pl1"],
+            ["playlist", "export", "pl1"],
+            ["discover", "top-tracks"],
+            ["discover", "deep-cuts", "art1"],
+            ["discover", "genre", "indie-rock"],
+            ["discover", "time-capsule"],
+            ["schedule", "list"],
+            ["schedule", "remove", "1"],
+        ],
+    )
+    def test_command_without_login_exits_1(self, cli_env, args):
+        result = runner.invoke(app, args)
         assert result.exit_code == 1
+        assert "Not logged in" in result.stderr
 
-    # -- playlist create ---------------------------------------------------
 
-    def test_playlist_create_success(self):
-        mock_manager = MagicMock()
-        mock_manager.create_playlist = AsyncMock(
-            return_value={
-                "name": "My New Playlist",
-                "id": "pl_new_001",
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
+# ---------------------------------------------------------------------------
+# Playlist
+# ---------------------------------------------------------------------------
 
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(
-                app, ["playlist", "create", "My New Playlist", "-d", "A great playlist"]
-            )
 
-        assert result.exit_code == 0
-        assert "Playlist created" in result.output
-        assert "My New Playlist" in result.output
+class TestPlaylistList:
+    def test_lists_playlists(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="Song A")
+        fake.add_playlist("pl1", name="Roadtrip", track_ids=["t1"])
+        fake.add_playlist("pl2", name="Chill", track_ids=[], public=False)
+        _login(fake)
 
-    def test_playlist_create_private(self):
-        mock_manager = MagicMock()
-        mock_manager.create_playlist = AsyncMock(
-            return_value={
-                "name": "Secret Mix",
-                "id": "pl_priv_001",
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "create", "Secret Mix", "--private"])
-
-        assert result.exit_code == 0
+        result = runner.invoke(app, ["playlist", "list"])
+        assert result.exit_code == 0, result.stderr
+        assert "Roadtrip" in result.output
+        assert "Chill" in result.output
+        assert "Public" in result.output
         assert "Private" in result.output
 
-    def test_playlist_create_failure(self):
-        mock_manager = MagicMock()
-        mock_manager.create_playlist = AsyncMock(side_effect=Exception("quota exceeded"))
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
+    def test_empty(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(app, ["playlist", "list"])
+        assert result.exit_code == 0, result.stderr
+        assert "No playlists found" in result.output
 
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "create", "Broken Playlist"])
 
-        assert result.exit_code == 1
+class TestPlaylistShow:
+    def test_shows_details_and_tracks(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="Song A", artist_name="Band X")
+        fake.add_track("t2", name="Song B", artist_name="Band X")
+        fake.add_playlist("pl1", name="Roadtrip", track_ids=["t1", "t2"])
+        _login(fake)
 
-    # -- playlist deduplicate ----------------------------------------------
-
-    def test_playlist_deduplicate_found_duplicates(self):
-        mock_manager = MagicMock()
-        mock_manager.deduplicate = AsyncMock(
-            return_value={
-                "removed": 5,
-                "remaining": 35,
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "deduplicate", "pl_001"])
-
-        assert result.exit_code == 0
-        assert "5" in result.output
-        assert "Deduplication complete" in result.output
-
-    def test_playlist_deduplicate_no_duplicates(self):
-        mock_manager = MagicMock()
-        mock_manager.deduplicate = AsyncMock(return_value={"removed": 0})
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "deduplicate", "pl_clean"])
-
-        assert result.exit_code == 0
-        assert "No duplicates found" in result.output
-
-    def test_playlist_deduplicate_failure(self):
-        mock_manager = MagicMock()
-        mock_manager.deduplicate = AsyncMock(side_effect=Exception("rate limited"))
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "deduplicate", "pl_err"])
-
-        assert result.exit_code == 1
-
-    # -- playlist sync -----------------------------------------------------
-
-    def test_playlist_sync_success(self):
-        mock_manager = MagicMock()
-        mock_manager.sync_playlist = AsyncMock(
-            return_value={
-                "name": "Synced Playlist",
-                "tracks_synced": 55,
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "sync", "pl_sync_001"])
-
-        assert result.exit_code == 0
-        assert "Sync Complete" in result.output
-        assert "55" in result.output
-
-    # -- playlist show -----------------------------------------------------
-
-    def test_playlist_show_success(self):
-        mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(
-            return_value={
-                "meta": {
-                    "name": "Test Playlist",
-                    "description": "A test description",
-                    "owner": "testuser",
-                    "track_count": 3,
-                    "followers": 100,
-                    "public": True,
-                },
-                "tracks": [
-                    {
-                        "name": "Track One",
-                        "artist": "Artist A",
-                        "album": "Album X",
-                        "duration_ms": 210000,
-                    },
-                    {
-                        "name": "Track Two",
-                        "artist": "Artist B",
-                        "album": "Album Y",
-                        "duration_ms": 180000,
-                    },
-                ],
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "show", "pl_show_001"])
-
-        assert result.exit_code == 0
-        assert "Test Playlist" in result.output
-        assert "Track One" in result.output
-
-    def test_playlist_show_empty_tracks(self):
-        mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(
-            return_value={
-                "meta": {
-                    "name": "Empty Playlist",
-                    "description": "",
-                    "owner": "testuser",
-                    "track_count": 0,
-                    "followers": 0,
-                    "public": False,
-                },
-                "tracks": [],
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "show", "pl_empty_001"])
-
-        assert result.exit_code == 0
-        assert "Playlist has no tracks" in result.output
-
-    # -- playlist export ---------------------------------------------------
-
-    def test_playlist_export_json_stdout(self):
-        tracks_data = [
-            {
-                "name": "Song A",
-                "artist": "Artist 1",
-                "album": "Album 1",
-                "duration_ms": 200000,
-                "uri": "spotify:track:aaa",
-            },
-            {
-                "name": "Song B",
-                "artist": "Artist 2",
-                "album": "Album 2",
-                "duration_ms": 180000,
-                "uri": "spotify:track:bbb",
-            },
-        ]
-        mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(
-            return_value={
-                "meta": {"name": "Export Playlist"},
-                "tracks": tracks_data,
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "export", "pl_export_001", "--format", "json"])
-
-        assert result.exit_code == 0
+        result = runner.invoke(app, ["playlist", "show", "pl1"])
+        assert result.exit_code == 0, result.stderr
+        assert "Roadtrip" in result.output
         assert "Song A" in result.output
         assert "Song B" in result.output
-        assert "spotify:track:aaa" in result.output
+        assert "Band X" in result.output
 
-    def test_playlist_export_csv_stdout(self):
-        tracks_data = [
-            {
-                "name": "Song A",
-                "artist": "Artist 1",
-                "album": "Album 1",
-                "duration_ms": 200000,
-                "uri": "spotify:track:aaa",
-            },
-        ]
-        mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(
-            return_value={
-                "meta": {"name": "CSV Export"},
-                "tracks": tracks_data,
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "export", "pl_export_002", "--format", "csv"])
-
-        assert result.exit_code == 0
-        assert "name" in result.output
-        assert "Song A" in result.output
-
-    def test_playlist_export_json_to_file(self, tmp_path):
-        tracks_data = [
-            {
-                "name": "File Song",
-                "artist": "File Artist",
-                "album": "File Album",
-                "duration_ms": 300000,
-                "uri": "spotify:track:file1",
-            },
-        ]
-        mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(
-            return_value={
-                "meta": {"name": "File Export"},
-                "tracks": tracks_data,
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        output_file = tmp_path / "export.json"
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(
-                app,
-                [
-                    "playlist",
-                    "export",
-                    "pl_file_001",
-                    "--format",
-                    "json",
-                    "--output",
-                    str(output_file),
-                ],
-            )
-
-        assert result.exit_code == 0
-        assert "Exported" in result.output
-        assert output_file.exists()
-        data = json.loads(output_file.read_text())
-        assert len(data) == 1
-        assert data[0]["name"] == "File Song"
-
-    def test_playlist_export_csv_to_file(self, tmp_path):
-        tracks_data = [
-            {
-                "name": "CSV Song",
-                "artist": "CSV Artist",
-                "album": "CSV Album",
-                "duration_ms": 250000,
-                "uri": "spotify:track:csv1",
-            },
-        ]
-        mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(
-            return_value={
-                "meta": {"name": "CSV File Export"},
-                "tracks": tracks_data,
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        output_file = tmp_path / "export.csv"
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(
-                app,
-                [
-                    "playlist",
-                    "export",
-                    "pl_csv_001",
-                    "--format",
-                    "csv",
-                    "--output",
-                    str(output_file),
-                ],
-            )
-
-        assert result.exit_code == 0
-        assert "Exported" in result.output
-        assert output_file.exists()
-        content = output_file.read_text()
-        assert "name,artist,album,duration_ms,uri" in content
-        assert "CSV Song" in content
-
-    def test_playlist_export_empty_playlist(self):
-        mock_manager = MagicMock()
-        mock_manager.get_playlist_details = AsyncMock(
-            return_value={
-                "meta": {"name": "Empty"},
-                "tracks": [],
-            }
-        )
-        MockPM = MagicMock(return_value=mock_manager)
-        fake_mod = _fake_module("spotifyforge.core.playlist_manager", PlaylistManager=MockPM)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": fake_mod}):
-            result = runner.invoke(app, ["playlist", "export", "pl_empty", "--format", "json"])
-
+    def test_missing_playlist_exits_1(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(app, ["playlist", "show", "nope"])
         assert result.exit_code == 1
+        assert "Failed to fetch playlist" in result.stderr
 
 
-# =========================================================================
-# DISCOVER commands
-# =========================================================================
+class TestPlaylistCreate:
+    def test_creates_on_spotify_and_locally(self, cli_env):
+        fake = cli_env
+        _login(fake)
 
-
-class TestDiscoverCommands:
-    """Tests for the ``discover`` sub-command group."""
-
-    def test_discover_help(self):
-        result = runner.invoke(app, ["discover", "--help"])
-        assert result.exit_code == 0
-        assert "top-tracks" in result.output
-        assert "deep-cuts" in result.output
-        assert "genre" in result.output
-        assert "time-capsule" in result.output
-
-    # -- top-tracks --------------------------------------------------------
-
-    def test_discover_top_tracks_success(self):
-        mock_discovery = MagicMock()
-        mock_discovery.get_top_tracks = AsyncMock(
-            return_value=[
-                {
-                    "name": "Hit Song",
-                    "artist": "Pop Star",
-                    "album": "Greatest Hits",
-                    "popularity": 95,
-                },
-                {
-                    "name": "Another Hit",
-                    "artist": "Rock Band",
-                    "album": "Rock Album",
-                    "popularity": 80,
-                },
-            ]
+        result = runner.invoke(
+            app,
+            ["playlist", "create", "My Mix", "--description", "test mix", "--private"],
         )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
+        assert result.exit_code == 0, result.stderr
+        assert "Playlist created!" in result.output
+        assert "My Mix" in result.output
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "top-tracks"])
+        # Created on (fake) Spotify...
+        created = [p for p in fake.playlists.values() if p["name"] == "My Mix"]
+        assert len(created) == 1
+        assert created[0]["public"] is False
 
-        assert result.exit_code == 0
-        assert "Hit Song" in result.output
-        assert "Pop Star" in result.output
-        assert "95" in result.output
+        # ...and persisted locally, owned by the logged-in user.
+        with Session(get_engine()) as session:
+            row = session.exec(select(Playlist).where(Playlist.name == "My Mix")).first()
+            assert row is not None
+            assert row.spotify_id == created[0]["id"]
+            user = session.exec(select(User).where(User.spotify_id == "user1")).first()
+            assert row.owner_id == user.id
 
-    def test_discover_top_tracks_with_options(self):
-        mock_discovery = MagicMock()
-        mock_discovery.get_top_tracks = AsyncMock(
-            return_value=[
-                {
-                    "name": "Recent Track",
-                    "artist": "New Artist",
-                    "album": "New Album",
-                    "popularity": 70,
-                },
-            ]
+
+class TestPlaylistSync:
+    def test_sync_caches_tracks(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="Song A")
+        fake.add_track("t2", name="Song B")
+        fake.add_playlist("pl1", name="Roadtrip", track_ids=["t1", "t2"])
+        _login(fake)
+
+        result = runner.invoke(app, ["playlist", "sync", "pl1"])
+        assert result.exit_code == 0, result.stderr
+        assert "Playlist synced" in result.output
+        assert "Tracks synced: 2" in result.output
+
+        with Session(get_engine()) as session:
+            row = session.exec(select(Playlist).where(Playlist.spotify_id == "pl1")).first()
+            assert row is not None
+            assert row.track_count == 2
+
+    def test_sync_missing_playlist_exits_1(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(app, ["playlist", "sync", "ghost"])
+        assert result.exit_code == 1
+        assert "Sync failed" in result.stderr
+
+
+class TestPlaylistDeduplicate:
+    def test_removes_duplicates(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="Song A")
+        fake.add_track("t2", name="Song B")
+        fake.add_playlist("pl1", track_ids=["t1", "t2", "t1"])
+        _login(fake)
+
+        result = runner.invoke(app, ["playlist", "deduplicate", "pl1"])
+        assert result.exit_code == 0, result.stderr
+        assert "Deduplication complete" in result.output
+        assert "1" in result.output
+        # The fake's playlist really lost the duplicate, order preserved.
+        assert fake.playlist_tracks["pl1"] == ["t1", "t2"]
+
+    def test_clean_playlist(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1")
+        fake.add_track("t2")
+        fake.add_playlist("pl1", track_ids=["t1", "t2"])
+        _login(fake)
+
+        result = runner.invoke(app, ["playlist", "deduplicate", "pl1"])
+        assert result.exit_code == 0, result.stderr
+        assert "No duplicates found" in result.output
+        assert fake.playlist_tracks["pl1"] == ["t1", "t2"]
+
+
+class TestPlaylistExport:
+    def test_export_json_to_file(self, cli_env, tmp_path):
+        fake = cli_env
+        fake.add_track("t1", name="Song A", artist_name="Band X")
+        fake.add_playlist("pl1", track_ids=["t1"])
+        _login(fake)
+
+        out = tmp_path / "export.json"
+        result = runner.invoke(
+            app, ["playlist", "export", "pl1", "--format", "json", "-o", str(out)]
         )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
+        assert result.exit_code == 0, result.stderr
+        data = json.loads(out.read_text())
+        assert data[0]["name"] == "Song A"
+        assert data[0]["artist"] == "Band X"
+        assert data[0]["uri"] == "spotify:track:t1"
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(
-                app, ["discover", "top-tracks", "--time-range", "short_term", "--limit", "5"]
-            )
+    def test_export_csv_to_file(self, cli_env, tmp_path):
+        fake = cli_env
+        fake.add_track("t1", name="Song A", artist_name="Band X", album_name="LP One")
+        fake.add_playlist("pl1", track_ids=["t1"])
+        _login(fake)
 
-        assert result.exit_code == 0
-        assert "Recent Track" in result.output
+        out = tmp_path / "export.csv"
+        result = runner.invoke(
+            app, ["playlist", "export", "pl1", "--format", "csv", "-o", str(out)]
+        )
+        assert result.exit_code == 0, result.stderr
+        lines = out.read_text().strip().splitlines()
+        assert lines[0] == "name,artist,album,duration_ms,uri"
+        assert "Song A,Band X,LP One,200000,spotify:track:t1" in lines[1]
+
+    def test_export_json_to_stdout(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="SongA")
+        fake.add_playlist("pl1", track_ids=["t1"])
+        _login(fake)
+
+        result = runner.invoke(app, ["playlist", "export", "pl1"])
+        assert result.exit_code == 0, result.stderr
+        assert "SongA" in result.output
+
+    def test_export_empty_playlist_exits_1(self, cli_env):
+        fake = cli_env
+        fake.add_playlist("pl1", track_ids=[])
+        _login(fake)
+
+        result = runner.invoke(app, ["playlist", "export", "pl1"])
+        assert result.exit_code == 1
+        assert "no tracks to export" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Discover
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverTopTracks:
+    def test_shows_top_tracks(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="Hit One", popularity=90)
+        fake.add_track("t2", name="Hit Two", popularity=80)
+        _login(fake)
+        fake.top_tracks["user1"] = ["t1", "t2"]
+
+        result = runner.invoke(app, ["discover", "top-tracks", "-t", "short_term"])
+        assert result.exit_code == 0, result.stderr
+        assert "Hit One" in result.output
+        assert "Hit Two" in result.output
         assert "Last 4 Weeks" in result.output
-        mock_discovery.get_top_tracks.assert_called_once()
 
-    def test_discover_top_tracks_empty(self):
-        mock_discovery = MagicMock()
-        mock_discovery.get_top_tracks = AsyncMock(return_value=[])
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
+    def test_respects_limit(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="Hit One")
+        fake.add_track("t2", name="Hit Two")
+        _login(fake)
+        fake.top_tracks["user1"] = ["t1", "t2"]
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "top-tracks"])
+        result = runner.invoke(app, ["discover", "top-tracks", "--limit", "1"])
+        assert result.exit_code == 0, result.stderr
+        assert "Hit One" in result.output
+        assert "Hit Two" not in result.output
 
-        assert result.exit_code == 0
+    def test_empty(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(app, ["discover", "top-tracks"])
+        assert result.exit_code == 0, result.stderr
         assert "No top tracks found" in result.output
 
-    def test_discover_top_tracks_error(self):
-        mock_discovery = MagicMock()
-        mock_discovery.get_top_tracks = AsyncMock(side_effect=Exception("API failure"))
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "top-tracks"])
+class TestDiscoverDeepCuts:
+    def _seed_catalogue(self, fake):
+        # One artist, one album, a hit and two deep cuts.
+        fake.add_track("hit", name="The Hit", popularity=85, album_id="alb1")
+        fake.add_track("cut1", name="Obscure One", popularity=10, album_id="alb1")
+        fake.add_track("cut2", name="Obscure Two", popularity=25, album_id="alb1")
+        fake.artist_albums["art1"] = ["alb1"]
+        fake.album_tracks["alb1"] = ["hit", "cut1", "cut2"]
 
-        assert result.exit_code == 1
+    def test_finds_deep_cuts_below_threshold(self, cli_env):
+        fake = cli_env
+        self._seed_catalogue(fake)
+        _login(fake)
 
-    # -- deep-cuts ---------------------------------------------------------
+        result = runner.invoke(app, ["discover", "deep-cuts", "art1", "--threshold", "30"])
+        assert result.exit_code == 0, result.stderr
+        assert "Found 2 deep cuts" in result.output
+        assert "Obscure One" in result.output
+        assert "Obscure Two" in result.output
+        assert "The Hit" not in result.output
 
-    def test_discover_deep_cuts_success(self):
-        mock_discovery = MagicMock()
-        mock_discovery.find_deep_cuts = AsyncMock(
-            return_value={
-                "artist_name": "Indie Band",
-                "tracks": [
-                    {
-                        "name": "Hidden Gem",
-                        "album": "Obscure Album",
-                        "popularity": 12,
-                        "duration_ms": 240000,
-                    },
-                    {
-                        "name": "B-Side Track",
-                        "album": "Rare Vinyl",
-                        "popularity": 5,
-                        "duration_ms": 195000,
-                    },
-                ],
-            }
-        )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
+    def test_no_deep_cuts(self, cli_env):
+        fake = cli_env
+        self._seed_catalogue(fake)
+        _login(fake)
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "deep-cuts", "Indie Band"])
-
-        assert result.exit_code == 0
-        assert "Hidden Gem" in result.output
-        assert "Indie Band" in result.output
-
-    def test_discover_deep_cuts_none_found(self):
-        mock_discovery = MagicMock()
-        mock_discovery.find_deep_cuts = AsyncMock(
-            return_value={
-                "artist_name": "Famous Singer",
-                "tracks": [],
-            }
-        )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "deep-cuts", "Famous Singer"])
-
-        assert result.exit_code == 0
+        result = runner.invoke(app, ["discover", "deep-cuts", "art1", "--threshold", "5"])
+        assert result.exit_code == 0, result.stderr
         assert "No deep cuts found" in result.output
 
-    def test_discover_deep_cuts_with_threshold(self):
-        mock_discovery = MagicMock()
-        mock_discovery.find_deep_cuts = AsyncMock(
-            return_value={
-                "artist_name": "Some Artist",
-                "tracks": [
-                    {"name": "Ultra Deep", "album": "Rare", "popularity": 2, "duration_ms": 180000},
-                ],
-            }
+
+class TestDiscoverGenre:
+    def test_creates_genre_playlist(self, cli_env):
+        fake = cli_env
+        fake.add_track("g1", name="Indie Song")
+        fake.add_track("g2", name="Indie Anthem")
+        _login(fake)
+
+        result = runner.invoke(app, ["discover", "genre", "indie-rock", "--name", "Indie Finds"])
+        assert result.exit_code == 0, result.stderr
+        assert "Genre playlist created!" in result.output
+        assert "Indie Finds" in result.output
+
+        created = [p for p, m in fake.playlists.items() if m["name"] == "Indie Finds"]
+        assert len(created) == 1
+        assert sorted(fake.playlist_tracks[created[0]]) == ["g1", "g2"]
+
+
+class TestDiscoverTimeCapsule:
+    def test_creates_private_capsule_playlist(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1", name="Memory Lane")
+        _login(fake)
+        fake.top_tracks["user1"] = ["t1"]
+
+        result = runner.invoke(app, ["discover", "time-capsule", "-t", "long_term"])
+        assert result.exit_code == 0, result.stderr
+        assert "Time capsule created!" in result.output
+        assert "Tracks:     1" in result.output
+
+        created = [m for m in fake.playlists.values() if "Time Capsule" in m["name"]]
+        assert len(created) == 1
+        assert created[0]["public"] is False
+        assert fake.playlist_tracks[created[0]["id"]] == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# Schedule
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleAdd:
+    def test_add_sync_job_autosyncs_playlist(self, cli_env):
+        fake = cli_env
+        fake.add_track("t1")
+        fake.add_playlist("schedpl", name="Nightly", track_ids=["t1"])
+        _login(fake)
+
+        result = runner.invoke(
+            app,
+            [
+                "schedule",
+                "add",
+                "--name",
+                "nightly sync",
+                "--type",
+                "sync",
+                "--cron",
+                "0 3 * * *",
+                "--playlist",
+                "schedpl",
+            ],
         )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
+        assert result.exit_code == 0, result.stderr
+        assert "Job scheduled successfully!" in result.output
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(
-                app, ["discover", "deep-cuts", "Some Artist", "--threshold", "10"]
-            )
+        with Session(get_engine()) as session:
+            job = session.exec(select(ScheduledJob)).first()
+            assert job is not None
+            assert job.name == "nightly sync"
+            assert job.job_type == JobType.sync
+            assert job.cron_expression == "0 3 * * *"
+            assert job.enabled is True
+            # The playlist FK points at the auto-synced local row.
+            pl = session.get(Playlist, job.playlist_id)
+            assert pl.spotify_id == "schedpl"
 
-        assert result.exit_code == 0
-        assert "Ultra Deep" in result.output
-
-    # -- genre -------------------------------------------------------------
-
-    def test_discover_genre_success(self):
-        mock_discovery = MagicMock()
-        mock_discovery.build_genre_playlist = AsyncMock(
-            return_value={
-                "playlist": {"name": "Indie Rock Vibes", "id": "pl_genre_001"},
-                "tracks": [
-                    {"name": "Indie Song 1", "artist": "Band A"},
-                    {"name": "Indie Song 2", "artist": "Band B"},
-                ],
-            }
+    def test_add_time_capsule_needs_no_playlist(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(
+            app,
+            [
+                "schedule",
+                "add",
+                "--name",
+                "monthly capsule",
+                "--type",
+                "time_capsule",
+                "--cron",
+                "0 8 1 * *",
+                "--time-range",
+                "short_term",
+            ],
         )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
+        assert result.exit_code == 0, result.stderr
+        with Session(get_engine()) as session:
+            job = session.exec(select(ScheduledJob)).first()
+            assert job.job_type == JobType.time_capsule
+            assert job.playlist_id is None
+            assert job.config == {"time_range": "short_term"}
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "genre", "indie-rock"])
-
-        assert result.exit_code == 0
-        assert "Genre playlist created" in result.output
-        assert "Indie Rock Vibes" in result.output
-
-    def test_discover_genre_error(self):
-        mock_discovery = MagicMock()
-        mock_discovery.build_genre_playlist = AsyncMock(side_effect=Exception("bad genre"))
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "genre", "nonexistent-genre"])
-
+    def test_bad_cron_exits_1(self, cli_env):
+        result = runner.invoke(
+            app,
+            ["schedule", "add", "-n", "x", "-t", "sync", "-c", "not a cron", "-p", "pl1"],
+        )
         assert result.exit_code == 1
+        assert "Invalid cron expression" in result.stderr
 
-    # -- time-capsule ------------------------------------------------------
-
-    def test_discover_time_capsule_success(self):
-        mock_discovery = MagicMock()
-        mock_discovery.create_time_capsule = AsyncMock(
-            return_value={
-                "playlist": {"name": "Time Capsule 2024", "id": "pl_tc_001"},
-                "track_count": 25,
-            }
+    def test_unknown_type_exits_1(self, cli_env):
+        result = runner.invoke(
+            app,
+            ["schedule", "add", "-n", "x", "-t", "explode", "-c", "0 3 * * *"],
         )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
+        assert result.exit_code == 1
+        assert "Unknown job type" in result.stderr
 
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "time-capsule"])
+    def test_sync_requires_playlist(self, cli_env):
+        result = runner.invoke(app, ["schedule", "add", "-n", "x", "-t", "sync", "-c", "0 3 * * *"])
+        assert result.exit_code == 1
+        assert "requires --playlist" in result.stderr
 
-        assert result.exit_code == 0
-        assert "Time capsule created" in result.output
-        assert "25" in result.output
-
-    def test_discover_time_capsule_with_time_range(self):
-        mock_discovery = MagicMock()
-        mock_discovery.create_time_capsule = AsyncMock(
-            return_value={
-                "playlist": {"name": "Short Term Capsule", "id": "pl_tc_002"},
-                "track_count": 15,
-            }
+    def test_genre_refresh_requires_genre(self, cli_env):
+        result = runner.invoke(
+            app,
+            [
+                "schedule",
+                "add",
+                "-n",
+                "x",
+                "-t",
+                "genre_refresh",
+                "-c",
+                "0 3 * * *",
+                "-p",
+                "pl1",
+            ],
         )
-        MockDiscoveryEngine = MagicMock(return_value=mock_discovery)
-        fake_mod = _fake_module("spotifyforge.core.discovery", DiscoveryEngine=MockDiscoveryEngine)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": fake_mod}):
-            result = runner.invoke(app, ["discover", "time-capsule", "--time-range", "short_term"])
-
-        assert result.exit_code == 0
-        assert "Last 4 Weeks" in result.output
+        assert result.exit_code == 1
+        assert "require --genre" in result.stderr
 
 
-# =========================================================================
-# SCHEDULE commands
-# =========================================================================
-
-
-class TestScheduleCommands:
-    """Tests for the ``schedule`` sub-command group."""
-
-    def test_schedule_help(self):
-        result = runner.invoke(app, ["schedule", "--help"])
-        assert result.exit_code == 0
-        assert "list" in result.output
-        assert "add" in result.output
-        assert "remove" in result.output
-        assert "run" in result.output
-
-    # -- schedule list -----------------------------------------------------
-
-    def test_schedule_list_with_jobs(self):
-        mock_scheduler = MagicMock()
-        mock_scheduler.list_jobs = AsyncMock(
-            return_value=[
-                {
-                    "id": "job_001",
-                    "name": "Weekly Sync",
-                    "type": "sync",
-                    "playlist_id": "pl_001",
-                    "cron": "0 8 * * 1",
-                    "next_run": "2026-02-23 08:00",
-                    "status": "active",
-                },
-                {
-                    "id": "job_002",
-                    "name": "Daily Dedup",
-                    "type": "deduplicate",
-                    "playlist_id": "pl_002",
-                    "cron": "0 0 * * *",
-                    "next_run": "2026-02-17 00:00",
-                    "status": "paused",
-                },
-            ]
+class TestScheduleListRemove:
+    def _add_job(self, fake) -> int:
+        fake.add_track("t1")
+        fake.add_playlist("schedpl", name="Nightly", track_ids=["t1"])
+        result = runner.invoke(
+            app,
+            [
+                "schedule",
+                "add",
+                "-n",
+                "nightly sync",
+                "-t",
+                "sync",
+                "-c",
+                "0 3 * * *",
+                "-p",
+                "schedpl",
+            ],
         )
-        MockScheduler = MagicMock(return_value=mock_scheduler)
-        fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
+        assert result.exit_code == 0, result.stderr
+        with Session(get_engine()) as session:
+            return session.exec(select(ScheduledJob)).first().id
 
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": fake_mod}):
-            result = runner.invoke(app, ["schedule", "list"])
-
-        assert result.exit_code == 0
-        # Rich tables may wrap long cell values across lines, so check for
-        # individual words rather than full phrases.
-        assert "Weekly" in result.output
-        assert "Sync" in result.output
-        assert "Daily" in result.output
-        assert "Dedup" in result.output
-        assert "job_001" in result.output
-
-    def test_schedule_list_empty(self):
-        mock_scheduler = MagicMock()
-        mock_scheduler.list_jobs = AsyncMock(return_value=[])
-        MockScheduler = MagicMock(return_value=mock_scheduler)
-        fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": fake_mod}):
-            result = runner.invoke(app, ["schedule", "list"])
-
-        assert result.exit_code == 0
+    def test_list_empty(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(app, ["schedule", "list"])
+        assert result.exit_code == 0, result.stderr
         assert "No scheduled jobs" in result.output
 
-    def test_schedule_list_error(self):
-        mock_scheduler = MagicMock()
-        mock_scheduler.list_jobs = AsyncMock(side_effect=Exception("db error"))
-        MockScheduler = MagicMock(return_value=mock_scheduler)
-        fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
+    def test_list_shows_jobs(self, cli_env):
+        fake = cli_env
+        _login(fake)
+        self._add_job(fake)
 
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": fake_mod}):
-            result = runner.invoke(app, ["schedule", "list"])
+        result = runner.invoke(app, ["schedule", "list"])
+        assert result.exit_code == 0, result.stderr
+        assert "nightly sync" in result.output
+        assert "sync" in result.output
+        assert "0 3 * * *" in result.output
+        assert "never" in result.output  # has not run yet
+        assert "Enabled" in result.output
 
-        assert result.exit_code == 1
+    def test_remove_job(self, cli_env):
+        fake = cli_env
+        _login(fake)
+        job_id = self._add_job(fake)
 
-    # -- schedule add ------------------------------------------------------
-
-    def test_schedule_add_success(self):
-        mock_scheduler = MagicMock()
-        mock_scheduler.add_job = AsyncMock(
-            return_value={
-                "id": "job_new_001",
-                "next_run": "2026-02-23 08:00",
-            }
-        )
-        MockScheduler = MagicMock(return_value=mock_scheduler)
-        fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": fake_mod}):
-            result = runner.invoke(
-                app,
-                [
-                    "schedule",
-                    "add",
-                    "--name",
-                    "My Sync Job",
-                    "--type",
-                    "sync",
-                    "--playlist",
-                    "pl_001",
-                    "--cron",
-                    "0 8 * * 1",
-                ],
-            )
-
-        assert result.exit_code == 0
-        assert "Job scheduled successfully" in result.output
-        assert "My Sync Job" in result.output
-
-    def test_schedule_add_failure(self):
-        mock_scheduler = MagicMock()
-        mock_scheduler.add_job = AsyncMock(side_effect=Exception("invalid cron"))
-        MockScheduler = MagicMock(return_value=mock_scheduler)
-        fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": fake_mod}):
-            result = runner.invoke(
-                app,
-                [
-                    "schedule",
-                    "add",
-                    "--name",
-                    "Bad Job",
-                    "--type",
-                    "sync",
-                    "--playlist",
-                    "pl_001",
-                    "--cron",
-                    "invalid",
-                ],
-            )
-
-        assert result.exit_code == 1
-
-    # -- schedule remove ---------------------------------------------------
-
-    def test_schedule_remove_success(self):
-        mock_scheduler = MagicMock()
-        mock_scheduler.remove_job = AsyncMock(return_value=None)
-        MockScheduler = MagicMock(return_value=mock_scheduler)
-        fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": fake_mod}):
-            result = runner.invoke(app, ["schedule", "remove", "job_001"])
-
-        assert result.exit_code == 0
-        assert "job_001" in result.output
+        result = runner.invoke(app, ["schedule", "remove", str(job_id)])
+        assert result.exit_code == 0, result.stderr
         assert "removed successfully" in result.output
 
-    def test_schedule_remove_failure(self):
-        mock_scheduler = MagicMock()
-        mock_scheduler.remove_job = AsyncMock(side_effect=Exception("not found"))
-        MockScheduler = MagicMock(return_value=mock_scheduler)
-        fake_mod = _fake_module("spotifyforge.core.scheduler", Scheduler=MockScheduler)
+        with Session(get_engine()) as session:
+            assert session.get(ScheduledJob, job_id) is None
 
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": fake_mod}):
-            result = runner.invoke(app, ["schedule", "remove", "job_missing"])
-
+    def test_remove_missing_job_exits_1(self, cli_env):
+        _login(cli_env)
+        result = runner.invoke(app, ["schedule", "remove", "999"])
         assert result.exit_code == 1
+        assert "not found" in result.stderr
 
 
-# =========================================================================
-# CONFIG commands
-# =========================================================================
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 
-class TestConfigCommands:
-    """Tests for the ``config`` sub-command group."""
+class TestConfigShow:
+    def test_shows_settings_with_secrets_masked(self, cli_env, monkeypatch):
+        from spotifyforge.config import settings
 
-    def test_config_help(self):
-        result = runner.invoke(app, ["config", "--help"])
-        assert result.exit_code == 0
-        assert "show" in result.output
-        assert "set" in result.output
+        monkeypatch.setattr(settings, "secret_key", "supersecretkey123")
 
-    def test_config_show(self):
         result = runner.invoke(app, ["config", "show"])
-        assert result.exit_code == 0
-        assert "SpotifyForge Configuration" in result.output
-        # Should list known config fields
+        assert result.exit_code == 0, result.stderr
         assert "spotify_client_id" in result.output
-        assert "db_path" in result.output
-        assert "scheduler_enabled" in result.output
-        assert "web_host" in result.output
-        assert "web_port" in result.output
+        assert "secret_key" in result.output
+        # Secrets never appear in cleartext; only ****<last4>.
+        assert "supersecretkey123" not in result.output
+        assert "****y123" in result.output
+        assert "test-client-secret" not in result.output
+        assert "****" in result.output
+        # Non-secret values are shown as-is.
+        assert "development" in result.output
 
-    def test_config_show_contains_source_column(self):
-        """The config show table should include a Source column."""
-        result = runner.invoke(app, ["config", "show"])
-        assert result.exit_code == 0
-        # The Source column shows "env" or "default"
-        assert "default" in result.output or "env" in result.output
 
-    def test_config_set_invalid_key(self):
-        """Setting an unknown config key produces an error."""
-        result = runner.invoke(app, ["config", "set", "nonexistent_key", "value"])
-        assert result.exit_code == 1
-
-    def test_config_set_valid_key(self, tmp_path, monkeypatch):
-        """Setting a valid config key writes to the .env file."""
-        # Change working directory to tmp_path so the .env file is written there
+class TestConfigSet:
+    def test_writes_new_key_to_env_file(self, cli_env, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(app, ["config", "set", "web_port", "9000"])
-
-        assert result.exit_code == 0
+        result = runner.invoke(app, ["config", "set", "web_port", "9090"])
+        assert result.exit_code == 0, result.stderr
         assert "Configuration updated" in result.output
-        assert "web_port" in result.output
-        assert "9000" in result.output
+        assert "SPOTIFYFORGE_WEB_PORT=9090" in (tmp_path / ".env").read_text()
 
-        # Verify the .env file was created with the correct content
-        env_file = tmp_path / ".env"
-        assert env_file.exists()
-        content = env_file.read_text()
-        assert "SPOTIFYFORGE_WEB_PORT=9000" in content
-
-    def test_config_set_updates_existing_env(self, tmp_path, monkeypatch):
-        """Setting a key that already exists in .env updates (not duplicates) it."""
+    def test_updates_existing_key_in_place(self, cli_env, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        env_file = tmp_path / ".env"
-        env_file.write_text("SPOTIFYFORGE_WEB_PORT=8000\nSPOTIFYFORGE_WEB_HOST=0.0.0.0\n")
-
-        result = runner.invoke(app, ["config", "set", "web_port", "9000"])
-
-        assert result.exit_code == 0
-        content = env_file.read_text()
-        assert "SPOTIFYFORGE_WEB_PORT=9000" in content
-        assert "SPOTIFYFORGE_WEB_HOST=0.0.0.0" in content
-        # No duplicate
+        (tmp_path / ".env").write_text("SPOTIFYFORGE_WEB_PORT=8000\nSPOTIFYFORGE_LOG_LEVEL=DEBUG\n")
+        result = runner.invoke(app, ["config", "set", "web_port", "9090"])
+        assert result.exit_code == 0, result.stderr
+        content = (tmp_path / ".env").read_text()
         assert content.count("SPOTIFYFORGE_WEB_PORT") == 1
+        assert "SPOTIFYFORGE_WEB_PORT=9090" in content
+        assert "SPOTIFYFORGE_LOG_LEVEL=DEBUG" in content  # untouched
 
+    def test_secret_value_masked_in_output(self, cli_env, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["config", "set", "secret_key", "hunter2secret"])
+        assert result.exit_code == 0, result.stderr
+        assert "hunter2secret" not in result.output
+        assert "****" in result.output
+        # But the real value is written to the file.
+        assert "SPOTIFYFORGE_SECRET_KEY=hunter2secret" in (tmp_path / ".env").read_text()
 
-# =========================================================================
-# Error handling and edge cases
-# =========================================================================
-
-
-class TestErrorHandling:
-    """Tests for generic error handling across CLI commands."""
-
-    def test_import_error_auth(self):
-        """When the auth module cannot be imported, an error panel is shown."""
-        with patch.dict("sys.modules", {"spotifyforge.auth.oauth": None}):
-            result = runner.invoke(app, ["auth", "status"])
-
+    def test_unknown_key_exits_1(self, cli_env, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["config", "set", "no_such_key", "value"])
         assert result.exit_code == 1
+        assert "Unknown configuration key" in result.stderr
+        assert not (tmp_path / ".env").exists()
 
-    def test_import_error_playlist_manager(self):
-        """When the playlist manager cannot be imported, an error panel is shown."""
-        with patch.dict("sys.modules", {"spotifyforge.core.playlist_manager": None}):
-            result = runner.invoke(app, ["playlist", "list"])
 
+# ---------------------------------------------------------------------------
+# Cross-command flow
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEndFlow:
+    def test_login_create_sync_schedule_logout(self, cli_env):
+        """One session: login -> create -> add tracks upstream -> sync ->
+        schedule -> logout, with state persisting between commands."""
+        fake = cli_env
+        _login(fake)
+
+        # Create a playlist through the CLI.
+        result = runner.invoke(app, ["playlist", "create", "Flow List"])
+        assert result.exit_code == 0, result.stderr
+        pid = next(p for p, m in fake.playlists.items() if m["name"] == "Flow List")
+
+        # Tracks get added on Spotify (out of band), then we sync.
+        fake.add_track("f1", name="Flow One")
+        fake.playlist_tracks[pid].append("f1")
+        result = runner.invoke(app, ["playlist", "sync", pid])
+        assert result.exit_code == 0, result.stderr
+        assert "Tracks synced: 1" in result.output
+
+        # Schedule a job against the (already cached) playlist.
+        result = runner.invoke(
+            app,
+            ["schedule", "add", "-n", "flow job", "-t", "sync", "-c", "0 3 * * *", "-p", pid],
+        )
+        assert result.exit_code == 0, result.stderr
+
+        result = runner.invoke(app, ["schedule", "list"])
+        assert "flow job" in result.output
+        assert "Flow List" in result.output
+
+        # Logout ends the session.
+        result = runner.invoke(app, ["auth", "logout"])
+        assert result.exit_code == 0
+        result = runner.invoke(app, ["schedule", "list"])
         assert result.exit_code == 1
-
-    def test_import_error_discovery(self):
-        """When the discovery module cannot be imported, an error panel is shown."""
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": None}):
-            result = runner.invoke(app, ["discover", "top-tracks"])
-
-        assert result.exit_code == 1
-
-    def test_import_error_scheduler(self):
-        """When the scheduler module cannot be imported, an error panel is shown."""
-        with patch.dict("sys.modules", {"spotifyforge.core.scheduler": None}):
-            result = runner.invoke(app, ["schedule", "list"])
-
-        assert result.exit_code == 1
-
-    def test_playlist_show_missing_argument(self):
-        """Omitting a required argument produces a usage error."""
-        result = runner.invoke(app, ["playlist", "show"])
-        assert result.exit_code != 0
-
-    def test_discover_deep_cuts_missing_argument(self):
-        """Omitting the artist argument produces a usage error."""
-        result = runner.invoke(app, ["discover", "deep-cuts"])
-        assert result.exit_code != 0
-
-    def test_schedule_add_missing_required_options(self):
-        """Omitting required options for schedule add produces an error."""
-        result = runner.invoke(app, ["schedule", "add"])
-        assert result.exit_code != 0
-
-    def test_unknown_command(self):
-        """Invoking a nonexistent command produces an error."""
-        result = runner.invoke(app, ["foobar"])
-        assert result.exit_code != 0
+        assert "Not logged in" in result.stderr

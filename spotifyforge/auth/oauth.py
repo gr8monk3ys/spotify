@@ -13,11 +13,10 @@ import json
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 import tekore
-from cryptography.fernet import Fernet
-from cryptography.fernet import InvalidToken as FernetInvalidToken
 
 from spotifyforge.config import Settings
 from spotifyforge.security import (
@@ -26,6 +25,40 @@ from spotifyforge.security import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Test seam: when set (tests only), every internally constructed tekore
+# Credentials/Spotify instance uses a sender from this factory, so the whole
+# OAuth + API stack can be pointed at an in-process fake. Production leaves
+# it None and tekore uses its default senders.
+# ---------------------------------------------------------------------------
+
+SenderFactory = Callable[[bool], "tekore.Sender"]
+_sender_factory: SenderFactory | None = None
+
+
+def set_sender_factory(factory: SenderFactory | None) -> None:
+    """Install (or clear) the sender factory. Intended for tests."""
+    global _sender_factory  # noqa: PLW0603
+    _sender_factory = factory
+
+
+def make_sender(asynchronous: bool) -> tekore.Sender | None:
+    """Return a sender from the installed factory, or ``None`` for defaults."""
+    return _sender_factory(asynchronous) if _sender_factory is not None else None
+
+
+def make_client(token: tekore.Token | str, asynchronous: bool) -> tekore.Spotify:
+    """Build a ``tekore.Spotify`` client, honouring the test seam.
+
+    Every internal Spotify construction goes through here so a forgotten
+    ``sender=`` can never silently escape the fake in tests.
+    """
+    sender = make_sender(asynchronous)
+    if sender is not None:
+        return tekore.Spotify(token, sender=sender)
+    return tekore.Spotify(token, asynchronous=asynchronous)
+
 
 # ---------------------------------------------------------------------------
 # Required OAuth scopes (from PRD)
@@ -178,76 +211,6 @@ class KeyringTokenStore(TokenStore):
 
 
 # ---------------------------------------------------------------------------
-# Database / encrypted token store
-# ---------------------------------------------------------------------------
-
-
-class DBTokenStore(TokenStore):
-    """Store tokens as Fernet-encrypted JSON blobs.
-
-    This implementation keeps an in-memory dictionary as its backing store.
-    In production the *_storage* dict would be replaced by (or backed by) a
-    database table; the class is designed so that subclasses can override
-    ``_persist`` and ``_retrieve`` for custom backends.
-
-    Parameters
-    ----------
-    encryption_key
-        A URL-safe base64-encoded 32-byte Fernet key.  Generate one with
-        ``cryptography.fernet.Fernet.generate_key()``.
-    """
-
-    def __init__(self, encryption_key: str | bytes) -> None:
-        if isinstance(encryption_key, str):
-            encryption_key = encryption_key.encode()
-        try:
-            self._fernet = Fernet(encryption_key)
-        except (ValueError, Exception) as exc:
-            raise AuthenticationError("Invalid Fernet encryption key for DBTokenStore") from exc
-        self._storage: dict[str, bytes] = {}
-
-    # -- internal persistence hooks (override for real DB) ------------------
-
-    def _persist(self, user_id: str, encrypted: bytes) -> None:
-        """Write *encrypted* blob for *user_id* to the backing store."""
-        self._storage[user_id] = encrypted
-
-    def _retrieve(self, user_id: str) -> bytes | None:
-        """Read the encrypted blob for *user_id*, or ``None`` if absent."""
-        return self._storage.get(user_id)
-
-    def _remove(self, user_id: str) -> bool:
-        """Remove the entry for *user_id*.  Return ``True`` if it existed."""
-        return self._storage.pop(user_id, None) is not None
-
-    # -- public interface ---------------------------------------------------
-
-    def save_token(self, user_id: str, token: tekore.Token) -> None:
-        payload = json.dumps(_token_to_dict(token)).encode()
-        encrypted = self._fernet.encrypt(payload)
-        self._persist(user_id, encrypted)
-        logger.debug("Saved encrypted token for user %s", user_id)
-
-    def load_token(self, user_id: str) -> tekore.Token:
-        encrypted = self._retrieve(user_id)
-        if encrypted is None:
-            raise TokenNotFoundError(f"No token found in DB store for user '{user_id}'")
-        try:
-            decrypted = self._fernet.decrypt(encrypted)
-        except FernetInvalidToken as exc:
-            raise AuthenticationError(
-                f"Failed to decrypt token for user '{user_id}'; the encryption key may have changed"
-            ) from exc
-        data: dict[str, Any] = json.loads(decrypted)
-        return _dict_to_token(data)
-
-    def delete_token(self, user_id: str) -> None:
-        if not self._remove(user_id):
-            raise TokenNotFoundError(f"No token found in DB store for user '{user_id}'")
-        logger.debug("Deleted encrypted token for user %s", user_id)
-
-
-# ---------------------------------------------------------------------------
 # Main auth wrapper
 # ---------------------------------------------------------------------------
 
@@ -298,11 +261,13 @@ class SpotifyAuth:
         self._asynchronous = asynchronous
         self._token_store = token_store
 
+        sender = make_sender(self._asynchronous)
         self._credentials = tekore.Credentials(
             client_id=self._client_id,
             client_secret=self._client_secret,
             redirect_uri=self._redirect_uri,
-            asynchronous=self._asynchronous,
+            sender=sender,
+            asynchronous=None if sender is not None else self._asynchronous,
         )
 
     # -- properties ---------------------------------------------------------
@@ -321,6 +286,63 @@ class SpotifyAuth:
     def token_store(self) -> TokenStore | None:
         """The configured token store, if any."""
         return self._token_store
+
+    # -- CLI login flow -----------------------------------------------------
+
+    def begin_login(self) -> tuple[str, str]:
+        """Start an interactive login: return ``(auth_url, state)``.
+
+        The caller sends the user to *auth_url* and must pass *state*
+        back to :meth:`complete_login` for CSRF verification.
+        """
+        state = generate_csrf_state()
+        return self.get_auth_url(state=state), state
+
+    def complete_login(self, redirect_url: str, expected_state: str) -> dict[str, Any]:
+        """Finish an interactive login from the pasted redirect URL.
+
+        Parses the authorization code and state from *redirect_url*,
+        verifies the state against *expected_state*, exchanges the code
+        for tokens (synchronously — this is the CLI path), persists the
+        token in the configured store, and returns the user's profile.
+
+        Returns a dict with ``user_id``, ``display_name``, ``email``,
+        and ``product``.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        query = parse_qs(urlparse(redirect_url).query)
+        returned_state = query.get("state", [None])[0]
+        if not verify_csrf_state(expected_state, returned_state):
+            raise AuthenticationError(
+                "OAuth state mismatch — the redirect URL does not belong to this login attempt."
+            )
+        code = query.get("code", [None])[0]
+        if not code:
+            error = query.get("error", ["missing authorization code"])[0]
+            raise AuthenticationError(f"Spotify authorization failed: {error}")
+
+        try:
+            token: tekore.Token = self._credentials.request_user_token(code)
+        except Exception as exc:
+            raise AuthenticationError(f"Failed to exchange authorization code: {exc}") from exc
+
+        client = make_client(token, asynchronous=False)
+        try:
+            user = client.current_user()
+        except Exception as exc:
+            raise AuthenticationError(f"Failed to fetch Spotify user profile: {exc}") from exc
+
+        if self._token_store is not None:
+            self._token_store.save_token(user.id, token)
+            logger.info("Stored token for user %s", user.id)
+
+        return {
+            "user_id": user.id,
+            "display_name": user.display_name,
+            "email": getattr(user, "email", None),
+            "product": getattr(user, "product", None),
+        }
 
     # -- authorisation flow -------------------------------------------------
 
@@ -342,154 +364,7 @@ class SpotifyAuth:
             scope=self._scopes,
             state=state,
         )
-        logger.debug("Generated auth URL: %s", url)
         return url
-
-    async def handle_callback(self, code: str) -> tekore.Spotify:
-        """Exchange an authorisation *code* for tokens and return a Spotify client.
-
-        The token is automatically persisted in the configured
-        :class:`TokenStore` (if one was provided), keyed by the Spotify user
-        ID obtained from the ``/me`` endpoint.
-
-        Parameters
-        ----------
-        code
-            The authorisation code from the callback query parameters.
-
-        Returns
-        -------
-        tekore.Spotify
-            A ready-to-use Spotify API client.
-
-        Raises
-        ------
-        AuthenticationError
-            If the token exchange or user-info request fails.
-        """
-        try:
-            if self._asynchronous:
-                token: tekore.Token = await self._credentials.request_user_token(code)
-            else:
-                token = self._credentials.request_user_token(code)
-        except Exception as exc:
-            raise AuthenticationError(
-                f"Failed to exchange authorisation code for token: {exc}"
-            ) from exc
-
-        client = tekore.Spotify(token, asynchronous=self._asynchronous)
-
-        # Persist token keyed by user ID
-        if self._token_store is not None:
-            try:
-                if self._asynchronous:
-                    user = await client.current_user()
-                else:
-                    user = client.current_user()
-                self._token_store.save_token(user.id, token)
-                logger.info("Stored token for user %s", user.id)
-            except Exception:
-                logger.warning(
-                    "Token obtained but failed to persist it; "
-                    "the client is still usable for this session",
-                    exc_info=True,
-                )
-
-        return client
-
-    async def refresh_client(self, refresh_token: str) -> tekore.Spotify:
-        """Create a new Spotify client from a *refresh_token*.
-
-        Parameters
-        ----------
-        refresh_token
-            A previously obtained refresh token.
-
-        Returns
-        -------
-        tekore.Spotify
-            A Spotify client with a freshly refreshed access token.
-
-        Raises
-        ------
-        AuthenticationError
-            If the refresh request fails.
-        """
-        try:
-            if self._asynchronous:
-                token: tekore.Token = await self._credentials.refresh_user_token(refresh_token)
-            else:
-                token = self._credentials.refresh_user_token(refresh_token)
-        except Exception as exc:
-            raise TokenExpiredError(f"Failed to refresh token: {exc}") from exc
-
-        return tekore.Spotify(token, asynchronous=self._asynchronous)
-
-    async def get_client(self, user_id: str | None = None) -> tekore.Spotify:
-        """High-level helper: obtain a Spotify client for *user_id*.
-
-        Resolution order:
-
-        1. Load the stored token for *user_id* from the token store.
-        2. If the token is expiring, refresh it and persist the new one.
-        3. Return a ``tekore.Spotify`` client.
-
-        If no *user_id* is supplied and the store contains exactly one user,
-        that user's token is used automatically.
-
-        Parameters
-        ----------
-        user_id
-            Spotify user ID.  ``None`` for single-user convenience.
-
-        Returns
-        -------
-        tekore.Spotify
-            A ready-to-use Spotify client.
-
-        Raises
-        ------
-        TokenNotFoundError
-            If no token store is configured, or no token exists for the user.
-        TokenExpiredError
-            If the stored token cannot be refreshed.
-        AuthenticationError
-            For any other authentication failure.
-        """
-        if self._token_store is None:
-            raise TokenNotFoundError(
-                "No token store configured; cannot look up tokens.  "
-                "Provide a TokenStore when constructing SpotifyAuth."
-            )
-
-        if user_id is None:
-            raise TokenNotFoundError(
-                "user_id is required when calling get_client (multi-account support)."
-            )
-
-        token = self._token_store.load_token(user_id)
-
-        # Refresh the token if it is expiring (or already expired)
-        if token.is_expiring:
-            refresh_tok = token.refresh_token
-            if not refresh_tok:
-                raise TokenExpiredError(
-                    f"Token for user '{user_id}' is expiring and has no refresh token."
-                )
-            try:
-                if self._asynchronous:
-                    token = await self._credentials.refresh_user_token(refresh_tok)
-                else:
-                    token = self._credentials.refresh_user_token(refresh_tok)
-            except Exception as exc:
-                raise TokenExpiredError(
-                    f"Failed to refresh token for user '{user_id}': {exc}"
-                ) from exc
-
-            self._token_store.save_token(user_id, token)
-            logger.info("Refreshed and stored token for user %s", user_id)
-
-        return tekore.Spotify(token, asynchronous=self._asynchronous)
 
 
 # ---------------------------------------------------------------------------
@@ -508,21 +383,15 @@ def build_auth_url(state: str | None = None) -> str:
     return auth.get_auth_url(state=state)
 
 
-async def exchange_code(
-    code: str,
-    state: str | None = None,
-    expected_state: str | None = None,
-) -> dict[str, Any]:
+async def exchange_code(code: str) -> dict[str, Any]:
     """Exchange an authorization code for token info.
 
-    If expected_state is provided, validates the state parameter to prevent CSRF.
+    CSRF state validation is the caller's responsibility (the web callback
+    checks the state cookie before calling this).
 
     Returns a dict with ``access_token``, ``refresh_token``, and
     ``expires_at`` keys, compatible with what the web layer expects.
     """
-    if expected_state is not None and not verify_csrf_state(expected_state, state):
-        raise AuthenticationError("CSRF state mismatch — possible cross-site request forgery.")
-
     auth = SpotifyAuth(asynchronous=True)
     try:
         token: tekore.Token = await auth.credentials.request_user_token(code)
@@ -539,7 +408,7 @@ async def get_spotify_user(access_token: str) -> dict[str, Any]:
     calls ``/me``, and returns a dict with ``id``, ``display_name``,
     ``email``, and ``product`` fields.
     """
-    client = tekore.Spotify(access_token, asynchronous=True)
+    client = make_client(access_token, asynchronous=True)
     try:
         user = await client.current_user()
     except Exception as exc:

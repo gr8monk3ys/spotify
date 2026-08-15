@@ -18,7 +18,7 @@ import tekore as tk
 from sqlmodel import select
 
 from spotifyforge.db.engine import get_async_session
-from spotifyforge.models.models import Playlist, PlaylistTrack, Track
+from spotifyforge.models.models import Playlist, PlaylistTrack, Track, utc_now
 
 if TYPE_CHECKING:
     from tekore import Spotify
@@ -51,7 +51,8 @@ class PlaylistManager:
         """Fetch the current user's playlists from Spotify.
 
         Returns a list of dicts with keys: ``id``, ``name``,
-        ``track_count``, ``public``, ``followers``.
+        ``track_count``, ``public``. (Spotify's list endpoint does not
+        include follower counts; use :meth:`get_playlist_details`.)
         """
         try:
             user = await self._sp.current_user()
@@ -71,7 +72,6 @@ class PlaylistManager:
                             "name": pl.name,
                             "track_count": pl.tracks.total if pl.tracks else 0,
                             "public": pl.public,
-                            "followers": pl.followers.total if pl.followers else 0,
                         }
                     )
 
@@ -132,11 +132,13 @@ class PlaylistManager:
     # Sync
     # ------------------------------------------------------------------
 
-    async def sync_playlist(self, playlist_id: str) -> Playlist:
+    async def sync_playlist(self, playlist_id: str, owner_id: int) -> Playlist:
         """Fetch a playlist from Spotify and upsert it into the local DB.
 
         All tracks are resolved and stored; the local ``PlaylistTrack``
         association rows are rebuilt so they mirror Spotify's ordering.
+        The row is scoped to *owner_id*, so two local users tracking the
+        same Spotify playlist each get their own row.
 
         Returns the local :class:`Playlist` row after sync.
         """
@@ -152,7 +154,10 @@ class PlaylistManager:
         async with get_async_session() as session:
             # Upsert the playlist row.
             result = await session.execute(
-                select(Playlist).where(Playlist.spotify_id == playlist_id)
+                select(Playlist).where(
+                    Playlist.spotify_id == playlist_id,
+                    Playlist.owner_id == owner_id,
+                )
             )
             db_playlist: Playlist | None = result.scalars().first()
 
@@ -165,9 +170,8 @@ class PlaylistManager:
                     collaborative=sp_playlist.collaborative,
                     snapshot_id=sp_playlist.snapshot_id,
                     track_count=sp_playlist.tracks.total,
-                    last_synced_at=datetime.utcnow(),
-                    # owner_id will be set by the caller if needed
-                    owner_id=0,
+                    last_synced_at=utc_now(),
+                    owner_id=owner_id,
                 )
                 session.add(db_playlist)
             else:
@@ -177,8 +181,8 @@ class PlaylistManager:
                 db_playlist.collaborative = sp_playlist.collaborative
                 db_playlist.snapshot_id = sp_playlist.snapshot_id
                 db_playlist.track_count = sp_playlist.tracks.total
-                db_playlist.last_synced_at = datetime.utcnow()
-                db_playlist.updated_at = datetime.utcnow()
+                db_playlist.last_synced_at = utc_now()
+                db_playlist.updated_at = utc_now()
                 session.add(db_playlist)
 
             await session.flush()
@@ -229,13 +233,13 @@ class PlaylistManager:
                     db_track.album_name = track_obj.album.name if track_obj.album else None
                     db_track.duration_ms = track_obj.duration_ms
                     db_track.popularity = track_obj.popularity
-                    db_track.cached_at = datetime.utcnow()
+                    db_track.cached_at = utc_now()
                     session.add(db_track)
                     await session.flush()
 
                 assoc = PlaylistTrack(
                     playlist_id=playlist_pk,
-                    track_id=db_track.id,  # type: ignore[arg-type]
+                    track_id=db_track.id,
                     position=position,
                     added_at=_parse_added_at(item),
                     added_by=_extract_added_by(item),
@@ -260,13 +264,18 @@ class PlaylistManager:
     async def create_playlist(
         self,
         name: str,
+        owner_id: int,
         description: str = "",
         public: bool = True,
+        collaborative: bool = False,
     ) -> Playlist:
         """Create a new playlist on Spotify and persist it locally.
 
         The current user's Spotify ID is resolved automatically from the
-        authenticated client.
+        authenticated client. Spotify's create endpoint has no
+        ``collaborative`` flag, so collaborative playlists are created
+        private and then flipped via ``playlist_change_details`` (Spotify
+        requires collaborative playlists to be non-public).
 
         Returns the newly created local :class:`Playlist` row.
         """
@@ -275,9 +284,11 @@ class PlaylistManager:
             sp_playlist = await self._sp.playlist_create(
                 user.id,
                 name,
-                public=public,
+                public=False if collaborative else public,
                 description=description,
             )
+            if collaborative:
+                await self._sp.playlist_change_details(sp_playlist.id, collaborative=True)
         except tk.HTTPError as exc:
             logger.error("Failed to create playlist on Spotify: %s", exc)
             raise
@@ -287,12 +298,12 @@ class PlaylistManager:
                 spotify_id=sp_playlist.id,
                 name=sp_playlist.name,
                 description=description,
-                public=public,
-                collaborative=False,
+                public=False if collaborative else public,
+                collaborative=collaborative,
                 snapshot_id=sp_playlist.snapshot_id,
                 track_count=0,
-                last_synced_at=datetime.utcnow(),
-                owner_id=0,  # Caller should update with the real FK
+                last_synced_at=utc_now(),
+                owner_id=owner_id,
             )
             session.add(db_playlist)
             await session.commit()
@@ -300,6 +311,28 @@ class PlaylistManager:
 
         logger.info("Created playlist '%s' (%s)", name, sp_playlist.id)
         return db_playlist
+
+    async def create_playlist_with_tracks(
+        self,
+        name: str,
+        owner_id: int,
+        tracks: Sequence[Any],
+        description: str = "",
+        public: bool = True,
+    ) -> Playlist:
+        """Create a playlist and fill it with *tracks* (tekore track objects).
+
+        The composed flow behind genre playlists, time capsules, and any
+        other "build a list from discovered tracks" feature — one place
+        for the create-then-add sequence and the local-track filtering.
+        """
+        playlist = await self.create_playlist(
+            name=name, owner_id=owner_id, description=description, public=public
+        )
+        uris = [t.uri for t in tracks if t.uri]
+        if uris:
+            await self.add_tracks(playlist.spotify_id, uris)
+        return playlist
 
     # ------------------------------------------------------------------
     # Add / Remove / Reorder tracks
@@ -420,38 +453,82 @@ class PlaylistManager:
     # ------------------------------------------------------------------
 
     async def deduplicate(self, playlist_id: str) -> int:
-        """Remove duplicate tracks from a playlist.
+        """Remove duplicate tracks from a playlist, keeping one copy of each.
 
-        A track is considered a duplicate if its URI appears more than once.
-        Only the *first* occurrence of each track is kept.
+        Spotify's remove-by-URI endpoint deletes *every* occurrence of a
+        URI, so naive removal would destroy the kept copy too. Instead:
+
+        1. Remove all occurrences of each duplicated URI (guarded by the
+           playlist's ``snapshot_id`` so a concurrently modified playlist
+           aborts rather than removing the wrong rows).
+        2. Re-insert one copy of each at its position in the final,
+           deduplicated ordering (ascending, so earlier inserts never
+           shift later targets).
 
         Returns the number of duplicate occurrences removed.
         """
+        try:
+            # fields= makes tekore return a raw dict with just the snapshot.
+            snapshot = await self._sp.playlist(playlist_id, fields="snapshot_id")
+        except tk.HTTPError as exc:
+            logger.error("Failed to fetch playlist %s: %s", playlist_id, exc)
+            raise
+        snapshot_id = snapshot["snapshot_id"] if isinstance(snapshot, dict) else None
+
         all_items = await self.get_playlist_tracks(playlist_id)
 
+        original_uris = [
+            item.track.uri
+            for item in all_items
+            if item.track is not None and item.track.uri is not None
+        ]
+
         seen: set[str] = set()
-        duplicate_uris: list[str] = []
+        final_sequence: list[str] = []  # original order with 2nd+ occurrences dropped
+        duplicated: set[str] = set()
 
-        for item in all_items:
-            track = item.track
-            if track is None or track.uri is None:
-                continue
-            if track.uri in seen:
-                duplicate_uris.append(track.uri)
+        for uri in original_uris:
+            if uri in seen:
+                duplicated.add(uri)
             else:
-                seen.add(track.uri)
+                seen.add(uri)
+                final_sequence.append(uri)
+        removed_count = len(original_uris) - len(final_sequence)
 
-        if not duplicate_uris:
+        if not duplicated:
             logger.info("No duplicates found in playlist %s", playlist_id)
             return 0
 
-        await self.remove_tracks(playlist_id, duplicate_uris)
+        # Step 1: remove every copy of each duplicated URI.
+        dup_list = sorted(duplicated)
+        for offset in range(0, len(dup_list), _CHUNK_SIZE):
+            chunk = dup_list[offset : offset + _CHUNK_SIZE]
+            await self._sp.playlist_remove(playlist_id, chunk, snapshot_id)
+
+        # Step 2: re-insert one copy of each at its final position, in
+        # ascending order so every earlier element of the final sequence is
+        # already in place. Consecutive positions are batched into a single
+        # request (duplicates cluster in practice).
+        runs: list[tuple[int, list[str]]] = []
+        for position, uri in enumerate(final_sequence):
+            if uri in duplicated:
+                if runs and runs[-1][0] + len(runs[-1][1]) == position:
+                    runs[-1][1].append(uri)
+                else:
+                    runs.append((position, [uri]))
+        for start, uris in runs:
+            for offset in range(0, len(uris), _CHUNK_SIZE):
+                await self._sp.playlist_add(
+                    playlist_id, uris[offset : offset + _CHUNK_SIZE], position=start + offset
+                )
+
         logger.info(
-            "Removed %d duplicate track(s) from playlist %s",
-            len(duplicate_uris),
+            "Removed %d duplicate occurrence(s) of %d track(s) from playlist %s",
+            removed_count,
+            len(duplicated),
             playlist_id,
         )
-        return len(duplicate_uris)
+        return removed_count
 
     # ------------------------------------------------------------------
     # Pagination helper
@@ -483,37 +560,6 @@ class PlaylistManager:
             items.extend(page.items if page.items else [])
 
         return items
-
-    # ------------------------------------------------------------------
-    # Snapshot check
-    # ------------------------------------------------------------------
-
-    async def snapshot_check(self, playlist_id: str, known_snapshot_id: str) -> bool:
-        """Check whether a playlist has changed since a known snapshot.
-
-        Returns *True* if the remote snapshot ID differs from
-        *known_snapshot_id*, indicating the playlist has been modified.
-        """
-        try:
-            sp_playlist = await self._sp.playlist(playlist_id, fields="snapshot_id")
-        except tk.HTTPError as exc:
-            logger.error("Failed to check snapshot for %s: %s", playlist_id, exc)
-            raise
-
-        current_snapshot = sp_playlist.snapshot_id
-        changed = current_snapshot != known_snapshot_id
-
-        if changed:
-            logger.info(
-                "Playlist %s has changed (snapshot %s -> %s)",
-                playlist_id,
-                known_snapshot_id,
-                current_snapshot,
-            )
-        else:
-            logger.debug("Playlist %s is unchanged (snapshot %s)", playlist_id, known_snapshot_id)
-
-        return changed
 
 
 # ---------------------------------------------------------------------------

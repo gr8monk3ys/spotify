@@ -23,6 +23,7 @@ from spotifyforge.models.models import (
     PlaylistTrackLink,
     Track,
     User,
+    as_utc,
 )
 
 # ============================================================================
@@ -419,21 +420,36 @@ class TestPlaylistRepositoryGetBySpotifyId:
 
 
 class TestPlaylistRepositoryGetByUser:
-    """PlaylistRepository.get_by_user.
+    """PlaylistRepository.get_by_user filters on Playlist.owner_id."""
 
-    Note: The repository references ``Playlist.user_id`` which does not exist
-    as a declared column on the model (the actual column is ``owner_id``).
-    SQLAlchemy will raise an ``ArgumentError`` when trying to build the
-    WHERE clause. We verify that the method raises instead of silently
-    returning wrong results.
-    """
-
-    def test_get_by_user_raises_for_missing_attribute(
+    def test_returns_playlists_owned_by_user(
         self, session: Session, sample_user: User, sample_playlist: Playlist
     ):
         repo = PlaylistRepository(session)
-        with pytest.raises(Exception):
-            repo.get_by_user(str(sample_user.id))
+        results = repo.get_by_user(sample_user.id)
+        assert [p.id for p in results] == [sample_playlist.id]
+
+    def test_excludes_other_users_playlists(
+        self, session: Session, sample_user: User, sample_playlist: Playlist
+    ):
+        other = User(spotify_id="user_2", display_name="Other User")
+        session.add(other)
+        session.commit()
+        session.refresh(other)
+
+        repo = PlaylistRepository(session)
+        other_pl = repo.create(
+            {"spotify_id": "sp_playlist_other", "owner_id": other.id, "name": "Other's"}
+        )
+
+        mine = repo.get_by_user(sample_user.id)
+        theirs = repo.get_by_user(other.id)
+        assert [p.id for p in mine] == [sample_playlist.id]
+        assert [p.id for p in theirs] == [other_pl.id]
+
+    def test_returns_empty_for_unknown_user(self, session: Session):
+        repo = PlaylistRepository(session)
+        assert repo.get_by_user(999999) == []
 
 
 class TestPlaylistRepositorySyncTracks:
@@ -499,6 +515,26 @@ class TestPlaylistRepositorySyncTracks:
         ).all()
         assert len(links) == 1
         assert links[0].track_id == sample_tracks[2].id
+
+    def test_sync_tracks_allows_duplicate_track_ids(
+        self,
+        session: Session,
+        sample_playlist: Playlist,
+        sample_tracks: list[Track],
+    ):
+        """The same track can legally appear at several positions."""
+        repo = PlaylistRepository(session)
+        dup_ids = [sample_tracks[0].id, sample_tracks[1].id, sample_tracks[0].id]
+        repo.sync_tracks(sample_playlist.id, dup_ids, "snap_dup")
+
+        from sqlmodel import select
+
+        links = session.exec(
+            select(PlaylistTrackLink).where(PlaylistTrackLink.playlist_id == sample_playlist.id)
+        ).all()
+        assert len(links) == 3
+        ordered = sorted(links, key=lambda l: l.position)
+        assert [link.track_id for link in ordered] == dup_ids
 
     def test_sync_tracks_empty_list_clears_all(
         self,
@@ -719,26 +755,27 @@ class TestScheduledJobRepositoryCreate:
             {
                 "user_id": sample_user.id,
                 "name": "Daily sync",
-                "job_type": JobType.playlist_sync,
+                "job_type": JobType.sync,
                 "cron_expression": "0 0 * * *",
             }
         )
         assert job.id is not None
         assert job.name == "Daily sync"
-        assert job.job_type == JobType.playlist_sync
+        assert job.job_type == JobType.sync
         assert job.enabled is True
 
     def test_create_with_all_fields(
         self, session: Session, sample_user: User, sample_playlist: Playlist
     ):
         repo = ScheduledJobRepository(session)
-        # Use naive datetimes because SQLite drops timezone info on round-trip
-        now = datetime.utcnow()
+        # Timestamps are written timezone-aware; SQLite stores them naive,
+        # so as_utc() re-attaches UTC when comparing round-tripped values.
+        now = datetime.now(UTC).replace(microsecond=0)
         job = repo.create(
             {
                 "user_id": sample_user.id,
                 "name": "Full job",
-                "job_type": JobType.playlist_update,
+                "job_type": JobType.archive,
                 "playlist_id": sample_playlist.id,
                 "config": {"max_tracks": 50},
                 "cron_expression": "0 6 * * *",
@@ -750,7 +787,7 @@ class TestScheduledJobRepositoryCreate:
         assert job.playlist_id == sample_playlist.id
         assert job.config == {"max_tracks": 50}
         assert job.enabled is False
-        assert job.last_run_at == now
+        assert as_utc(job.last_run_at) == now
 
     def test_create_disabled_job(self, session: Session, sample_user: User):
         repo = ScheduledJobRepository(session)
@@ -758,7 +795,7 @@ class TestScheduledJobRepositoryCreate:
             {
                 "user_id": sample_user.id,
                 "name": "Disabled job",
-                "job_type": JobType.health_check,
+                "job_type": JobType.deduplicate,
                 "cron_expression": "*/5 * * * *",
                 "enabled": False,
             }
@@ -775,7 +812,7 @@ class TestScheduledJobRepositoryGetEnabledJobs:
             {
                 "user_id": sample_user.id,
                 "name": "Enabled 1",
-                "job_type": JobType.playlist_sync,
+                "job_type": JobType.sync,
                 "cron_expression": "0 0 * * *",
                 "enabled": True,
             }
@@ -784,7 +821,7 @@ class TestScheduledJobRepositoryGetEnabledJobs:
             {
                 "user_id": sample_user.id,
                 "name": "Disabled 1",
-                "job_type": JobType.health_check,
+                "job_type": JobType.deduplicate,
                 "cron_expression": "*/5 * * * *",
                 "enabled": False,
             }
@@ -793,7 +830,7 @@ class TestScheduledJobRepositoryGetEnabledJobs:
             {
                 "user_id": sample_user.id,
                 "name": "Enabled 2",
-                "job_type": JobType.stats_snapshot,
+                "job_type": JobType.time_capsule,
                 "cron_expression": "0 12 * * *",
                 "enabled": True,
             }
@@ -810,7 +847,7 @@ class TestScheduledJobRepositoryGetEnabledJobs:
             {
                 "user_id": sample_user.id,
                 "name": "Off",
-                "job_type": JobType.health_check,
+                "job_type": JobType.deduplicate,
                 "cron_expression": "0 0 * * *",
                 "enabled": False,
             }
@@ -831,7 +868,7 @@ class TestScheduledJobRepositoryGetByUser:
             {
                 "user_id": sample_user.id,
                 "name": "User job 1",
-                "job_type": JobType.playlist_sync,
+                "job_type": JobType.sync,
                 "cron_expression": "0 0 * * *",
             }
         )
@@ -839,19 +876,17 @@ class TestScheduledJobRepositoryGetByUser:
             {
                 "user_id": sample_user.id,
                 "name": "User job 2",
-                "job_type": JobType.health_check,
+                "job_type": JobType.deduplicate,
                 "cron_expression": "*/5 * * * *",
             }
         )
 
-        # The method expects a string user_id, but compares against ScheduledJob.user_id (int).
-        # With SQLite, integer user_id == str "1" can work via type coercion.
-        jobs = repo.get_by_user(str(sample_user.id))
+        jobs = repo.get_by_user(sample_user.id)
         assert len(jobs) == 2
 
     def test_returns_empty_for_unknown_user(self, session: Session):
         repo = ScheduledJobRepository(session)
-        assert repo.get_by_user("999999") == []
+        assert repo.get_by_user(999999) == []
 
 
 class TestScheduledJobRepositoryUpdateLastRun:
@@ -863,17 +898,16 @@ class TestScheduledJobRepositoryUpdateLastRun:
             {
                 "user_id": sample_user.id,
                 "name": "Run tracker",
-                "job_type": JobType.playlist_sync,
+                "job_type": JobType.sync,
                 "cron_expression": "0 0 * * *",
             }
         )
         assert job.last_run_at is None
 
-        # Use naive datetime because SQLite drops timezone info
-        run_time = datetime(2025, 6, 15, 12, 0, 0)
+        run_time = datetime(2025, 6, 15, 12, 0, 0, tzinfo=UTC)
         updated = repo.update_last_run(job.id, run_time)
         assert updated is not None
-        assert updated.last_run_at == run_time
+        assert as_utc(updated.last_run_at) == run_time
 
     def test_update_last_run_nonexistent_returns_none(self, session: Session):
         repo = ScheduledJobRepository(session)
@@ -885,17 +919,16 @@ class TestScheduledJobRepositoryUpdateLastRun:
             {
                 "user_id": sample_user.id,
                 "name": "Multi run",
-                "job_type": JobType.stats_snapshot,
+                "job_type": JobType.time_capsule,
                 "cron_expression": "0 0 * * *",
             }
         )
-        # Use naive datetimes because SQLite drops timezone info
-        first_run = datetime(2025, 1, 1)
+        first_run = datetime(2025, 1, 1, tzinfo=UTC)
         repo.update_last_run(job.id, first_run)
 
-        second_run = datetime(2025, 2, 1)
+        second_run = datetime(2025, 2, 1, tzinfo=UTC)
         updated = repo.update_last_run(job.id, second_run)
-        assert updated.last_run_at == second_run
+        assert as_utc(updated.last_run_at) == second_run
 
 
 # ============================================================================

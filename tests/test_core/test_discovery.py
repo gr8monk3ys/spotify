@@ -1,7 +1,9 @@
-"""Comprehensive tests for DiscoveryEngine.
+"""Comprehensive tests for DiscoveryEngine and its module-level serializers.
 
-All Tekore Spotify client interactions are mocked so these tests run
-entirely in-process with no network I/O.
+Request/response behavior (pagination, batching, search) runs against the
+in-memory FakeSpotify backend so the real tekore client stack is exercised;
+AsyncMock covers narrow unit tests (limit clamping, query building, error
+propagation).
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import tekore as tk
 
-from spotifyforge.core.discovery import DiscoveryEngine
+from spotifyforge.core.discovery import DiscoveryEngine, artist_to_dict, track_to_dict
 
 # ---------------------------------------------------------------------------
 # Helpers -- lightweight stand-ins for Tekore response objects
@@ -794,68 +796,164 @@ class TestBuildTimeCapsule:
 
 
 # ===================================================================
-# build_mood_playlist
+# Serializers (module-level, shared by web routes and CLI)
 # ===================================================================
 
 
-class TestBuildMoodPlaylist:
-    """Tests for DiscoveryEngine.build_mood_playlist."""
+class TestSerializers:
+    """track_to_dict / artist_to_dict convert Tekore models to plain dicts."""
 
-    async def test_mood_playlist_success(self, engine, mock_spotify):
-        tracks = [_make_track("t1"), _make_track("t2")]
-        mock_spotify.recommendations.return_value = SimpleNamespace(tracks=tracks)
-
-        result = await engine.build_mood_playlist(
-            valence_range=(0.6, 0.9),
-            energy_range=(0.5, 0.8),
-            limit=20,
+    def test_track_to_dict_full(self):
+        track = SimpleNamespace(
+            id="t1",
+            name="Song",
+            artists=[SimpleNamespace(name="A"), SimpleNamespace(name="B")],
+            album=SimpleNamespace(id="alb1", name="Album"),
+            duration_ms=210_000,
+            popularity=63,
         )
+        result = track_to_dict(track)
+        assert result["spotify_id"] == "t1"
+        assert result["name"] == "Song"
+        assert result["artist_names"] == ["A", "B"]
+        assert result["album_name"] == "Album"
+        assert result["album_id"] == "alb1"
+        assert result["duration_ms"] == 210_000
+        assert result["popularity"] == 63
+        assert result["isrc"] is None
+        assert isinstance(result["cached_at"], str)
+
+    def test_track_to_dict_handles_missing_fields(self):
+        track = SimpleNamespace(
+            id=None, name=None, artists=None, album=None, duration_ms=None, popularity=None
+        )
+        result = track_to_dict(track)
+        assert result["spotify_id"] == ""
+        assert result["name"] == ""
+        assert result["artist_names"] == []
+        assert result["album_name"] is None
+        assert result["album_id"] is None
+        assert result["duration_ms"] == 0
+
+    def test_artist_to_dict_full(self):
+        artist = SimpleNamespace(
+            id="a1",
+            name="Artist",
+            genres=["jazz", "bop"],
+            popularity=71,
+            followers=SimpleNamespace(total=1234),
+        )
+        result = artist_to_dict(artist)
+        assert result == {
+            "id": "a1",
+            "name": "Artist",
+            "genres": ["jazz", "bop"],
+            "popularity": 71,
+            "followers": 1234,
+        }
+
+    def test_artist_to_dict_handles_missing_fields(self):
+        artist = SimpleNamespace(id=None, name=None, genres=None, popularity=None, followers=None)
+        result = artist_to_dict(artist)
+        assert result["id"] == ""
+        assert result["name"] == ""
+        assert result["genres"] == []
+        assert result["followers"] == 0
+
+
+# ===================================================================
+# FakeSpotify-backed tests: real request/response behavior
+# ===================================================================
+
+
+@pytest.fixture()
+async def fake_client(fake_spotify):
+    """A real async tekore client wired to the fake backend."""
+    fake_spotify.add_user("user1")
+    client = fake_spotify.async_client("user1")
+    yield fake_spotify, client
+    await client.close()
+
+
+class TestAgainstFakeBackend:
+    async def test_top_tracks_round_trip(self, fake_client):
+        fake, client = fake_client
+        for i in range(5):
+            fake.add_track(f"top{i}", name=f"Top {i}")
+        fake.top_tracks["user1"] = [f"top{i}" for i in range(5)]
+
+        result = await DiscoveryEngine(client).get_user_top_tracks(limit=5)
+
+        assert [t.id for t in result] == [f"top{i}" for i in range(5)]
+
+    async def test_top_artists_round_trip(self, fake_client):
+        fake, client = fake_client
+        from tests.fake_spotify import _full_artist
+
+        fake.top_artists["user1"] = [_full_artist("a1", "Artist One", genres=["jazz"])]
+
+        result = await DiscoveryEngine(client).get_user_top_artists(limit=10)
+
+        assert len(result) == 1
+        assert result[0].id == "a1"
+        assert result[0].genres == ["jazz"]
+
+    async def test_search_tracks_matches_by_name(self, fake_client):
+        fake, client = fake_client
+        fake.add_track("d1", name="Dream On")
+        fake.add_track("d2", name="Daydream")
+        fake.add_track("x1", name="Something Else")
+
+        result = await DiscoveryEngine(client).search_tracks("dream")
+
+        assert {t.id for t in result} == {"d1", "d2"}
+
+    async def test_build_genre_playlist_respects_limit(self, fake_client):
+        fake, client = fake_client
+        for i in range(4):
+            fake.add_track(f"g{i}", name=f"Jazz Track {i}")
+
+        result = await DiscoveryEngine(client).build_genre_playlist("jazz", limit=2)
 
         assert len(result) == 2
-        mock_spotify.recommendations.assert_awaited_once_with(
-            genre_seeds=["pop"],
-            limit=20,
-            target_valence=0.75,  # (0.6+0.9)/2
-            target_energy=0.65,  # (0.5+0.8)/2
-            min_valence=0.6,
-            max_valence=0.9,
-            min_energy=0.5,
-            max_energy=0.8,
-        )
+        assert all(t.uri is not None for t in result)
 
-    async def test_mood_playlist_api_error_returns_empty(self, engine, mock_spotify):
-        """An HTTPError from the recommendations endpoint should return []."""
-        mock_spotify.recommendations.side_effect = tk.HTTPError(
-            "deprecated", request=MagicMock(), response=MagicMock()
-        )
+    async def test_deep_cuts_paginates_and_batches(self, fake_client):
+        """55 tracks in one album: 2 album-track pages, 2 /tracks batches,
+        filtered below the threshold and sorted ascending."""
+        fake, client = fake_client
+        ids = []
+        for i in range(55):
+            tid = f"dc{i:02d}"
+            # popularity 0..54; threshold 30 keeps 30 tracks
+            fake.add_track(tid, popularity=i, artist_id="art1", album_id="alb1")
+            ids.append(tid)
+        fake.artist_albums["art1"] = ["alb1"]
+        fake.album_tracks["alb1"] = ids
 
-        result = await engine.build_mood_playlist(
-            valence_range=(0.0, 1.0),
-            energy_range=(0.0, 1.0),
-        )
+        result = await DiscoveryEngine(client).find_deep_cuts("art1", popularity_threshold=30)
 
-        assert result == []
+        assert len(result) == 30
+        assert [t.popularity for t in result] == sorted(t.popularity for t in result)
+        assert all(t.popularity < 30 for t in result)
+        # Pagination/batching actually happened on the wire.
+        album_gets = [r for r in fake.requests if r == ("GET", "/v1/albums/alb1/tracks")]
+        assert len(album_gets) == 2
+        batch_gets = [r for r in fake.requests if r == ("GET", "/v1/tracks")]
+        assert len(batch_gets) == 2
 
-    async def test_mood_playlist_limit_clamped(self, engine, mock_spotify):
-        mock_spotify.recommendations.return_value = SimpleNamespace(tracks=[])
+    async def test_deep_cuts_dedupes_across_albums(self, fake_client):
+        fake, client = fake_client
+        fake.add_track("shared", popularity=5, artist_id="art1", album_id="alb1")
+        # Register the same track under a second album too.
+        fake.add_track("only2", popularity=7, artist_id="art1", album_id="alb2")
+        fake.artist_albums["art1"] = ["alb1", "alb2"]
+        fake.album_tracks["alb1"] = ["shared"]
+        fake.album_tracks["alb2"] = ["shared", "only2"]
 
-        await engine.build_mood_playlist(
-            valence_range=(0.5, 0.5),
-            energy_range=(0.5, 0.5),
-            limit=200,
-        )
+        result = await DiscoveryEngine(client).find_deep_cuts("art1", popularity_threshold=30)
 
-        assert mock_spotify.recommendations.call_args.kwargs["limit"] == 100
-
-    async def test_mood_playlist_none_tracks(self, engine, mock_spotify):
-        mock_spotify.recommendations.return_value = SimpleNamespace(tracks=None)
-
-        result = await engine.build_mood_playlist(
-            valence_range=(0.5, 0.5),
-            energy_range=(0.5, 0.5),
-        )
-
-        assert result == []
+        assert sorted(t.id for t in result) == ["only2", "shared"]
 
 
 # ===================================================================
