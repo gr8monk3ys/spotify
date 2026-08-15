@@ -576,3 +576,18 @@ async def test_reflow_handles_playlists_longer_than_one_request(
 
     await reflow(manager, sp, plan.specs, delay=0)
     assert fake_spotify.playlist_tracks[playlist.spotify_id] == [t.id for t in spec.tracks]
+
+
+def test_catalogue_is_deterministic_regardless_of_library_order():
+    # `forge` resumes by matching titles and `reflow` compares track
+    # order, so both break if the same library can produce two different
+    # catalogues.
+    tracks = [
+        _ct(f"t{i}", name=f"Song {i}", genres=("coldwave",), popularity=(i * 7) % 100)
+        for i in range(30)
+    ]
+    first = cluster_library(tracks, min_size=10)
+    second = cluster_library(list(reversed(tracks)), min_size=10)
+
+    assert [s.title for s in first] == [s.title for s in second]
+    assert [[t.id for t in s.tracks] for s in first] == [[t.id for t in s.tracks] for s in second]
