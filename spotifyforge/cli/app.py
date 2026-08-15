@@ -1002,7 +1002,9 @@ def curate_plan(
             f"Songs placed:          [bold]{plan.placed_count}[/bold] of {plan.unique_count} "
             f"({plan.unique_count - plan.placed_count} in genres too small to fill a playlist)\n"
             f"Playlist entries:      [bold]{plan.entry_count}[/bold] "
-            "(a song can belong to more than one genre)",
+            "(a song can belong to more than one genre)\n"
+            f"Sequenced by key+BPM:  [bold]{plan.harmonic_count}[/bold] of {len(plan.specs)} "
+            "(the rest had too little key data)",
             title="Curation Plan",
             border_style="cyan",
             expand=False,
