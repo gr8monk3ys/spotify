@@ -7,10 +7,13 @@ functions tested directly.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import tekore as tk
 from sqlmodel import Session, select
 
+from spotifyforge.core.audio_features import AudioFeature
 from spotifyforge.core.curation import (
     CurationEngine,
     CurationOptions,
@@ -591,3 +594,87 @@ def test_catalogue_is_deterministic_regardless_of_library_order():
 
     assert [s.title for s in first] == [s.title for s in second]
     assert [[t.id for t in s.tracks] for s in first] == [[t.id for t in s.tracks] for s in second]
+
+
+# ---------------------------------------------------------------------------
+# Harmonic sequencing (tempo/key aware)
+# ---------------------------------------------------------------------------
+
+
+def _keyed(track_id, *, key, mode, tempo, popularity=50, artist="a1"):
+    return _ct(track_id, popularity=popularity, artist=artist), AudioFeature(
+        tempo=tempo, key=key, mode=mode
+    )
+
+
+def test_flow_chains_by_key_when_features_are_available():
+    # 8A (A minor) -> 8B (C major, relative) -> 9A (E minor) are all
+    # compatible moves; 2B (F# major) is the far side of the wheel and
+    # must be visited last.
+    pairs = [
+        _keyed("amin", key=9, mode=0, tempo=120, popularity=99, artist="w"),
+        _keyed("cmaj", key=0, mode=1, tempo=121, popularity=50, artist="x"),
+        _keyed("emin", key=4, mode=0, tempo=122, popularity=40, artist="y"),
+        _keyed("far", key=6, mode=1, tempo=120, popularity=60, artist="z"),
+    ]
+    tracks = [replace(t, isrc=t.id) for t, _ in pairs]
+    features = {t.id: f for t, (_, f) in zip(tracks, pairs, strict=True)}
+
+    ordered = order_for_flow(tracks, features)
+
+    assert ordered[0].id == "amin"  # most popular opens
+    assert ordered[-1].id == "far"  # harmonically distant closes
+    assert sorted(t.id for t in ordered) == ["amin", "cmaj", "emin", "far"]
+
+
+def test_flow_prefers_close_tempo_when_keys_tie():
+    tracks, features = [], {}
+    for tid, tempo, pop in [("start", 100.0, 99), ("near", 102.0, 10), ("far", 160.0, 60)]:
+        t = replace(_ct(tid, popularity=pop, artist=tid), isrc=tid)
+        tracks.append(t)
+        features[tid] = AudioFeature(tempo=tempo, key=9, mode=0)  # identical keys
+
+    ordered = order_for_flow(tracks, features)
+    assert [t.id for t in ordered] == ["start", "near", "far"]
+
+
+def test_harmonic_ordering_still_refuses_back_to_back_artists():
+    # Two tracks by one artist share a key; a purely harmonic chain would
+    # put them together. Artist separation has to win.
+    tracks, features = [], {}
+    for tid, artist, pop in [("s1", "same", 99), ("s2", "same", 98), ("o1", "other", 10)]:
+        t = replace(_ct(tid, popularity=pop, artist=artist), isrc=tid)
+        tracks.append(t)
+        features[tid] = AudioFeature(tempo=120.0, key=9, mode=0)
+
+    ordered = order_for_flow(tracks, features)
+    assert [t.artist_ids[0] for t in ordered] == ["same", "other", "same"]
+
+
+def test_flow_falls_back_to_the_arc_when_too_little_is_analysed():
+    # Only one of six tracks has a key — below the coverage floor, so the
+    # popularity arc must be used instead of a mostly-guessed chain.
+    tracks = [
+        replace(_ct(f"t{i}", popularity=i * 10, artist=f"a{i}"), isrc=f"t{i}") for i in range(6)
+    ]
+    features = {"t0": AudioFeature(tempo=120.0, key=9, mode=0)}
+
+    ordered = order_for_flow(tracks, features)
+    assert ordered[0].popularity == max(t.popularity for t in tracks)
+
+
+def test_flow_ignores_features_that_match_no_track():
+    tracks = [replace(_ct(f"t{i}", popularity=i, artist=f"a{i}"), isrc=f"t{i}") for i in range(5)]
+    ordered = order_for_flow(tracks, {"unrelated": AudioFeature(tempo=99.0, key=1, mode=1)})
+    assert sorted(t.id for t in ordered) == sorted(t.id for t in tracks)
+
+
+async def test_isrc_is_carried_off_spotify_into_curation_tracks(fake_spotify, client_for):
+    fake_spotify.add_user("user1")
+    fake_spotify.add_track("t1")
+    fake_spotify.save_track("user1", "t1")
+
+    tracks = await CurationEngine(client_for("user1")).fetch_liked()
+    # The fake mints ISRCs the same shape Spotify does; without this the
+    # whole tempo/key lookup has nothing to key on.
+    assert tracks[0].isrc == "ISRCT1"

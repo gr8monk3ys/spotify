@@ -15,6 +15,7 @@ built-in scheduler for hands-off playlist maintenance.
 - **Playlist management** -- list, inspect, create, sync, export (JSON/CSV), and deduplicate playlists
 - **Music discovery** -- top tracks, deep cuts, genre-based playlists, and time-capsule generators
 - **Bulk curation** -- turn your liked songs into a catalogue of hundreds of niche, genre-clustered playlists, each sequenced for flow
+- **Harmonic sequencing** -- tempo and musical key sourced by ISRC from Deezer and AcousticBrainz, then Camelot-wheel mixing (Spotify's own audio-features endpoint is withdrawn for new apps)
 - **Automated scheduling** -- cron-driven jobs for syncing, archiving Discover Weekly, deduplication, and genre refresh
 - **REST API** -- full FastAPI server with OAuth login, CRUD endpoints, and Swagger docs at `/docs`
 - **Rich CLI** -- beautiful terminal output powered by Typer + Rich
@@ -115,6 +116,10 @@ spotifyforge curate forge --limit 25                # Create the next 25; re-run
 spotifyforge curate forge --exclusive               # Each song in one genre only
 spotifyforge curate forge --private
 spotifyforge curate reflow                          # Re-sequence existing ones in place
+spotifyforge curate features                        # Fetch BPM (Deezer) for your library
+spotifyforge curate features --deep                 # Also fetch musical key (AcousticBrainz)
+spotifyforge curate reflow --harmonic               # Re-sequence by key + BPM (Camelot wheel)
+spotifyforge curate curators                        # List curators who share your taste
 
 # Scheduling
 spotifyforge schedule list
@@ -297,6 +302,8 @@ spotifyforge/
     │   ├── playlist_manager.py  # Playlist CRUD, sync, dedup, export
     │   ├── discovery.py         # Top tracks, deep cuts, genre, time capsule
     │   ├── curation.py          # Liked songs -> genre clusters -> flow-ordered playlists
+    │   ├── audio_features.py    # Tempo/key by ISRC (Deezer, AcousticBrainz) + Camelot wheel
+    │   ├── curators.py          # Find curators whose playlists overlap your library
     │   └── scheduler.py         # APScheduler service + job dispatch
     ├── db/
     │   ├── engine.py            # SQLite engine, session helpers, init_db()

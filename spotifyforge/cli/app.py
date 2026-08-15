@@ -921,6 +921,31 @@ _EXCLUSIVE = typer.Option(
     "--exclusive",
     help="Put each track in only its rarest genre (fewer, sharper playlists).",
 )
+_HARMONIC = typer.Option(
+    False,
+    "--harmonic",
+    help="Sequence by musical key and BPM (needs 'curate features' first).",
+)
+
+
+def _features_or_warn(harmonic: bool):
+    """Load cached tempo/key data, explaining if there is none yet."""
+    if not harmonic:
+        return None
+    from spotifyforge.core.curation import load_features
+
+    features = load_features()
+    if not features:
+        _error_panel(
+            "No tempo/key data cached yet.\n"
+            "Run [bold]spotifyforge curate features --deep[/bold] first.",
+            title="Nothing to sequence by",
+        )
+    keyed = sum(1 for f in features.values() if f.has_key)
+    console.print(
+        f"[dim]Harmonic ordering: {len(features)} tracks analysed, {keyed} with a key.[/dim]"
+    )
+    return features
 
 
 def _curation_options(min_size, max_size, max_tracks, exclusive):
@@ -955,15 +980,17 @@ def curate_plan(
     max_size: int = _MAX_SIZE,
     max_tracks: int | None = _MAX_TRACKS,
     exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
 ) -> None:
     """Preview the playlist catalogue your liked songs would produce (no writes)."""
     from spotifyforge.core.curation import plan_catalogue
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
     plan = _run_spotify(
         "Scanning your liked songs...",
         "Failed to plan curation",
-        lambda sp: plan_catalogue(sp, opts),
+        lambda sp: plan_catalogue(sp, opts, features),
     )
 
     console.print(
@@ -998,6 +1025,7 @@ def curate_forge(
     max_size: int = _MAX_SIZE,
     max_tracks: int | None = _MAX_TRACKS,
     exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
     private: bool = typer.Option(
         False, "--private", help="Create the playlists as private instead of public."
     ),
@@ -1008,9 +1036,10 @@ def curate_forge(
 
     owner_id = _db_user_id()
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
 
     async def _forge(sp):
-        plan = await plan_catalogue(sp, opts)
+        plan = await plan_catalogue(sp, opts, features)
         created, pending = await forge_next(
             PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
         )
@@ -1046,21 +1075,144 @@ def curate_forge(
     console.print(_specs_table([spec for spec, _ in created]))
 
 
+@curate_app.command("curators")
+def curate_curators(
+    limit: int = typer.Option(25, "--limit", "-l", min=1, help="How many curators to list."),
+    genres: int = typer.Option(12, "--genres", min=1, help="How many of your genres to search."),
+    max_tracks: int | None = _MAX_TRACKS,
+) -> None:
+    """Find curators whose playlists overlap your liked songs.
+
+    Read-only: it lists people worth following, it does not follow
+    anyone. Mass-following strangers to collect follow-backs is the
+    artificial-engagement pattern Spotify's rules prohibit, and it risks
+    the account it is meant to grow.
+    """
+    from spotifyforge.core.curation import CurationEngine
+    from spotifyforge.core.curators import find_curators, top_genres
+
+    async def _find(sp):
+        engine = CurationEngine(sp)
+        tracks = await engine.enrich_genres(await engine.fetch_liked(max_tracks=max_tracks))
+        me = await sp.current_user()
+        seeds = top_genres(tracks, count=genres)
+        liked_ids = {t.id for t in tracks}
+        return await find_curators(sp, seeds, liked_ids, me.id, limit=limit), seeds, len(tracks)
+
+    curators, seeds, scanned = _run_spotify(
+        "Searching for curators who share your taste...",
+        "Failed to find curators",
+        _find,
+    )
+
+    console.print(
+        Panel(
+            f"Liked songs scanned: [bold]{scanned}[/bold]\n"
+            f"Genres searched:     {', '.join(seeds[:6])}"
+            + (f" (+{len(seeds) - 6} more)" if len(seeds) > 6 else "")
+            + f"\nCurators found:      [bold]{len(curators)}[/bold]",
+            title="Curator search",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    if not curators:
+        console.print("No curators with overlapping taste turned up. Try [bold]--genres 20[/bold].")
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Curator", style="white", no_wrap=True, max_width=28)
+    table.add_column("Shared", justify="right", style="green")
+    table.add_column("Their playlist", style="magenta", no_wrap=True, max_width=34)
+    table.add_column("Profile", style="dim", no_wrap=True)
+    for idx, c in enumerate(curators, start=1):
+        table.add_row(str(idx), c.display_name, str(c.shared_tracks), c.example_playlist, c.url)
+    console.print(table)
+    console.print(
+        "\n[dim]'Shared' counts your own liked songs found in that curator's playlist. "
+        "Open a profile and follow the ones you actually like — that is the kind of "
+        "follow Spotify rewards.[/dim]"
+    )
+
+
+@curate_app.command("features")
+def curate_features(
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Also fetch musical key via MusicBrainz/AcousticBrainz (~1 track/sec).",
+    ),
+    max_tracks: int | None = _MAX_TRACKS,
+) -> None:
+    """Fetch tempo and key for your liked songs, caching them on disk.
+
+    Spotify's own audio-features endpoint is withdrawn for this app, so
+    tempo comes from Deezer and musical key from AcousticBrainz, both
+    looked up by ISRC. Results are cached, so this is slow once and
+    instant afterwards; re-run it after liking new music.
+    """
+    from spotifyforge.core.curation import CurationEngine, feature_cache_path, gather_features
+
+    async def _fetch(sp):
+        return await CurationEngine(sp).fetch_liked(max_tracks=max_tracks)
+
+    tracks = _run_spotify("Reading your liked songs...", "Failed to read library", _fetch)
+    with_isrc = [t for t in tracks if t.isrc]
+
+    if deep:
+        console.print(
+            f"[yellow]Deep lookup is rate-limited to about one track per second, "
+            f"so this may take a while for {len(with_isrc)} tracks.[/yellow]"
+        )
+
+    from rich.progress import Progress
+
+    with Progress(transient=True) as progress:
+        task = progress.add_task("Looking up tempo/key...", total=len(with_isrc))
+        features, added = _run(
+            gather_features(with_isrc, deep=deep, progress=lambda: progress.advance(task))
+        )
+
+    analysed = sum(1 for f in features.values() if f.tempo is not None)
+    keyed = sum(1 for f in features.values() if f.has_key)
+    console.print(
+        Panel(
+            f"Tracks with an ISRC:  [bold]{len(with_isrc)}[/bold] of {len(tracks)}\n"
+            f"New lookups this run: [bold]{added}[/bold]\n"
+            f"Tempo known:          [bold]{analysed}[/bold]\n"
+            f"Key known:            [bold]{keyed}[/bold]"
+            + ("" if deep else "  [dim](use --deep to fetch keys)[/dim]")
+            + f"\nCache: {feature_cache_path()}",
+            title="Audio features",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    if keyed:
+        console.print(
+            "\nRun [bold]spotifyforge curate reflow --harmonic[/bold] to re-sequence "
+            "your playlists by key and BPM."
+        )
+
+
 @curate_app.command("reflow")
 def curate_reflow(
     min_size: int = _MIN_SIZE,
     max_size: int = _MAX_SIZE,
     max_tracks: int | None = _MAX_TRACKS,
     exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
 ) -> None:
     """Re-sequence playlists you already forged, keeping their URLs and followers."""
     from spotifyforge.core.curation import plan_catalogue, reflow
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
 
     async def _reflow(sp):
-        plan = await plan_catalogue(sp, opts)
+        plan = await plan_catalogue(sp, opts, features)
         return await reflow(PlaylistManager(sp), sp, plan.specs), len(plan.specs)
 
     rewritten, total = _run_spotify(

@@ -494,6 +494,22 @@ class FakeSpotify:
             q = query.get("q", "")
             head = q.split()[0].lower() if q.split() else ""
             words = [w for w in re.split(r"[^a-z0-9]+", head) if w]
+            types = query.get("type", "track").split(",")
+
+            if "playlist" in types:
+                hits = [
+                    p
+                    for p, meta in self.playlists.items()
+                    if words and any(w in meta["name"].lower() for w in words)
+                ]
+                items = [self._simple_playlist_payload(p) for p in hits[offset : offset + limit]]
+                return httpx.Response(
+                    200,
+                    json={
+                        "playlists": self._paging(f"{API}/search", items, limit, offset, len(hits))
+                    },
+                )
+
             matches = [
                 t
                 for t in self.tracks.values()

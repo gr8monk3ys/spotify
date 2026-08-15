@@ -15,9 +15,11 @@ Turns a Spotify library into a catalogue of niche playlists:
    playlists that already exist so runs are resumable, and
    :func:`reflow` re-sequences ones already created.
 
-Spotify removed the audio-features endpoint (key/BPM) for this API app,
-so harmonic ("Camelot wheel") sequencing is not possible here; the
-popularity arc is the ordering that real data can actually support.
+Spotify withdrew its own audio-features endpoint, so tempo and key come
+from :mod:`spotifyforge.core.audio_features` (Deezer and AcousticBrainz,
+looked up by ISRC). When enough of a playlist has been analysed the
+ordering switches to Camelot-wheel harmonic mixing; otherwise it falls
+back to the popularity arc, which needs no outside data.
 """
 
 from __future__ import annotations
@@ -27,9 +29,19 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import tekore as tk
+
+from spotifyforge.core.audio_features import (
+    AcousticBrainzProvider,
+    AudioFeature,
+    DeezerProvider,
+    FeatureCache,
+    fetch_features,
+    key_distance,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -53,6 +65,16 @@ _READ_CONCURRENCY = 5
 # Spotify's rate limits (each creation is 1 create + ~1 add call).
 _FORGE_DELAY = 1.0
 
+# Harmonic ordering only beats the popularity arc when most of the
+# playlist is actually analysed; below this it would chain a handful of
+# known keys and scatter the rest.
+_HARMONIC_MIN_COVERAGE = 0.5
+# BPM difference treated as one step of "further away".
+_TEMPO_BUCKET = 6.0
+# Cost charged when either side has no tempo — worse than a close match,
+# better than a jarring one, so unanalysed tracks fill gaps naturally.
+_UNKNOWN_TEMPO_GAP = 4
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -70,6 +92,7 @@ class CurationTrack:
     artist_names: tuple[str, ...]
     release_year: int | None
     popularity: int
+    isrc: str | None = None  # global recording id; the key for tempo/key lookups
     genres: tuple[str, ...] = ()
 
 
@@ -243,7 +266,15 @@ def _to_curation_track(track: Any) -> CurationTrack:
         artist_names=tuple(a.name for a in track.artists or [] if a.name),
         release_year=release_year,
         popularity=track.popularity if track.popularity is not None else 0,
+        isrc=_extract_isrc(track),
     )
+
+
+def _extract_isrc(track: Any) -> str | None:
+    external = getattr(track, "external_ids", None)
+    if isinstance(external, dict):
+        return external.get("isrc")
+    return getattr(external, "isrc", None)
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +348,7 @@ def cluster_library(
     max_size: int = 60,
     exclusive: bool = False,
     include_unclassified: bool = True,
+    features: dict[str, AudioFeature] | None = None,
 ) -> list[PlaylistSpec]:
     """Group tracks into niche playlist specs.
 
@@ -355,18 +387,18 @@ def cluster_library(
         if len(members) < min_size:
             continue
         if len(members) <= max_size:
-            specs.append(_make_spec(genre, None, members))
+            specs.append(_make_spec(genre, None, members, features))
             continue
         for decade, decade_members in _split_by_decade(members):
             if len(decade_members) >= min_size:
-                specs.append(_make_spec(genre, decade, decade_members))
+                specs.append(_make_spec(genre, decade, decade_members, features))
 
     if include_unclassified:
         placed = {t.id for s in specs for t in s.tracks}
         orphans = [t for t in tracks if t.id not in placed]
         for decade, members in _split_by_decade(orphans):
             if len(members) >= min_size:
-                specs.append(_make_spec(None, decade, members[:max_size]))
+                specs.append(_make_spec(None, decade, members[:max_size], features))
 
     # Most niche first: rarer genres make better calling cards.
     specs.sort(key=lambda s: (len(s.tracks), s.title))
@@ -405,18 +437,82 @@ def _shares_artist(a: CurationTrack, b: CurationTrack) -> bool:
     return bool(set(a.artist_ids) & set(b.artist_ids))
 
 
-def order_for_flow(tracks: list[CurationTrack]) -> list[CurationTrack]:
+def order_for_flow(
+    tracks: list[CurationTrack],
+    features: dict[str, AudioFeature] | None = None,
+) -> list[CurationTrack]:
     """Sequence tracks so consecutive ones flow into each other.
 
-    Shapes a popularity arc — most familiar track first, descending into
-    the deep cuts, resurfacing at the close — then walks that order
-    taking the first track whose artist differs from the one just
-    played, so an artist never repeats back-to-back unless the playlist
-    leaves no alternative.
+    Without tempo/key data, shapes a popularity arc — most familiar
+    track first, descending into the deep cuts, resurfacing at the close
+    — then pulls same-artist runs apart.
+
+    With *features* (see :mod:`spotifyforge.core.audio_features`), chains
+    tracks by harmonic compatibility and tempo proximity instead,
+    starting from the most popular track. Coverage from those sources is
+    partial, so this is used only when enough of the playlist is
+    analysed; a track with no analysis still takes part, it just carries
+    no key preference.
     """
     if len(tracks) <= 2:
         return list(tracks)
+    if features and _harmonic_coverage(tracks, features) >= _HARMONIC_MIN_COVERAGE:
+        return _order_harmonic(tracks, features)
     return _space_artists(_popularity_arc(tracks))
+
+
+def _harmonic_coverage(tracks: list[CurationTrack], features: dict[str, AudioFeature]) -> float:
+    """Fraction of *tracks* with a known musical key."""
+    known = sum(
+        1 for t in tracks if t.isrc and (f := features.get(t.isrc)) is not None and f.has_key
+    )
+    return known / len(tracks) if tracks else 0.0
+
+
+def _order_harmonic(
+    tracks: list[CurationTrack], features: dict[str, AudioFeature]
+) -> list[CurationTrack]:
+    """Chain tracks by key compatibility, then tempo, then popularity.
+
+    Artist repetition still outranks harmony: a perfect key match by the
+    same artist twice in a row reads as an accident, not a mix.
+    """
+    empty = AudioFeature()
+
+    def feature_of(track: CurationTrack) -> AudioFeature:
+        return (features.get(track.isrc) or empty) if track.isrc else empty
+
+    remaining = sorted(tracks, key=lambda t: (-t.popularity, t.id))
+    chain = [remaining.pop(0)]
+
+    while remaining:
+        previous = chain[-1]
+        previous_feature = feature_of(previous)
+
+        def cost(
+            candidate: CurationTrack,
+            previous: CurationTrack = previous,
+            pf: AudioFeature = previous_feature,
+        ) -> tuple[bool, int, int, int, str]:
+            feature = feature_of(candidate)
+            if feature.tempo is not None and pf.tempo is not None:
+                # Bucket the tempo gap so near-equal tempos tie and fall
+                # through to popularity rather than splitting hairs.
+                tempo_gap = round(abs(feature.tempo - pf.tempo) / _TEMPO_BUCKET)
+            else:
+                tempo_gap = _UNKNOWN_TEMPO_GAP
+            return (
+                _shares_artist(candidate, previous),
+                key_distance(pf, feature),
+                tempo_gap,
+                -candidate.popularity,
+                candidate.id,
+            )
+
+        nxt = min(remaining, key=cost)
+        remaining.remove(nxt)
+        chain.append(nxt)
+    return chain
 
 
 def _popularity_arc(tracks: list[CurationTrack]) -> list[CurationTrack]:
@@ -474,7 +570,12 @@ _TITLE_TEMPLATES = [
 _UNCLASSIFIED_TITLE = "beyond genre"
 
 
-def _make_spec(genre: str | None, decade: int | None, members: list[CurationTrack]) -> PlaylistSpec:
+def _make_spec(
+    genre: str | None,
+    decade: int | None,
+    members: list[CurationTrack],
+    features: dict[str, AudioFeature] | None = None,
+) -> PlaylistSpec:
     if genre is None:
         title = _UNCLASSIFIED_TITLE
         subject = "tracks by artists Spotify never tagged with a genre"
@@ -487,7 +588,7 @@ def _make_spec(genre: str | None, decade: int | None, members: list[CurationTrac
     if decade:
         title = f"{title} ('{decade % 100:02d}s)"
     era = f" from the {decade}s" if decade else ""
-    ordered = order_for_flow(members)
+    ordered = order_for_flow(members, features)
     description = (
         f"{len(ordered)} {subject}{era}, sequenced for flow. "
         "Forged from my liked songs by SpotifyForge."
@@ -502,11 +603,16 @@ def _make_spec(genre: str | None, decade: int | None, members: list[CurationTrac
 # ---------------------------------------------------------------------------
 
 
-async def plan_catalogue(spotify: Spotify, opts: CurationOptions) -> CurationPlan:
+async def plan_catalogue(
+    spotify: Spotify,
+    opts: CurationOptions,
+    features: dict[str, AudioFeature] | None = None,
+) -> CurationPlan:
     """Read the library and return the catalogue it would produce.
 
     Pure read — nothing is created. ``curate plan`` shows this and
-    ``curate forge`` acts on it, so both see the same clusters.
+    ``curate forge`` acts on it, so both see the same clusters. Pass
+    *features* (from :func:`load_features`) to sequence harmonically.
     """
     engine = CurationEngine(spotify)
     liked = await engine.enrich_genres(await engine.fetch_liked(max_tracks=opts.max_tracks))
@@ -516,8 +622,46 @@ async def plan_catalogue(spotify: Spotify, opts: CurationOptions) -> CurationPla
         min_size=opts.min_size,
         max_size=opts.max_size,
         exclusive=opts.exclusive,
+        features=features,
     )
     return CurationPlan(liked_count=len(liked), unique_count=len(unique), specs=specs)
+
+
+def feature_cache_path() -> Path:
+    """Where the tempo/key cache lives — beside the local database."""
+    from spotifyforge.config import settings
+
+    return settings.db_path.parent / "audio_features.json"
+
+
+def load_features() -> dict[str, AudioFeature]:
+    """Return every tempo/key reading already cached on disk.
+
+    Never hits the network: ordering uses whatever ``curate features``
+    has gathered so far, and simply falls back where it has nothing.
+    """
+    return FeatureCache(feature_cache_path()).all()
+
+
+async def gather_features(
+    tracks: list[CurationTrack],
+    deep: bool = False,
+    progress: object = None,
+) -> tuple[dict[str, AudioFeature], int]:
+    """Fetch and cache tempo/key for *tracks*, returning (features, new).
+
+    Deezer alone supplies tempo quickly. *deep* adds the
+    MusicBrainz/AcousticBrainz walk, which is the only source of musical
+    key but is rate-limited to roughly one track per second.
+    """
+    cache = FeatureCache(feature_cache_path())
+    before = len(cache)
+    isrcs = sorted({t.isrc for t in tracks if t.isrc})
+    providers: list[DeezerProvider | AcousticBrainzProvider] = [DeezerProvider()]
+    if deep:
+        providers.append(AcousticBrainzProvider())
+    features = await fetch_features(isrcs, providers, cache, progress=progress)
+    return features, len(cache) - before
 
 
 async def forge_next(
