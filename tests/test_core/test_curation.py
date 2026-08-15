@@ -712,3 +712,55 @@ async def test_isrc_is_carried_off_spotify_into_curation_tracks(fake_spotify, cl
     # The fake mints ISRCs the same shape Spotify does; without this the
     # whole tempo/key lookup has nothing to key on.
     assert tracks[0].isrc == "ISRCT1"
+
+
+async def test_library_read_retries_a_transient_failure(fake_spotify, client_for, monkeypatch):
+    """A timeout on one page must not silently shrink the library."""
+    import httpx
+
+    monkeypatch.setattr("spotifyforge.core.curation._READ_BACKOFF", 0)
+    fake_spotify.add_user("user1")
+    for i in range(120):
+        fake_spotify.add_track(f"t{i}")
+        fake_spotify.save_track("user1", f"t{i}")
+
+    sp = client_for("user1")
+    calls = {"n": 0}
+    real = sp.saved_tracks
+
+    async def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise httpx.ReadTimeout("")
+        return await real(*a, **kw)
+
+    sp.saved_tracks = flaky
+    tracks = await CurationEngine(sp).fetch_liked()
+
+    assert len(tracks) == 120  # nothing lost to the blip
+    assert len({t.id for t in tracks}) == 120
+
+
+async def test_library_read_raises_rather_than_returning_a_partial_library(
+    fake_spotify, client_for, monkeypatch
+):
+    """Silently dropping a page would make reflow delete real tracks."""
+    import httpx
+
+    monkeypatch.setattr("spotifyforge.core.curation._READ_BACKOFF", 0)
+    fake_spotify.add_user("user1")
+    for i in range(120):
+        fake_spotify.add_track(f"t{i}")
+        fake_spotify.save_track("user1", f"t{i}")
+
+    sp = client_for("user1")
+    real = sp.saved_tracks
+
+    async def always_fails(*a, **kw):
+        if kw.get("offset"):
+            raise httpx.ReadTimeout("")
+        return await real(*a, **kw)
+
+    sp.saved_tracks = always_fails
+    with pytest.raises(httpx.ReadTimeout):
+        await CurationEngine(sp).fetch_liked()

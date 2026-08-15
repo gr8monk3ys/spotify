@@ -29,6 +29,7 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -54,6 +55,10 @@ _REPLACE_CHUNK = 100  # Spotify max URIs for PUT /v1/playlists/{id}/tracks
 # Concurrent API calls during library reads. Bounded so a large library
 # does not open hundreds of sockets or trip Spotify's rate limiter.
 _READ_CONCURRENCY = 5
+# Transient timeouts are common across a few hundred requests; retry
+# before giving up, because a lost page silently corrupts the catalogue.
+_READ_ATTEMPTS = 3
+_READ_BACKOFF = 1.0
 
 # One creation per _FORGE_DELAY seconds keeps bulk runs well inside
 # Spotify's rate limits (each creation is 1 create + ~1 add call).
@@ -182,7 +187,7 @@ class CurationEngine:
 
         offsets = list(range(_LIKED_PAGE, first.total, _LIKED_PAGE))
         for page in await _gather_bounded(
-            [self._sp.saved_tracks(limit=_LIKED_PAGE, offset=o) for o in offsets]
+            [partial(self._sp.saved_tracks, limit=_LIKED_PAGE, offset=o) for o in offsets]
         ):
             if page is not None:
                 out.extend(_saved_page_to_tracks(page))
@@ -199,7 +204,7 @@ class CurationEngine:
         ]
 
         genres_by_artist: dict[str, tuple[str, ...]] = {}
-        for artists in await _gather_bounded([self._sp.artists(b) for b in batches]):
+        for artists in await _gather_bounded([partial(self._sp.artists, b) for b in batches]):
             for artist in artists or ():
                 genres_by_artist[artist.id] = tuple(artist.genres or ())
 
@@ -221,25 +226,35 @@ class CurationEngine:
         return enriched
 
 
-async def _gather_bounded(coros: list[Any]) -> list[Any]:
-    """Await *coros* concurrently, at most ``_READ_CONCURRENCY`` at once.
+async def _gather_bounded(factories: list[Any]) -> list[Any]:
+    """Await *factories* concurrently, at most ``_READ_CONCURRENCY`` at once.
 
-    A failed call yields ``None`` rather than cancelling its siblings —
-    one bad artist batch should not lose the whole library.
+    Each item is a zero-argument callable returning a fresh coroutine, so
+    a failed call can be retried — a coroutine cannot be awaited twice.
+
+    Failures are retried with backoff and then re-raised rather than
+    skipped. A dropped page of liked songs would silently compute the
+    catalogue from an incomplete library, and reflow would then *remove*
+    the missing tracks from playlists; failing loudly is the safe choice.
     """
-    if not coros:
+    if not factories:
         return []
     semaphore = asyncio.Semaphore(_READ_CONCURRENCY)
 
-    async def _run(coro: Any) -> Any:
+    async def _run(make: Any) -> Any:
         async with semaphore:
-            try:
-                return await coro
-            except tk.HTTPError as exc:
-                logger.warning("Library read failed, continuing without it: %s", exc)
-                return None
+            for attempt in range(_READ_ATTEMPTS):
+                try:
+                    return await make()
+                except (tk.HTTPError, httpx.HTTPError) as exc:
+                    if attempt == _READ_ATTEMPTS - 1:
+                        logger.error("Library read failed after %d tries: %s", attempt + 1, exc)
+                        raise
+                    logger.warning("Library read failed (%s); retrying", exc)
+                    await asyncio.sleep(_READ_BACKOFF * (attempt + 1))
+            return None
 
-    return list(await asyncio.gather(*(_run(c) for c in coros)))
+    return list(await asyncio.gather(*(_run(f) for f in factories)))
 
 
 def _ordered_unique(values: Iterable[str]) -> tuple[str, ...]:
