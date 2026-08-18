@@ -25,6 +25,8 @@ back to the popularity arc, which needs no outside data.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import html
 import logging
 import re
 from collections import Counter
@@ -588,6 +590,74 @@ _TITLE_TEMPLATES = [
 ]
 _UNCLASSIFIED_TITLE = "beyond genre"
 
+# The description is the only text besides the name that Spotify's search
+# indexes, and artist names are what searchers actually type — so every
+# description leads with the playlist's own biggest names. No track counts
+# (they go stale as the library grows) and no tool credit (an account
+# whose every playlist names its bot reads as a bot).
+_DESCRIPTION_TEMPLATES = [
+    "{artists}, and the deeper cuts between them. {genre} that plays start to finish.",
+    "a long sit with {genre}: {artists}, more.",
+    "{genre} with the skips already taken out. {artists} inside.",
+    "one mood, held all the way through: {genre} around {artists}.",
+    "the {genre} shelf, filed with care. {artists}.",
+    "{genre} sequenced so each song hands off to the next. {artists}, company.",
+    "for when only {genre} will do. {artists}, and friends.",
+    "{artists}. {genre}, end to end.",
+]
+_UNCLASSIFIED_DESCRIPTION = "songs spotify never tagged with a genre. {artists}, other strays."
+_DESCRIPTION_MAX = 300  # Spotify's documented limit for playlist descriptions
+
+
+def _lead_artists(tracks: list[CurationTrack], count: int) -> list[str]:
+    """The playlist's most recognisable artist names, most popular first."""
+    names: list[str] = []
+    for track in sorted(tracks, key=lambda t: -t.popularity):
+        name = track.artist_names[0] if track.artist_names else ""
+        if name and name not in names:
+            names.append(name)
+        if len(names) == count:
+            break
+    return names
+
+
+def _join_names(names: list[str]) -> str:
+    if len(names) > 1:
+        return ", ".join(names[:-1]) + " and " + names[-1]
+    return names[0] if names else ""
+
+
+def _describe(
+    genre: str | None, decade: int | None, tracks: list[CurationTrack], ordering: str
+) -> str:
+    """A human-sounding description, deterministic per genre.
+
+    Phrasing is chosen by hashing the genre (like cover palettes), so a
+    genre keeps its voice across runs and neighbouring playlists don't
+    all read alike. Tries three artist names, then fewer if the result
+    would overrun Spotify's length limit.
+    """
+    for count in (3, 2, 1, 0):
+        artists = _join_names(_lead_artists(tracks, count))
+        if not artists:
+            text = (
+                "songs spotify never tagged with a genre."
+                if genre is None
+                else f"{genre}, start to finish."
+            )
+        elif genre is None:
+            text = _UNCLASSIFIED_DESCRIPTION.format(artists=artists)
+        else:
+            index = hashlib.sha256(genre.encode()).digest()[0] % len(_DESCRIPTION_TEMPLATES)
+            text = _DESCRIPTION_TEMPLATES[index].format(genre=genre, artists=artists)
+        if decade:
+            text += f" all from the {decade}s."
+        if ordering == "harmonic":
+            text += " mixed by key, like a dj set."
+        if len(text) <= _DESCRIPTION_MAX:
+            return text
+    return text[:_DESCRIPTION_MAX]
+
 
 def _make_spec(
     genre: str | None,
@@ -597,24 +667,17 @@ def _make_spec(
 ) -> PlaylistSpec:
     if genre is None:
         title = _UNCLASSIFIED_TITLE
-        subject = "tracks by artists Spotify never tagged with a genre"
     else:
         # Deterministic template choice so re-runs produce the same names.
         template = _TITLE_TEMPLATES[sum(ord(c) for c in genre) % len(_TITLE_TEMPLATES)]
         article = "an" if genre[:1].lower() in "aeiou" else "a"
         title = template.format(genre=genre, a=article)
-        subject = f"{genre} tracks"
     if decade:
         title = f"{title} ('{decade % 100:02d}s)"
-    era = f" from the {decade}s" if decade else ""
     ordered, ordering = order_with_mode(members, features)
-    description = (
-        f"{len(ordered)} {subject}{era}, sequenced for flow. "
-        "Forged from my liked songs by SpotifyForge."
-    )
     return PlaylistSpec(
         title=title,
-        description=description,
+        description=_describe(genre, decade, ordered, ordering),
         genre=genre,
         decade=decade,
         tracks=ordered,
@@ -772,6 +835,46 @@ async def apply_covers(
 
     logger.info("Set %d cover(s), %d failed", len(uploaded), len(failed))
     return uploaded, failed
+
+
+async def apply_descriptions(
+    manager: PlaylistManager,
+    spotify: Spotify,
+    specs: list[PlaylistSpec],
+    delay: float = _FORGE_DELAY,
+) -> tuple[list[str], list[str]]:
+    """Bring live playlists' descriptions up to date with their spec.
+
+    Descriptions are written once at forge time and drift as the library
+    (and the description templates) evolve; this pushes the current text
+    without touching tracks, titles, or followers. Spotify serves
+    descriptions back HTML-escaped, so comparison happens on the
+    unescaped text and an already-correct playlist costs nothing.
+    Returns ``(updated, failed)`` titles; one failure never discards the
+    rest of the run.
+    """
+    by_title = {p["name"]: p for p in await manager.get_user_playlists()}
+    updated: list[str] = []
+    failed: list[str] = []
+
+    for spec in specs:
+        entry = by_title.get(spec.title)
+        if entry is None:
+            continue
+        if html.unescape(entry.get("description") or "") == spec.description:
+            continue
+        try:
+            await spotify.playlist_change_details(entry["id"], description=spec.description)
+        except (tk.HTTPError, httpx.HTTPError) as exc:
+            logger.warning("Could not describe %r: %s", spec.title, exc)
+            failed.append(spec.title)
+            continue
+        updated.append(spec.title)
+        if delay:
+            await asyncio.sleep(delay)
+
+    logger.info("Updated %d description(s), %d failed", len(updated), len(failed))
+    return updated, failed
 
 
 async def _has_custom_cover(spotify: Spotify, playlist_id: str) -> bool:
