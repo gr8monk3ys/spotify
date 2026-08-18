@@ -156,14 +156,18 @@ def _run_spotify(status_msg: str, error_msg: str, coro_fn):
         try:
             return _run(_impl())
         except Exception as exc:
-            _error_panel(f"{error_msg}: {exc}")
+            # Some exceptions (httpx.ReadTimeout among them) stringify to
+            # "", which produced an error panel that named no error.
+            detail = str(exc) or type(exc).__name__
+            _error_panel(f"{error_msg}: {detail}")
 
 
 def _db_user_id() -> int:
     """Return the local DB user id for the logged-in CLI user, or exit.
 
-    The row is created at login; if it is missing (e.g. the database was
-    deleted), the user is asked to log in again.
+    The row is created at login. If it is missing but the keyring still
+    holds a usable token (e.g. the database file was deleted), it is
+    rebuilt from that token rather than forcing a full re-authorization.
     """
     from sqlmodel import Session, select
 
@@ -174,15 +178,41 @@ def _db_user_id() -> int:
     spotify_user_id = _current_spotify_user_id()
     with Session(get_engine()) as session:
         user = session.exec(select(User).where(User.spotify_id == spotify_user_id)).first()
-        if user is None or user.id is None:
-            _error_panel(
-                "Local user record not found. Run [bold]spotifyforge auth login[/bold] again.",
-                title="Authentication Required",
-            )
-        return user.id
+        if user is not None and user.id is not None:
+            return user.id
+
+    return _rebuild_db_user(spotify_user_id)
 
 
-def _upsert_db_user(profile: dict[str, Any], token: tekore.Token) -> int:
+def _rebuild_db_user(spotify_user_id: str) -> int:
+    """Recreate the local User row from the keyring token, or exit."""
+    from spotifyforge.auth.oauth import get_spotify_user
+
+    auth = _make_auth()
+    try:
+        token = _load_token(auth, spotify_user_id)
+    except Exception:
+        _error_panel(
+            "Local user record not found and no stored credentials to rebuild it.\n"
+            "Run [bold]spotifyforge auth login[/bold] to authenticate.",
+            title="Authentication Required",
+        )
+
+    with console.status("Rebuilding local user record..."):
+        try:
+            profile = _run(get_spotify_user(token.access_token))
+        except Exception as exc:
+            _error_panel(f"Could not rebuild local user record: {exc}")
+
+    user_id = _upsert_db_user(profile["id"], profile, token)
+    console.print(
+        "[yellow]Local database was rebuilt from your stored credentials.[/yellow] "
+        "Playlists and schedules it held were not restored."
+    )
+    return user_id
+
+
+def _upsert_db_user(spotify_id: str, profile: dict[str, Any], token: tekore.Token) -> int:
     """Create or update the local User row (with encrypted tokens).
 
     Tokens are persisted so scheduled jobs (which authenticate from the
@@ -196,9 +226,9 @@ def _upsert_db_user(profile: dict[str, Any], token: tekore.Token) -> int:
 
     init_db()
     with Session(get_engine()) as session:
-        user = session.exec(select(User).where(User.spotify_id == profile["user_id"])).first()
+        user = session.exec(select(User).where(User.spotify_id == spotify_id)).first()
         if user is None:
-            user = User(spotify_id=profile["user_id"])
+            user = User(spotify_id=spotify_id)
         apply_user_profile(user, profile)
         apply_user_tokens(user, token.access_token, token.refresh_token, token.expires_at)
         session.add(user)
@@ -268,7 +298,7 @@ def auth_login(
     try:
         profile = auth.complete_login(redirect_url, expected_state=state)
         token = auth.token_store.load_token(profile["user_id"])
-        _upsert_db_user(profile, token)
+        _upsert_db_user(profile["user_id"], profile, token)
     except Exception as exc:
         _error_panel(f"Login failed: {exc}", title="Authentication Error")
 
@@ -865,6 +895,430 @@ def discover_time_capsule(
             expand=False,
         )
     )
+
+
+# ╔═════════════════════════════════════════════════════════════════════════╗
+# ║  CURATE                                                                ║
+# ╚═════════════════════════════════════════════════════════════════════════╝
+curate_app = typer.Typer(
+    name="curate",
+    help="Forge a catalogue of niche playlists from your liked songs.",
+    no_args_is_help=True,
+)
+app.add_typer(curate_app)
+
+# Shared option definitions so `plan`, `forge` and `reflow` cannot drift
+# apart — a plan that previewed different clusters than the forge creates
+# would make the preview worthless.
+_MIN_SIZE = typer.Option(
+    12, "--min-size", min=2, help="Smallest genre cluster that becomes a playlist."
+)
+_MAX_SIZE = typer.Option(
+    60, "--max-size", min=10, help="Clusters larger than this are split by decade."
+)
+_MAX_TRACKS = typer.Option(
+    None, "--max-tracks", min=1, help="Only scan the first N liked songs (quick preview)."
+)
+_EXCLUSIVE = typer.Option(
+    False,
+    "--exclusive",
+    help="Put each track in only its rarest genre (fewer, sharper playlists).",
+)
+_HARMONIC = typer.Option(
+    False,
+    "--harmonic",
+    help="Sequence by musical key and BPM (needs 'curate features' first).",
+)
+
+
+def _features_or_warn(harmonic: bool):
+    """Load cached tempo/key data, explaining if there is none yet."""
+    if not harmonic:
+        return None
+    from spotifyforge.core.audio_features import load_cached_features
+
+    features = load_cached_features()
+    if not features:
+        _error_panel(
+            "No tempo/key data cached yet.\n"
+            "Run [bold]spotifyforge curate features --deep[/bold] first.",
+            title="Nothing to sequence by",
+        )
+    keyed = sum(1 for f in features.values() if f.has_key)
+    console.print(
+        f"[dim]Harmonic ordering: {len(features)} tracks analysed, {keyed} with a key.[/dim]"
+    )
+    return features
+
+
+def _curation_options(min_size, max_size, max_tracks, exclusive):
+    from spotifyforge.core.curation import CurationOptions
+
+    return CurationOptions(
+        min_size=min_size, max_size=max_size, max_tracks=max_tracks, exclusive=exclusive
+    )
+
+
+def _specs_table(specs) -> Table:
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Playlist", style="white", no_wrap=True, max_width=45)
+    table.add_column("Genre", style="green", no_wrap=True, max_width=30)
+    table.add_column("Era", style="magenta")
+    table.add_column("Tracks", justify="right")
+    for idx, spec in enumerate(specs, start=1):
+        table.add_row(
+            str(idx),
+            spec.title,
+            spec.genre_label,
+            f"{spec.decade}s" if spec.decade else "\u2014",
+            str(len(spec.tracks)),
+        )
+    return table
+
+
+@curate_app.command("plan")
+def curate_plan(
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Preview the playlist catalogue your liked songs would produce (no writes)."""
+    from spotifyforge.core.curation import plan_catalogue
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+    plan = _run_spotify(
+        "Scanning your liked songs...",
+        "Failed to plan curation",
+        lambda sp: plan_catalogue(sp, opts, features),
+    )
+
+    console.print(
+        Panel(
+            f"Liked songs scanned:   [bold]{plan.liked_count}[/bold]\n"
+            f"Unique songs:          [bold]{plan.unique_count}[/bold] "
+            f"({plan.collapsed_count} duplicate versions collapsed)\n"
+            f"Playlists planned:     [bold]{len(plan.specs)}[/bold]\n"
+            f"Songs placed:          [bold]{plan.placed_count}[/bold] of {plan.unique_count} "
+            f"({plan.unique_count - plan.placed_count} in genres too small to fill a playlist)\n"
+            f"Playlist entries:      [bold]{plan.entry_count}[/bold] "
+            "(a song can belong to more than one genre)\n"
+            f"Sequenced by key+BPM:  [bold]{plan.harmonic_count}[/bold] of {len(plan.specs)} "
+            "(the rest had too little key data)",
+            title="Curation Plan",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    if plan.specs:
+        console.print(_specs_table(plan.specs))
+        console.print(
+            "\nRun [bold]spotifyforge curate forge --limit N[/bold] to create them "
+            "(already-created titles are skipped, so repeated runs continue the catalogue)."
+        )
+
+
+@curate_app.command("forge")
+def curate_forge(
+    limit: int = typer.Option(
+        5, "--limit", "-l", min=1, help="Maximum playlists to create this run."
+    ),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+    private: bool = typer.Option(
+        False, "--private", help="Create the playlists as private instead of public."
+    ),
+) -> None:
+    """Create the next batch of planned playlists on Spotify (resumable)."""
+    from spotifyforge.core.curation import forge_next, plan_catalogue
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    owner_id = _db_user_id()
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _forge(sp):
+        plan = await plan_catalogue(sp, opts, features)
+        created, pending = await forge_next(
+            PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
+        )
+        return created, pending, len(plan.specs)
+
+    created, pending, total = _run_spotify(
+        "Forging playlists from your liked songs...",
+        "Failed to forge playlists",
+        _forge,
+    )
+
+    if not created:
+        console.print(
+            Panel(
+                f"All {total} planned playlists already exist \u2014 nothing to create.",
+                title="Catalogue complete",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[green]Created {len(created)} playlist(s).[/green]\n"
+            f"Remaining in plan: [bold]{pending - len(created)}[/bold] of {total} \u2014 "
+            "run the same command again to continue.",
+            title="Forge",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(_specs_table([spec for spec, _ in created]))
+
+
+@curate_app.command("curators")
+def curate_curators(
+    limit: int = typer.Option(25, "--limit", "-l", min=1, help="How many curators to list."),
+    genres: int = typer.Option(12, "--genres", min=1, help="How many of your genres to search."),
+    max_tracks: int | None = _MAX_TRACKS,
+) -> None:
+    """Find curators whose playlists overlap your liked songs.
+
+    Read-only: it lists people worth following, it does not follow
+    anyone. Mass-following strangers to collect follow-backs is the
+    artificial-engagement pattern Spotify's rules prohibit, and it risks
+    the account it is meant to grow.
+    """
+    from spotifyforge.core.curation import CurationEngine
+    from spotifyforge.core.curators import find_curators, top_genres
+
+    async def _find(sp):
+        engine = CurationEngine(sp)
+        tracks = await engine.enrich_genres(await engine.fetch_liked(max_tracks=max_tracks))
+        me = await sp.current_user()
+        seeds = top_genres(tracks, count=genres)
+        liked_ids = {t.id for t in tracks}
+        return await find_curators(sp, seeds, liked_ids, me.id, limit=limit), seeds, len(tracks)
+
+    curators, seeds, scanned = _run_spotify(
+        "Searching for curators who share your taste...",
+        "Failed to find curators",
+        _find,
+    )
+
+    console.print(
+        Panel(
+            f"Liked songs scanned: [bold]{scanned}[/bold]\n"
+            f"Genres searched:     {', '.join(seeds[:6])}"
+            + (f" (+{len(seeds) - 6} more)" if len(seeds) > 6 else "")
+            + f"\nCurators found:      [bold]{len(curators)}[/bold]",
+            title="Curator search",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    if not curators:
+        console.print("No curators with overlapping taste turned up. Try [bold]--genres 20[/bold].")
+        return
+
+    # The profile URL rides on the curator's name as a terminal hyperlink
+    # rather than taking a column of its own — five columns do not fit an
+    # 80-character terminal, and the overlap count is the part to read.
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Curator", style="white", overflow="ellipsis", max_width=30)
+    table.add_column("Shared", justify="right", style="bold green")
+    table.add_column("Their playlist", style="magenta", overflow="ellipsis", max_width=34)
+    for idx, c in enumerate(curators, start=1):
+        table.add_row(
+            str(idx),
+            f"[link={c.url}]{c.display_name}[/link]",
+            str(c.shared_tracks),
+            c.example_playlist,
+        )
+    console.print(table)
+    console.print("\n[dim]Profiles:[/dim]")
+    for idx, c in enumerate(curators, start=1):
+        console.print(f"  [dim]{idx:>2}.[/dim] {c.url}")
+    console.print(
+        "\n[dim]'Shared' counts your own liked songs found in that curator's playlist. "
+        "Open a profile and follow the ones you actually like — that is the kind of "
+        "follow Spotify rewards.[/dim]"
+    )
+
+
+@curate_app.command("covers")
+def curate_covers(
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace covers that are already set."
+    ),
+) -> None:
+    """Give your forged playlists generated cover art.
+
+    Spotify's default four-track mosaic makes a large catalogue look
+    automated. Each cover's colour is derived from the playlist's genre,
+    so it is stable across runs and the set reads as one collection.
+    """
+    from spotifyforge.core.curation import apply_covers, plan_catalogue
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+
+    async def _covers(sp):
+        plan = await plan_catalogue(sp, opts)
+        uploaded, failed = await apply_covers(
+            PlaylistManager(sp), sp, plan.specs, overwrite=overwrite
+        )
+        return uploaded, failed, len(plan.specs)
+
+    uploaded, failed, total = _run_spotify(
+        "Painting playlist covers...", "Failed to set covers", _covers
+    )
+
+    if not uploaded:
+        console.print(
+            Panel(
+                f"All {total} playlists already have artwork "
+                "(use [bold]--overwrite[/bold] to replace it).",
+                title="Nothing to paint",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[green]Set artwork on {len(uploaded)} playlist(s)[/green] of {total}."
+            + (f"\n[yellow]{len(failed)} failed[/yellow]" if failed else ""),
+            title="Covers",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+
+@curate_app.command("features")
+def curate_features(
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Also fetch musical key via MusicBrainz/AcousticBrainz (~1 track/sec).",
+    ),
+    max_tracks: int | None = _MAX_TRACKS,
+) -> None:
+    """Fetch tempo and key for your liked songs, caching them on disk.
+
+    Spotify's own audio-features endpoint is withdrawn for this app, so
+    tempo comes from Deezer and musical key from AcousticBrainz, both
+    looked up by ISRC. Results are cached, so this is slow once and
+    instant afterwards; re-run it after liking new music.
+    """
+    from spotifyforge.core.audio_features import feature_cache_path, gather_features
+    from spotifyforge.core.curation import CurationEngine
+
+    async def _fetch(sp):
+        return await CurationEngine(sp).fetch_liked(max_tracks=max_tracks)
+
+    tracks = _run_spotify("Reading your liked songs...", "Failed to read library", _fetch)
+    isrcs = sorted({t.isrc for t in tracks if t.isrc})
+
+    if deep:
+        console.print(
+            f"[yellow]Deep lookup resolves {len(isrcs)} recordings in batches of 25, "
+            "pausing between MusicBrainz calls as their rate limit asks.[/yellow]"
+        )
+
+    from rich.progress import Progress
+
+    with Progress(transient=True) as progress:
+        task = progress.add_task("Looking up tempo/key...", total=len(isrcs))
+        features, learned = _run(
+            gather_features(isrcs, deep=deep, progress=lambda: progress.advance(task))
+        )
+
+    analysed = sum(1 for f in features.values() if f.tempo is not None)
+    keyed = sum(1 for f in features.values() if f.has_key)
+    console.print(
+        Panel(
+            f"Recordings with an ISRC: [bold]{len(isrcs)}[/bold] from {len(tracks)} tracks\n"
+            f"Newly resolved:          [bold]{learned}[/bold]\n"
+            f"Tempo known:             [bold]{analysed}[/bold]\n"
+            f"Key known:               [bold]{keyed}[/bold]"
+            + ("" if deep else "  [dim](use --deep to fetch keys)[/dim]")
+            + f"\nCache: {feature_cache_path()}",
+            title="Audio features",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    if keyed:
+        console.print(
+            "\nRun [bold]spotifyforge curate reflow --harmonic[/bold] to re-sequence "
+            "your playlists by key and BPM."
+        )
+
+
+@curate_app.command("reflow")
+def curate_reflow(
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Re-sequence playlists you already forged, keeping their URLs and followers."""
+    from spotifyforge.core.curation import plan_catalogue, reflow
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _reflow(sp):
+        plan = await plan_catalogue(sp, opts, features)
+        rewritten, failed = await reflow(PlaylistManager(sp), sp, plan.specs)
+        return rewritten, failed, len(plan.specs)
+
+    rewritten, failed, total = _run_spotify(
+        "Re-sequencing your forged playlists...", "Failed to reflow playlists", _reflow
+    )
+
+    if not rewritten:
+        console.print(
+            Panel(
+                f"All {total} planned playlists are already in the right order.",
+                title="Nothing to reflow",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Playlist", style="white", no_wrap=True, max_width=55)
+    table.add_column("Tracks", justify="right")
+    for idx, (title, count) in enumerate(rewritten, start=1):
+        table.add_row(str(idx), title, str(count))
+
+    console.print(
+        Panel(
+            f"[green]Re-sequenced {len(rewritten)} playlist(s)[/green] of {total} planned."
+            + (f"\n[yellow]{len(failed)} could not be updated[/yellow]" if failed else ""),
+            title="Reflow",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(table)
 
 
 # ╔═════════════════════════════════════════════════════════════════════════╗

@@ -14,6 +14,8 @@ built-in scheduler for hands-off playlist maintenance.
 
 - **Playlist management** -- list, inspect, create, sync, export (JSON/CSV), and deduplicate playlists
 - **Music discovery** -- top tracks, deep cuts, genre-based playlists, and time-capsule generators
+- **Bulk curation** -- turn your liked songs into a catalogue of hundreds of niche, genre-clustered playlists, each sequenced for flow
+- **Harmonic sequencing** -- tempo and musical key sourced by ISRC from Deezer and AcousticBrainz, then Camelot-wheel mixing (Spotify's own audio-features endpoint is withdrawn for new apps)
 - **Automated scheduling** -- cron-driven jobs for syncing, archiving Discover Weekly, deduplication, and genre refresh
 - **REST API** -- full FastAPI server with OAuth login, CRUD endpoints, and Swagger docs at `/docs`
 - **Rich CLI** -- beautiful terminal output powered by Typer + Rich
@@ -84,7 +86,7 @@ spotifyforge playlist list
 ## CLI Usage
 
 SpotifyForge organises commands into sub-groups: `auth`, `playlist`, `discover`,
-`schedule`, and `config`.
+`curate`, `schedule`, and `config`.
 
 ```bash
 # Authentication
@@ -106,6 +108,19 @@ spotifyforge discover top-tracks --time-range short_term --limit 10
 spotifyforge discover deep-cuts 4Z8W4fKeB5YxbusRsdQVPb --threshold 25   # takes a Spotify artist ID
 spotifyforge discover genre indie-rock --limit 30                       # creates a playlist (max 50 tracks)
 spotifyforge discover time-capsule --time-range long_term               # creates a playlist
+
+# Bulk curation (liked songs -> a catalogue of niche playlists)
+spotifyforge curate plan                            # Preview the catalogue; writes nothing
+spotifyforge curate plan --min-size 10 --max-size 50
+spotifyforge curate forge --limit 25                # Create the next 25; re-run to continue
+spotifyforge curate forge --exclusive               # Each song in one genre only
+spotifyforge curate forge --private
+spotifyforge curate reflow                          # Re-sequence existing ones in place
+spotifyforge curate features                        # Fetch BPM (Deezer) for your library
+spotifyforge curate features --deep                 # Also fetch musical key (AcousticBrainz)
+spotifyforge curate reflow --harmonic               # Re-sequence by key + BPM (Camelot wheel)
+spotifyforge curate covers                          # Generate + upload cover art
+spotifyforge curate curators                        # List curators who share your taste
 
 # Scheduling
 spotifyforge schedule list
@@ -287,6 +302,10 @@ spotifyforge/
     ├── core/
     │   ├── playlist_manager.py  # Playlist CRUD, sync, dedup, export
     │   ├── discovery.py         # Top tracks, deep cuts, genre, time capsule
+    │   ├── curation.py          # Liked songs -> genre clusters -> flow-ordered playlists
+    │   ├── audio_features.py    # Tempo/key by ISRC (Deezer, AcousticBrainz) + Camelot wheel
+    │   ├── curators.py          # Find curators whose playlists overlap your library
+    │   ├── covers.py            # Generated playlist cover art (Pillow)
     │   └── scheduler.py         # APScheduler service + job dispatch
     ├── db/
     │   ├── engine.py            # SQLite engine, session helpers, init_db()

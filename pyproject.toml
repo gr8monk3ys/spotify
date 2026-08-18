@@ -24,6 +24,7 @@ dependencies = [
     "cryptography>=42.0",
     "aiosqlite>=0.20",
     "alembic>=1.13",
+    "pillow>=10.0",  # playlist cover art
     # SQLAlchemy's async engine requires greenlet, but SQLAlchemy only
     # declares it on some platforms — without this line, a clean install
     # on macOS arm64 cannot boot the server.

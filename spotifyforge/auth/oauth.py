@@ -64,6 +64,10 @@ def make_client(token: tekore.Token | str, asynchronous: bool) -> tekore.Spotify
 # Required OAuth scopes (from PRD)
 # ---------------------------------------------------------------------------
 
+# ``user-follow-modify`` is deliberately absent: without it, following
+# other users is a 403 no matter what the code asks for, which is what
+# actually enforces the read-only policy in core/curators.py. Adding it
+# removes that guarantee — see that module before you do.
 REQUIRED_SCOPES = tekore.Scope(
     "playlist-modify-public",
     "playlist-modify-private",
