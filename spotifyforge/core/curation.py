@@ -732,3 +732,53 @@ async def reflow(
 
     logger.info("Reflowed %d playlist(s), %d failed", len(rewritten), len(failed))
     return rewritten, failed
+
+
+async def apply_covers(
+    manager: PlaylistManager,
+    spotify: Spotify,
+    specs: list[PlaylistSpec],
+    delay: float = _FORGE_DELAY,
+    overwrite: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Give forged playlists generated cover art.
+
+    Skips playlists that already carry a custom cover unless *overwrite*,
+    so a re-run is cheap and never clobbers art the user chose. Returns
+    ``(uploaded, failed)`` titles; as with :func:`reflow`, one failure
+    must not discard the rest of the run.
+    """
+    from spotifyforge.core.covers import cover_payload
+
+    by_title = {p["name"]: p["id"] for p in await manager.get_user_playlists()}
+    uploaded: list[str] = []
+    failed: list[str] = []
+
+    for spec in specs:
+        playlist_id = by_title.get(spec.title)
+        if playlist_id is None:
+            continue
+        try:
+            if not overwrite and await _has_custom_cover(spotify, playlist_id):
+                continue
+            await spotify.playlist_cover_image_upload(playlist_id, cover_payload(spec))
+        except (tk.HTTPError, httpx.HTTPError) as exc:
+            logger.warning("Could not set cover for %r: %s", spec.title, exc)
+            failed.append(spec.title)
+            continue
+        uploaded.append(spec.title)
+        if delay:
+            await asyncio.sleep(delay)
+
+    logger.info("Set %d cover(s), %d failed", len(uploaded), len(failed))
+    return uploaded, failed
+
+
+async def _has_custom_cover(spotify: Spotify, playlist_id: str) -> bool:
+    """Whether a playlist already has art that is not Spotify's mosaic.
+
+    Spotify serves generated mosaics from a different host than uploaded
+    images, which is the only signal the API gives for the difference.
+    """
+    images = await spotify.playlist_cover_image(playlist_id)
+    return any("mosaic" not in (img.url or "") for img in images or [])

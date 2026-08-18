@@ -119,6 +119,7 @@ spotifyforge curate reflow                          # Re-sequence existing ones 
 spotifyforge curate features                        # Fetch BPM (Deezer) for your library
 spotifyforge curate features --deep                 # Also fetch musical key (AcousticBrainz)
 spotifyforge curate reflow --harmonic               # Re-sequence by key + BPM (Camelot wheel)
+spotifyforge curate covers                          # Generate + upload cover art
 spotifyforge curate curators                        # List curators who share your taste
 
 # Scheduling
@@ -304,6 +305,7 @@ spotifyforge/
     │   ├── curation.py          # Liked songs -> genre clusters -> flow-ordered playlists
     │   ├── audio_features.py    # Tempo/key by ISRC (Deezer, AcousticBrainz) + Camelot wheel
     │   ├── curators.py          # Find curators whose playlists overlap your library
+    │   ├── covers.py            # Generated playlist cover art (Pillow)
     │   └── scheduler.py         # APScheduler service + job dispatch
     ├── db/
     │   ├── engine.py            # SQLite engine, session helpers, init_db()

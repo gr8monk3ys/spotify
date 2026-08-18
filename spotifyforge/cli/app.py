@@ -1151,6 +1151,61 @@ def curate_curators(
     )
 
 
+@curate_app.command("covers")
+def curate_covers(
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace covers that are already set."
+    ),
+) -> None:
+    """Give your forged playlists generated cover art.
+
+    Spotify's default four-track mosaic makes a large catalogue look
+    automated. Each cover's colour is derived from the playlist's genre,
+    so it is stable across runs and the set reads as one collection.
+    """
+    from spotifyforge.core.curation import apply_covers, plan_catalogue
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+
+    async def _covers(sp):
+        plan = await plan_catalogue(sp, opts)
+        uploaded, failed = await apply_covers(
+            PlaylistManager(sp), sp, plan.specs, overwrite=overwrite
+        )
+        return uploaded, failed, len(plan.specs)
+
+    uploaded, failed, total = _run_spotify(
+        "Painting playlist covers...", "Failed to set covers", _covers
+    )
+
+    if not uploaded:
+        console.print(
+            Panel(
+                f"All {total} playlists already have artwork "
+                "(use [bold]--overwrite[/bold] to replace it).",
+                title="Nothing to paint",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[green]Set artwork on {len(uploaded)} playlist(s)[/green] of {total}."
+            + (f"\n[yellow]{len(failed)} failed[/yellow]" if failed else ""),
+            title="Covers",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+
 @curate_app.command("features")
 def curate_features(
     deep: bool = typer.Option(
