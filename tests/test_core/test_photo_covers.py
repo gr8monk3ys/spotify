@@ -19,16 +19,17 @@ from spotifyforge.core.photo_covers import (
     apply_photo_covers,
     choose_photo,
     load_picks,
+    queries_for,
     save_picks,
-    scene_query,
     to_cover,
 )
 
 
-def _photo_payload(photo_id: int, name: str = "Ana Lens") -> dict:
+def _photo_payload(photo_id: int, name: str = "Ana Lens", alt: str = "abstract paint") -> dict:
     return {
         "id": photo_id,
         "photographer": name,
+        "alt": alt,
         "url": f"https://www.pexels.com/photo/{photo_id}/",
         "src": {"large2x": f"https://images.pexels.com/{photo_id}.jpg"},
     }
@@ -62,10 +63,14 @@ def _pexels(responses: dict[str, list[dict]], limit_after: int | None = None):
 # ---------------------------------------------------------------------------
 
 
-def test_scene_query_maps_families_and_defaults():
-    assert "saxophone" in scene_query("latin jazz")
-    assert "neon" in scene_query("hard techno")
-    assert scene_query("zeuhl") == "abstract film grain texture"
+def test_queries_lean_abstract_and_spread_the_tail():
+    jazz = queries_for("blue hours, hard bop", "bebop")
+    assert jazz[0] == "bebop abstract"
+    assert "smoke abstract dark blue" in jazz
+    # Genres with no family still get a per-title art pool, not one
+    # shared query — that sharing is what caused repeated covers.
+    tails = {queries_for(f"playlist {i}", "zeuhl")[-1] for i in range(12)}
+    assert len(tails) > 1
 
 
 def test_to_cover_squares_grades_and_fits_limit():
@@ -87,25 +92,40 @@ def test_picks_roundtrip(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-async def test_choose_photo_is_stable_and_falls_back_to_scene():
-    photos = [_photo_payload(i) for i in range(5)]
-    source, _ = _pexels({"saxophone smoke dark stage": photos})
+async def test_choose_photo_is_stable_unique_and_person_free():
+    photos = [_photo_payload(i) for i in range(4)]
+    photos[2]["alt"] = "man playing saxophone"  # person → never chosen
+    source, _ = _pexels({"smoke abstract dark blue": photos})
     try:
-        # "bebop" itself finds nothing; the jazz scene fallback does.
-        first = await choose_photo(source, "blue hours, hard bop", "bebop")
-        again = await choose_photo(source, "blue hours, hard bop", "bebop")
-        other = await choose_photo(source, "the bebop index", "bebop")
+        # "bebop abstract" finds nothing; the jazz scene fallback does.
+        first = await choose_photo(source, "blue hours, hard bop", "bebop", set())
+        again = await choose_photo(source, "blue hours, hard bop", "bebop", set())
+        other = await choose_photo(source, "the bebop index", "bebop", {first["photo_id"]})
     finally:
         await source.close()
-    assert first is not None and first["query"] == "saxophone smoke dark stage"
+    assert first is not None and first["query"] == "smoke abstract dark blue"
     assert first == again  # hashed from the title → stable
-    assert other is not None  # same query pool, own pick
+    assert other is not None
+    assert other["photo_id"] != first["photo_id"]  # account-wide unique
+    assert first["photo_id"] != 2 and other["photo_id"] != 2  # no people
+
+
+async def test_search_cache_spends_quota_once_per_query():
+    source, calls = _pexels({"smoke abstract dark blue": [_photo_payload(1), _photo_payload(2)]})
+    try:
+        await choose_photo(source, "a", "bebop", set())
+        await choose_photo(source, "b", "bebop", set())
+    finally:
+        await source.close()
+    # First playlist: empty "bebop abstract" + the scene hit = 2 calls.
+    # Second playlist: both answered from cache = 0 calls.
+    assert calls["n"] == 2
 
 
 async def test_choose_photo_none_when_nothing_matches():
     source, _ = _pexels({})
     try:
-        assert await choose_photo(source, "t", "zeuhl") is None
+        assert await choose_photo(source, "t", "zeuhl", set()) is None
     finally:
         await source.close()
 
@@ -125,8 +145,8 @@ async def test_apply_uploads_skips_pinned_and_records_attribution(
     sp = client_for("user1")
     source, calls = _pexels(
         {
-            "coldwave": [_photo_payload(1)],
-            "marble rooms": [_photo_payload(2, name="Béla Stone")],
+            "coldwave abstract": [_photo_payload(1)],
+            "marble rooms abstract": [_photo_payload(2, name="Béla Stone")],
         }
     )
     targets = [("strictly coldwave", "pl1", "coldwave"), ("marble rooms", "pl2", "marble rooms")]
@@ -153,14 +173,16 @@ async def test_apply_pauses_on_rate_limit_and_resumes(fake_spotify, client_for, 
     path = tmp_path / "photo_covers.json"
     sp = client_for("user1")
     # Enough quota for the first playlist's search only ("a" then 429).
-    source, _ = _pexels({"va": [_photo_payload(1)], "vb": [_photo_payload(2)]}, limit_after=1)
+    source, _ = _pexels(
+        {"va abstract": [_photo_payload(1)], "vb abstract": [_photo_payload(2)]}, limit_after=1
+    )
     targets = [("a", "pl1", "va"), ("b", "pl2", "vb")]
     try:
         covered, failed, limited = await apply_photo_covers(sp, targets, source, path=path, delay=0)
         assert (covered, limited) == (["a"], True)
         assert "a" in load_picks(path)
 
-        fresh, _ = _pexels({"vb": [_photo_payload(2)]})
+        fresh, _ = _pexels({"vb abstract": [_photo_payload(2)]})
         try:
             covered, failed, limited = await apply_photo_covers(
                 sp, targets, fresh, path=path, delay=0
@@ -181,7 +203,9 @@ async def test_apply_tolerates_a_bad_photo(fake_spotify, client_for, tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "api.pexels.com":
             query = request.url.params["query"]
-            return httpx.Response(200, json={"photos": [_photo_payload(1 if query == "va" else 2)]})
+            return httpx.Response(
+                200, json={"photos": [_photo_payload(1 if query == "va abstract" else 2)]}
+            )
         if "1.jpg" in str(request.url):
             return httpx.Response(200, content=b"not an image")
         return httpx.Response(200, content=_jpeg_bytes())
