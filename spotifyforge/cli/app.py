@@ -1403,12 +1403,16 @@ def curate_features(
     """
     from spotifyforge.core.audio_features import feature_cache_path, gather_features
     from spotifyforge.core.curation import CurationEngine
+    from spotifyforge.core.expansion import load_expansions
 
     async def _fetch(sp):
         return await CurationEngine(sp).fetch_liked(max_tracks=max_tracks)
 
     tracks = _run_spotify("Reading your liked songs...", "Failed to read library", _fetch)
-    isrcs = sorted({t.isrc for t in tracks if t.isrc})
+    # Pinned expansion tracks play in the same playlists, so they need
+    # tempo/key just as much as the liked songs they sit between.
+    pinned = [t for entries in load_expansions().values() for t in entries]
+    isrcs = sorted({t.isrc for t in [*tracks, *pinned] if t.isrc})
 
     if deep:
         console.print(
@@ -1428,7 +1432,8 @@ def curate_features(
     keyed = sum(1 for f in features.values() if f.has_key)
     console.print(
         Panel(
-            f"Recordings with an ISRC: [bold]{len(isrcs)}[/bold] from {len(tracks)} tracks\n"
+            f"Recordings with an ISRC: [bold]{len(isrcs)}[/bold] "
+            f"from {len(tracks)} liked + {len(pinned)} pinned tracks\n"
             f"Newly resolved:          [bold]{learned}[/bold]\n"
             f"Tempo known:             [bold]{analysed}[/bold]\n"
             f"Key known:               [bold]{keyed}[/bold]"

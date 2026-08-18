@@ -699,6 +699,49 @@ class TestCurateStats:
         assert "Quiet Corner" in second.output
 
 
+class TestCurateFeatures:
+    def test_looks_up_pinned_expansion_isrcs_too(self, cli_env, monkeypatch):
+        from spotifyforge.core.curation import CurationTrack
+        from spotifyforge.core.expansion import save_expansions
+
+        fake = cli_env
+        fake.add_track("t1")
+        fake.save_track("user1", "t1")
+        _login(fake)
+        save_expansions(
+            {
+                ("coldwave", None): [
+                    CurationTrack(
+                        id="x",
+                        uri="spotify:track:x",
+                        name="X",
+                        artist_ids=("a",),
+                        artist_names=("A",),
+                        release_year=None,
+                        popularity=1,
+                        isrc="ISRCPINNED",
+                        genres=("coldwave",),
+                    )
+                ]
+            }
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        async def fake_gather(isrcs, deep=False, progress=None):
+            captured["isrcs"] = list(isrcs)
+            return {}, 0
+
+        monkeypatch.setattr("spotifyforge.core.audio_features.gather_features", fake_gather)
+
+        result = runner.invoke(app, ["curate", "features"])
+        assert result.exit_code == 0, result.stderr
+        # Pinned tracks sit in the same playlists as liked songs, so the
+        # lookup must cover both.
+        assert "ISRCPINNED" in captured["isrcs"]
+        assert "ISRCT1" in captured["isrcs"]
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
