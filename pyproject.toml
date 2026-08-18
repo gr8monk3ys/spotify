@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
     "tekore>=5.0,<7.0",
     "sqlmodel>=0.0.14",
-    "typer[all]>=0.12",
+    "typer>=0.12",
     "rich>=13.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
@@ -24,6 +24,10 @@ dependencies = [
     "cryptography>=42.0",
     "aiosqlite>=0.20",
     "alembic>=1.13",
+    # SQLAlchemy's async engine requires greenlet, but SQLAlchemy only
+    # declares it on some platforms — without this line, a clean install
+    # on macOS arm64 cannot boot the server.
+    "greenlet>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -62,10 +66,8 @@ select = ["E", "F", "I", "N", "W", "UP"]
 "tests/**/*.py" = ["N806", "E741", "E501"]
 # web/app.py: constants defined inside a closure use UPPER_CASE intentionally;
 # the HTML template strings include long inline CSS that cannot be wrapped.
+# E402: deps re-export sits after create_app() to avoid a circular import.
 "spotifyforge/web/app.py" = ["N806", "E402", "E501"]
-# web/routes.py: import is deliberately placed after the router objects it
-# depends on to break a circular import cycle.
-"spotifyforge/web/routes.py" = ["E402", "E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -90,10 +92,13 @@ ignore_errors = true
 module = "conftest"
 ignore_errors = true
 
-# SQLAlchemy DB layer and modules with untyped third-party dependencies:
-# dynamic column attributes (.in_, .ilike), untyped tekore/apscheduler/nicegui
-# calls, and SQLAlchemy generic dict usage are not understood by mypy without
-# additional stubs. Suppressed to keep CI green without requiring stub packages.
+# Untyped third-party libraries (tekore has no stubs; apscheduler's are
+# partial). First-party modules are all checked — no ignore_errors: the
+# blanket suppression previously hid every CLI/web/core interface-drift bug.
+[[tool.mypy.overrides]]
+module = ["apscheduler.*", "keyring.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = [
     "spotifyforge.db.repositories",
@@ -101,8 +106,22 @@ module = [
     "spotifyforge.cli.app",
     "spotifyforge.core.playlist_manager",
     "spotifyforge.core.scheduler",
+    "spotifyforge.core.clients",
+    "spotifyforge.core.discovery",
     "spotifyforge.web.app",
     "spotifyforge.web.deps",
     "spotifyforge.web.routes",
 ]
-ignore_errors = true
+# Dynamic SQLAlchemy column attributes and untyped tekore/apscheduler calls
+# make full strictness impractical without stub packages. Crucially,
+# check_untyped_defs stays on: function *bodies* are still fully checked
+# (attr-defined / call-arg / return-value — the checks that catch interface
+# drift); only the annotate-every-signature requirements are relaxed.
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+check_untyped_defs = true
+disallow_any_generics = false
+warn_return_any = false
+disallow_subclassing_any = false

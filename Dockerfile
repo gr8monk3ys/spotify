@@ -20,14 +20,13 @@ RUN apt-get update && \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install Python dependencies first (layer caching optimisation)
-COPY pyproject.toml ./
+# Copy the source and install. (A deps-only layer via `pip install .` from
+# pyproject.toml alone does not work: hatchling builds the *project*, which
+# needs README.md and the package sources present in the build context.)
+COPY pyproject.toml README.md ./
+COPY spotifyforge/ ./spotifyforge/
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
-
-# Copy the full source and re-install so the package itself is on the path
-COPY . .
-RUN pip install --no-cache-dir .
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — minimal image with only what we need

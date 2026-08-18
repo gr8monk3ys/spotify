@@ -1,13 +1,15 @@
 """Comprehensive tests for SpotifyForge SQLModel table models and Pydantic schemas.
 
 Covers enum members, model instantiation, field defaults, schema validation,
-partial-update semantics, from_attributes round-tripping, and JSON field handling.
+partial-update semantics, from_attributes round-tripping, JSON field handling,
+timezone helpers, and database-level constraints.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
+from sqlmodel import Session, select
 
 from spotifyforge.models.models import (
     # Table models
@@ -35,6 +37,8 @@ from spotifyforge.models.models import (
     Track,
     TrackResponse,
     User,
+    as_utc,
+    utc_now,
 )
 
 # ============================================================================
@@ -70,25 +74,37 @@ class TestAudioFeaturesSourceEnum:
 
 
 class TestJobTypeEnum:
-    """JobType should expose exactly six members."""
+    """JobType is the single job vocabulary: five members, each with a handler."""
 
     EXPECTED = {
-        "playlist_update",
-        "playlist_sync",
-        "playlist_archive",
-        "discovery_refresh",
-        "stats_snapshot",
-        "health_check",
+        "sync",
+        "archive",
+        "deduplicate",
+        "genre_refresh",
+        "time_capsule",
     }
 
     def test_member_count(self) -> None:
-        assert len(JobType) == 6
+        assert len(JobType) == 5
 
     def test_member_values(self) -> None:
         assert {m.value for m in JobType} == self.EXPECTED
 
     @pytest.mark.parametrize(
         "name",
+        [
+            "sync",
+            "archive",
+            "deduplicate",
+            "genre_refresh",
+            "time_capsule",
+        ],
+    )
+    def test_lookup_by_value(self, name) -> None:
+        assert JobType(name) is not None
+
+    @pytest.mark.parametrize(
+        "old_name",
         [
             "playlist_update",
             "playlist_sync",
@@ -98,8 +114,52 @@ class TestJobTypeEnum:
             "health_check",
         ],
     )
-    def test_lookup_by_value(self, name) -> None:
-        assert JobType(name) is not None
+    def test_old_members_are_gone(self, old_name) -> None:
+        """The pre-rewrite job vocabulary must not be storable."""
+        with pytest.raises(ValueError):
+            JobType(old_name)
+
+    def test_every_member_has_a_scheduler_handler(self) -> None:
+        """Each JobType member dispatches to a real handler in core.scheduler."""
+        from spotifyforge.core.scheduler import SchedulerService
+
+        handler_names = {
+            JobType.sync: "_handle_sync",
+            JobType.archive: "_handle_archive",
+            JobType.deduplicate: "_handle_deduplicate",
+            JobType.genre_refresh: "_handle_genre_refresh",
+            JobType.time_capsule: "_handle_time_capsule",
+        }
+        assert set(handler_names) == set(JobType)
+        for name in handler_names.values():
+            assert callable(getattr(SchedulerService, name))
+
+
+class TestTimestampHelpers:
+    """utc_now()/as_utc() back every model timestamp."""
+
+    def test_utc_now_is_timezone_aware(self) -> None:
+        now = utc_now()
+        assert now.tzinfo is UTC
+
+    def test_as_utc_none_passthrough(self) -> None:
+        assert as_utc(None) is None
+
+    def test_as_utc_attaches_utc_to_naive(self) -> None:
+        naive = datetime(2025, 6, 1, 12, 0, 0)
+        result = as_utc(naive)
+        assert result == datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_as_utc_preserves_existing_tzinfo(self) -> None:
+        aware = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
+        assert as_utc(aware) is aware
+
+    def test_model_default_timestamps_are_aware(self) -> None:
+        user = User(spotify_id="tz_user")
+        assert user.created_at.tzinfo is UTC
+        assert user.updated_at.tzinfo is UTC
+        track = Track(spotify_id="tz_track", name="T")
+        assert track.cached_at.tzinfo is UTC
 
 
 class TestRuleTypeEnum:
@@ -360,6 +420,40 @@ class TestPlaylistTrackModel:
         assert pt.position == 3
 
 
+class TestPlaylistTrackDuplicatesAllowed:
+    """Spotify playlists can contain the same track at multiple positions.
+
+    The old UniqueConstraint(playlist_id, track_id) is gone: sync must be
+    able to mirror duplicates, so inserting the same (playlist, track) pair
+    twice at different positions has to commit cleanly.
+    """
+
+    def test_same_track_twice_commits(self, db_session: Session) -> None:
+        user = User(spotify_id="dup_user")
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+
+        track = Track(spotify_id="dup_track", name="Repeated Song")
+        playlist = Playlist(spotify_id="dup_pl", owner_id=user.id, name="Dupes")
+        db_session.add(track)
+        db_session.add(playlist)
+        db_session.commit()
+        db_session.refresh(track)
+        db_session.refresh(playlist)
+
+        db_session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=0))
+        db_session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=2))
+        db_session.commit()  # must not raise IntegrityError
+
+        rows = db_session.exec(
+            select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist.id)
+        ).all()
+        assert len(rows) == 2
+        assert {r.position for r in rows} == {0, 2}
+        assert all(r.track_id == track.id for r in rows)
+
+
 class TestScheduledJobModel:
     """ScheduledJob model instantiation and defaults."""
 
@@ -367,18 +461,18 @@ class TestScheduledJobModel:
         job = ScheduledJob(
             user_id=1,
             name="Nightly sync",
-            job_type=JobType.playlist_sync,
+            job_type=JobType.sync,
             cron_expression="0 0 * * *",
         )
         assert job.user_id == 1
         assert job.name == "Nightly sync"
-        assert job.job_type == JobType.playlist_sync
+        assert job.job_type == JobType.sync
 
     def test_defaults(self) -> None:
         job = ScheduledJob(
             user_id=1,
             name="J",
-            job_type=JobType.health_check,
+            job_type=JobType.deduplicate,
             cron_expression="*/5 * * * *",
         )
         assert job.enabled is True
@@ -393,7 +487,7 @@ class TestScheduledJobModel:
         job = ScheduledJob(
             user_id=1,
             name="Configured",
-            job_type=JobType.discovery_refresh,
+            job_type=JobType.genre_refresh,
             cron_expression="0 12 * * *",
             config={"max_tracks": 50, "genre": "electronic"},
         )
@@ -539,11 +633,11 @@ class TestScheduledJobCreateSchema:
     def test_valid(self) -> None:
         sj = ScheduledJobCreate(
             name="Daily sync",
-            job_type=JobType.playlist_sync,
+            job_type=JobType.sync,
             cron_expression="0 0 * * *",
         )
         assert sj.name == "Daily sync"
-        assert sj.job_type == JobType.playlist_sync
+        assert sj.job_type == JobType.sync
         assert sj.cron_expression == "0 0 * * *"
         assert sj.enabled is True
         assert sj.playlist_id is None
@@ -553,7 +647,7 @@ class TestScheduledJobCreateSchema:
         with pytest.raises(ValidationError):
             ScheduledJobCreate(
                 name="",
-                job_type=JobType.health_check,
+                job_type=JobType.deduplicate,
                 cron_expression="* * * * *",
             )
 
@@ -561,18 +655,35 @@ class TestScheduledJobCreateSchema:
         with pytest.raises(ValidationError):
             ScheduledJobCreate(
                 name="Job",
-                job_type=JobType.health_check,
+                job_type=JobType.deduplicate,
                 cron_expression="",
             )
 
     def test_with_config(self) -> None:
         sj = ScheduledJobCreate(
             name="Discovery",
-            job_type=JobType.discovery_refresh,
+            job_type=JobType.genre_refresh,
             cron_expression="0 6 * * *",
             config={"seeds": ["pop", "rock"]},
         )
         assert sj.config == {"seeds": ["pop", "rock"]}
+
+    def test_accepts_string_job_type(self) -> None:
+        """JSON carries the enum as its string value; strict=False on the field."""
+        sj = ScheduledJobCreate(
+            name="String type",
+            job_type="time_capsule",
+            cron_expression="0 0 1 * *",
+        )
+        assert sj.job_type is JobType.time_capsule
+
+    def test_rejects_unknown_job_type(self) -> None:
+        with pytest.raises(ValidationError):
+            ScheduledJobCreate(
+                name="Bad type",
+                job_type="stats_snapshot",
+                cron_expression="0 0 * * *",
+            )
 
 
 class TestCurationRuleCreateSchema:
@@ -645,7 +756,7 @@ class TestPlaylistResponseSchema:
         assert resp.created_at == now
 
     def test_nullable_fields(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         pl = Playlist(
             id=2,
             spotify_id="sp_pl_2",
@@ -693,7 +804,7 @@ class TestTrackResponseSchema:
         assert resp.cached_at == now
 
     def test_json_field_multiple_artists(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         track = Track(
             id=11,
             spotify_id="sp_t_11",
@@ -706,7 +817,7 @@ class TestTrackResponseSchema:
         assert resp.artist_names == ["Artist A", "Artist B", "Artist C"]
 
     def test_nullable_fields(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         track = Track(
             id=12,
             spotify_id="sp_t_12",
@@ -755,7 +866,7 @@ class TestAudioFeaturesResponseSchema:
         assert resp.cached_at == now
 
     def test_nullable_feature_fields(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         af = AudioFeatures(
             id=2,
             track_id=20,
@@ -778,7 +889,7 @@ class TestScheduledJobResponseSchema:
             id=5,
             user_id=1,
             name="Nightly update",
-            job_type=JobType.playlist_update,
+            job_type=JobType.archive,
             playlist_id=10,
             config={"max": 100},
             cron_expression="0 0 * * *",
@@ -792,18 +903,18 @@ class TestScheduledJobResponseSchema:
         assert resp.id == 5
         assert resp.user_id == 1
         assert resp.name == "Nightly update"
-        assert resp.job_type == JobType.playlist_update
+        assert resp.job_type == JobType.archive
         assert resp.config == {"max": 100}
         assert resp.cron_expression == "0 0 * * *"
         assert resp.enabled is True
 
     def test_nullable_fields(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         job = ScheduledJob(
             id=6,
             user_id=2,
             name="Minimal",
-            job_type=JobType.health_check,
+            job_type=JobType.deduplicate,
             cron_expression="*/5 * * * *",
             created_at=now,
             updated_at=now,
@@ -844,7 +955,7 @@ class TestCurationRuleResponseSchema:
         assert resp.priority == 5
 
     def test_nullable_fields(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         rule = CurationRule(
             id=4,
             user_id=2,
@@ -947,7 +1058,7 @@ class TestJsonFieldSerialization:
         job = ScheduledJob(
             user_id=1,
             name="Nested",
-            job_type=JobType.stats_snapshot,
+            job_type=JobType.time_capsule,
             cron_expression="0 0 * * 0",
             config={
                 "metrics": ["plays", "saves"],

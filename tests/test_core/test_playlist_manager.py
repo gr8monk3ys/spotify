@@ -1,88 +1,46 @@
-"""Comprehensive tests for PlaylistManager.
+"""Tests for PlaylistManager.
 
-All Tekore Spotify client interactions and database sessions are mocked so
-these tests run entirely in-process with no network or filesystem I/O.
+Request/response behavior (pagination, chunking, dedup ordering, DB sync)
+runs against the in-memory FakeSpotify backend so the real tekore client
+stack is exercised. AsyncMock is used only for narrow unit tests such as
+error propagation.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import tekore as tk
+from sqlmodel import Session, select
 
 from spotifyforge.core.playlist_manager import _CHUNK_SIZE, PlaylistManager
+from spotifyforge.models.models import Playlist, PlaylistTrack, Track, User
 
 # ---------------------------------------------------------------------------
-# Helpers – lightweight stand-ins for Tekore response objects
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_track(
-    track_id: str = "t1",
-    name: str = "Track One",
-    uri: str | None = None,
-    popularity: int = 50,
-    duration_ms: int = 200_000,
-    artist_names: list[str] | None = None,
-    album_name: str = "Album",
-    album_id: str = "alb1",
-):
-    """Return a SimpleNamespace that looks like a Tekore FullTrack."""
-    if uri is None:
-        uri = f"spotify:track:{track_id}"
-    artists = [SimpleNamespace(name=n) for n in (artist_names or ["Artist"])]
-    album = SimpleNamespace(name=album_name, id=album_id)
-    external_ids = SimpleNamespace(isrc="USRC12345678")
-    return SimpleNamespace(
-        id=track_id,
-        name=name,
-        uri=uri,
-        popularity=popularity,
-        duration_ms=duration_ms,
-        artists=artists,
-        album=album,
-        external_ids=external_ids,
-    )
+def _uri(track_id: str) -> str:
+    return f"spotify:track:{track_id}"
 
 
-def _make_playlist_item(track=None, added_at=None, added_by=None):
-    """Return a SimpleNamespace that looks like a Tekore PlaylistTrack item."""
-    if track is None:
-        track = _make_track()
-    added_by_ns = SimpleNamespace(id=added_by) if added_by else None
-    return SimpleNamespace(track=track, added_at=added_at, added_by=added_by_ns)
+def _create_db_user(spotify_id: str = "user1") -> int:
+    """Insert a local User row (isolated_db must be active) and return its PK."""
+    from spotifyforge.db.engine import get_engine
+
+    with Session(get_engine()) as session:
+        user = User(spotify_id=spotify_id)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        return user.id
 
 
-def _make_paging(items, next_url=None, total=None):
-    """Return a SimpleNamespace that looks like a Tekore Paging object."""
-    return SimpleNamespace(
-        items=items,
-        next=next_url,
-        total=total if total is not None else len(items),
-    )
-
-
-def _make_spotify_playlist(
-    playlist_id: str = "pl1",
-    name: str = "My Playlist",
-    description: str = "desc",
-    public: bool = True,
-    collaborative: bool = False,
-    snapshot_id: str = "snap_abc",
-    total_tracks: int = 5,
-):
-    """Return a SimpleNamespace mimicking a Tekore FullPlaylist."""
-    return SimpleNamespace(
-        id=playlist_id,
-        name=name,
-        description=description,
-        public=public,
-        collaborative=collaborative,
-        snapshot_id=snapshot_id,
-        tracks=SimpleNamespace(total=total_tracks),
-    )
+def _requests_for(fake, method: str, path: str) -> list[tuple[str, str]]:
+    return [r for r in fake.requests if r[0] == method and r[1] == path]
 
 
 # ---------------------------------------------------------------------------
@@ -91,87 +49,94 @@ def _make_spotify_playlist(
 
 
 @pytest.fixture()
-def mock_spotify():
-    """Return an AsyncMock standing in for a tekore.Spotify client."""
-    sp = AsyncMock()
-    return sp
+async def client_for(fake_spotify):
+    """Factory building real async tekore clients wired to the fake backend."""
+    clients: list[tk.Spotify] = []
+
+    def make(user_id: str = "user1") -> tk.Spotify:
+        client = fake_spotify.async_client(user_id)
+        clients.append(client)
+        return client
+
+    yield make
+    for client in clients:
+        await client.close()
 
 
 @pytest.fixture()
-def manager(mock_spotify):
-    """Return a PlaylistManager wired to the mock Spotify client."""
+def mock_spotify():
+    """AsyncMock stand-in, for narrow unit tests (error propagation etc.)."""
+    return AsyncMock()
+
+
+@pytest.fixture()
+def mock_manager(mock_spotify):
     return PlaylistManager(mock_spotify)
 
 
+def _http_error() -> tk.HTTPError:
+    return tk.HTTPError("boom", request=MagicMock(), response=MagicMock())
+
+
 # ===================================================================
-# add_tracks
+# add_tracks (FakeSpotify: chunking and position are request behavior)
 # ===================================================================
 
 
 class TestAddTracks:
-    """Tests for PlaylistManager.add_tracks."""
+    async def test_add_appends_in_order(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        fake_spotify.add_playlist("pl", track_ids=["seed"])
+        manager = PlaylistManager(client_for())
 
-    async def test_add_single_chunk(self, manager, mock_spotify):
-        """Tracks <= 100 should produce exactly one API call."""
-        uris = [f"spotify:track:{i}" for i in range(50)]
-        mock_spotify.playlist_add.return_value = "snap_1"
+        snapshot = await manager.add_tracks("pl", [_uri("a"), _uri("b")])
 
-        result = await manager.add_tracks("pl1", uris)
+        assert fake_spotify.playlist_tracks["pl"] == ["seed", "a", "b"]
+        assert snapshot == fake_spotify.playlists["pl"]["snapshot_id"]
 
-        assert result == "snap_1"
-        mock_spotify.playlist_add.assert_awaited_once_with("pl1", uris, position=None)
+    async def test_add_over_100_chunks_requests(self, fake_spotify, client_for):
+        """250 URIs must arrive as 3 POSTs and land in order."""
+        fake_spotify.add_user("user1")
+        fake_spotify.add_playlist("pl")
+        manager = PlaylistManager(client_for())
+        ids = [f"t{i:03d}" for i in range(250)]
 
-    async def test_add_exactly_100_tracks(self, manager, mock_spotify):
-        """Exactly _CHUNK_SIZE tracks should produce one API call."""
-        uris = [f"spotify:track:{i}" for i in range(100)]
-        mock_spotify.playlist_add.return_value = "snap_1"
+        await manager.add_tracks("pl", [_uri(i) for i in ids])
 
-        await manager.add_tracks("pl1", uris)
+        assert fake_spotify.playlist_tracks["pl"] == ids
+        posts = _requests_for(fake_spotify, "POST", "/v1/playlists/pl/tracks")
+        assert len(posts) == 3
 
-        assert mock_spotify.playlist_add.await_count == 1
+    async def test_add_with_position_across_chunks(self, fake_spotify, client_for):
+        """Each chunk's insert position is offset so order is preserved."""
+        fake_spotify.add_user("user1")
+        fake_spotify.add_playlist("pl", track_ids=["a", "b", "c"])
+        manager = PlaylistManager(client_for())
+        new_ids = [f"n{i:03d}" for i in range(150)]
 
-    async def test_add_multiple_chunks(self, manager, mock_spotify):
-        """250 tracks should produce ceil(250/100) == 3 API calls."""
-        uris = [f"spotify:track:{i}" for i in range(250)]
-        mock_spotify.playlist_add.return_value = "snap_final"
+        await manager.add_tracks("pl", [_uri(i) for i in new_ids], position=1)
 
-        result = await manager.add_tracks("pl1", uris)
+        assert fake_spotify.playlist_tracks["pl"] == ["a", *new_ids, "b", "c"]
 
-        assert result == "snap_final"
-        assert mock_spotify.playlist_add.await_count == 3
+    async def test_add_empty_list_makes_no_requests(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        fake_spotify.add_playlist("pl")
+        manager = PlaylistManager(client_for())
 
-        # Verify chunk sizes: 100, 100, 50.
-        calls = mock_spotify.playlist_add.call_args_list
-        assert len(calls[0].args[1]) == 100
-        assert len(calls[1].args[1]) == 100
-        assert len(calls[2].args[1]) == 50
-
-    async def test_add_tracks_with_position(self, manager, mock_spotify):
-        """When *position* is given, each chunk offset should be added to it."""
-        uris = [f"spotify:track:{i}" for i in range(150)]
-        mock_spotify.playlist_add.return_value = "snap_x"
-
-        await manager.add_tracks("pl1", uris, position=10)
-
-        calls = mock_spotify.playlist_add.call_args_list
-        assert calls[0].kwargs["position"] == 10  # first chunk at 10
-        assert calls[1].kwargs["position"] == 110  # second chunk at 10+100
-
-    async def test_add_tracks_empty_list(self, manager, mock_spotify):
-        """An empty URI list should make zero API calls and return ''."""
-        result = await manager.add_tracks("pl1", [])
+        result = await manager.add_tracks("pl", [])
 
         assert result == ""
-        mock_spotify.playlist_add.assert_not_awaited()
+        assert _requests_for(fake_spotify, "POST", "/v1/playlists/pl/tracks") == []
 
-    async def test_add_tracks_api_error_propagates(self, manager, mock_spotify):
-        """An HTTPError from Tekore should propagate to the caller."""
-        mock_spotify.playlist_add.side_effect = tk.HTTPError(
-            "server error", request=MagicMock(), response=MagicMock()
-        )
+    async def test_add_tracks_api_error_propagates(self, mock_manager, mock_spotify):
+        mock_spotify.playlist_add.side_effect = _http_error()
 
         with pytest.raises(tk.HTTPError):
-            await manager.add_tracks("pl1", ["spotify:track:1"])
+            await mock_manager.add_tracks("pl1", [_uri("x")])
+
+    async def test_chunk_size_constant(self):
+        """Spotify's documented per-request limit."""
+        assert _CHUNK_SIZE == 100
 
 
 # ===================================================================
@@ -180,44 +145,43 @@ class TestAddTracks:
 
 
 class TestRemoveTracks:
-    """Tests for PlaylistManager.remove_tracks."""
+    async def test_remove_deletes_every_occurrence(self, fake_spotify, client_for):
+        """Spotify's remove-by-URI semantics: all copies of a URI go."""
+        fake_spotify.add_user("user1")
+        fake_spotify.add_playlist("pl", track_ids=["a", "b", "a", "c"])
+        manager = PlaylistManager(client_for())
 
-    async def test_remove_single_chunk(self, manager, mock_spotify):
-        uris = [f"spotify:track:{i}" for i in range(30)]
-        mock_spotify.playlist_remove.return_value = "snap_r1"
+        await manager.remove_tracks("pl", [_uri("a")])
 
-        result = await manager.remove_tracks("pl1", uris)
+        assert fake_spotify.playlist_tracks["pl"] == ["b", "c"]
 
-        assert result == "snap_r1"
-        mock_spotify.playlist_remove.assert_awaited_once_with("pl1", uris)
+    async def test_remove_over_100_chunks_requests(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        ids = [f"t{i:03d}" for i in range(150)]
+        fake_spotify.add_playlist("pl", track_ids=ids + ["keep"])
+        manager = PlaylistManager(client_for())
 
-    async def test_remove_multiple_chunks(self, manager, mock_spotify):
-        """200 tracks requires 2 chunked API calls."""
-        uris = [f"spotify:track:{i}" for i in range(200)]
-        mock_spotify.playlist_remove.return_value = "snap_r2"
+        await manager.remove_tracks("pl", [_uri(i) for i in ids])
 
-        result = await manager.remove_tracks("pl1", uris)
+        assert fake_spotify.playlist_tracks["pl"] == ["keep"]
+        deletes = _requests_for(fake_spotify, "DELETE", "/v1/playlists/pl/tracks")
+        assert len(deletes) == 2
 
-        assert result == "snap_r2"
-        assert mock_spotify.playlist_remove.await_count == 2
+    async def test_remove_empty_list_makes_no_requests(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        fake_spotify.add_playlist("pl", track_ids=["a"])
+        manager = PlaylistManager(client_for())
 
-        calls = mock_spotify.playlist_remove.call_args_list
-        assert len(calls[0].args[1]) == 100
-        assert len(calls[1].args[1]) == 100
-
-    async def test_remove_empty_list(self, manager, mock_spotify):
-        result = await manager.remove_tracks("pl1", [])
+        result = await manager.remove_tracks("pl", [])
 
         assert result == ""
-        mock_spotify.playlist_remove.assert_not_awaited()
+        assert fake_spotify.playlist_tracks["pl"] == ["a"]
 
-    async def test_remove_tracks_api_error(self, manager, mock_spotify):
-        mock_spotify.playlist_remove.side_effect = tk.HTTPError(
-            "bad request", request=MagicMock(), response=MagicMock()
-        )
+    async def test_remove_tracks_api_error_propagates(self, mock_manager, mock_spotify):
+        mock_spotify.playlist_remove.side_effect = _http_error()
 
         with pytest.raises(tk.HTTPError):
-            await manager.remove_tracks("pl1", ["spotify:track:1"])
+            await mock_manager.remove_tracks("pl1", [_uri("x")])
 
 
 # ===================================================================
@@ -226,102 +190,114 @@ class TestRemoveTracks:
 
 
 class TestGetPlaylistTracks:
-    """Tests for PlaylistManager.get_playlist_tracks."""
+    async def test_paginates_past_100(self, fake_spotify, client_for):
+        """250 tracks arrive across 3 pages and come back flat, in order."""
+        fake_spotify.add_user("user1")
+        ids = [f"t{i:03d}" for i in range(250)]
+        for tid in ids:
+            fake_spotify.add_track(tid)
+        fake_spotify.add_playlist("pl", track_ids=ids)
+        manager = PlaylistManager(client_for())
 
-    async def test_single_page(self, manager, mock_spotify):
-        """When next is None, only the first page is returned."""
-        items = [_make_playlist_item(_make_track(f"t{i}")) for i in range(3)]
-        mock_spotify.playlist_items.return_value = _make_paging(items, next_url=None)
+        items = await manager.get_playlist_tracks("pl")
 
-        result = await manager.get_playlist_tracks("pl1")
+        assert [item.track.id for item in items] == ids
+        gets = _requests_for(fake_spotify, "GET", "/v1/playlists/pl/tracks")
+        assert len(gets) == 3
 
-        assert len(result) == 3
-        mock_spotify.playlist_items.assert_awaited_once_with("pl1", limit=100)
-        mock_spotify.next.assert_not_awaited()
+    async def test_empty_playlist(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        fake_spotify.add_playlist("pl")
+        manager = PlaylistManager(client_for())
 
-    async def test_multiple_pages(self, manager, mock_spotify):
-        """Multiple pages should be auto-fetched until next is None."""
-        page1_items = [_make_playlist_item(_make_track(f"t{i}")) for i in range(100)]
-        page2_items = [_make_playlist_item(_make_track(f"t{i}")) for i in range(100, 150)]
+        assert await manager.get_playlist_tracks("pl") == []
 
-        page1 = _make_paging(page1_items, next_url="https://api.spotify.com/next")
-        page2 = _make_paging(page2_items, next_url=None)
-
-        mock_spotify.playlist_items.return_value = page1
-        mock_spotify.next.return_value = page2
-
-        result = await manager.get_playlist_tracks("pl1")
-
-        assert len(result) == 150
-        mock_spotify.next.assert_awaited_once_with(page1)
-
-    async def test_three_pages(self, manager, mock_spotify):
-        """Three pages of results are concatenated correctly."""
-        page1_items = [_make_playlist_item(_make_track(f"p1_{i}")) for i in range(100)]
-        page2_items = [_make_playlist_item(_make_track(f"p2_{i}")) for i in range(100)]
-        page3_items = [_make_playlist_item(_make_track(f"p3_{i}")) for i in range(42)]
-
-        page1 = _make_paging(page1_items, next_url="https://next1")
-        page2 = _make_paging(page2_items, next_url="https://next2")
-        page3 = _make_paging(page3_items, next_url=None)
-
-        mock_spotify.playlist_items.return_value = page1
-        mock_spotify.next.side_effect = [page2, page3]
-
-        result = await manager.get_playlist_tracks("pl1")
-
-        assert len(result) == 242
-        assert mock_spotify.next.await_count == 2
-
-    async def test_empty_playlist(self, manager, mock_spotify):
-        """An empty playlist returns an empty list."""
-        mock_spotify.playlist_items.return_value = _make_paging([], next_url=None)
-
-        result = await manager.get_playlist_tracks("pl1")
-
-        assert result == []
-
-    async def test_none_items_in_page(self, manager, mock_spotify):
-        """If page.items is None, treat as empty."""
-        mock_spotify.playlist_items.return_value = SimpleNamespace(items=None, next=None, total=0)
-
-        result = await manager.get_playlist_tracks("pl1")
-
-        assert result == []
-
-    async def test_pagination_returns_none(self, manager, mock_spotify):
-        """If self._sp.next() returns None, pagination should stop."""
-        page1_items = [_make_playlist_item(_make_track("t1"))]
-        page1 = _make_paging(page1_items, next_url="https://next")
-
-        mock_spotify.playlist_items.return_value = page1
-        mock_spotify.next.return_value = None
-
-        result = await manager.get_playlist_tracks("pl1")
-
-        assert len(result) == 1
-
-    async def test_get_tracks_api_error(self, manager, mock_spotify):
-        mock_spotify.playlist_items.side_effect = tk.HTTPError(
-            "not found", request=MagicMock(), response=MagicMock()
-        )
+    async def test_api_error_propagates(self, mock_manager, mock_spotify):
+        mock_spotify.playlist_items.side_effect = _http_error()
 
         with pytest.raises(tk.HTTPError):
-            await manager.get_playlist_tracks("pl1")
+            await mock_manager.get_playlist_tracks("pl1")
 
-    async def test_pagination_api_error(self, manager, mock_spotify):
-        """An error during pagination should propagate."""
-        page1 = _make_paging(
-            [_make_playlist_item(_make_track("t1"))],
-            next_url="https://next",
+    async def test_pagination_error_propagates(self, mock_manager, mock_spotify):
+        page1 = SimpleNamespace(
+            items=[SimpleNamespace(track=None, added_at=None, added_by=None)],
+            next="https://next",
         )
         mock_spotify.playlist_items.return_value = page1
-        mock_spotify.next.side_effect = tk.HTTPError(
-            "server error", request=MagicMock(), response=MagicMock()
-        )
+        mock_spotify.next.side_effect = _http_error()
 
         with pytest.raises(tk.HTTPError):
-            await manager.get_playlist_tracks("pl1")
+            await mock_manager.get_playlist_tracks("pl1")
+
+
+# ===================================================================
+# get_user_playlists
+# ===================================================================
+
+
+class TestGetUserPlaylists:
+    async def test_lists_playlists_without_followers_key(self, fake_spotify, client_for):
+        """The list endpoint carries no follower counts, so dicts must not either."""
+        fake_spotify.add_user("user1")
+        fake_spotify.add_track("t1")
+        fake_spotify.add_playlist("pl1", name="First", track_ids=["t1"], public=True)
+        fake_spotify.add_playlist("pl2", name="Second", public=False)
+        manager = PlaylistManager(client_for())
+
+        playlists = await manager.get_user_playlists()
+
+        assert len(playlists) == 2
+        by_id = {p["id"]: p for p in playlists}
+        assert set(by_id["pl1"]) == {"id", "name", "track_count", "public"}
+        assert by_id["pl1"]["name"] == "First"
+        assert by_id["pl1"]["track_count"] == 1
+        assert by_id["pl1"]["public"] is True
+        assert by_id["pl2"]["public"] is False
+
+    async def test_paginates_past_50(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        for i in range(60):
+            fake_spotify.add_playlist(f"pl{i:02d}", name=f"PL {i}")
+        manager = PlaylistManager(client_for())
+
+        playlists = await manager.get_user_playlists()
+
+        assert len(playlists) == 60
+        gets = _requests_for(fake_spotify, "GET", "/v1/users/user1/playlists")
+        assert len(gets) == 2
+
+    async def test_api_error_propagates(self, mock_manager, mock_spotify):
+        mock_spotify.current_user.side_effect = _http_error()
+
+        with pytest.raises(tk.HTTPError):
+            await mock_manager.get_user_playlists()
+
+
+# ===================================================================
+# get_playlist_details
+# ===================================================================
+
+
+class TestGetPlaylistDetails:
+    async def test_meta_and_tracks(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        fake_spotify.add_track("t1", name="Song One")
+        fake_spotify.add_track("t2", name="Song Two")
+        fake_spotify.add_playlist("pl", name="Detail PL", track_ids=["t1", "t2"])
+        manager = PlaylistManager(client_for())
+
+        details = await manager.get_playlist_details("pl")
+
+        assert details["meta"]["name"] == "Detail PL"
+        assert details["meta"]["track_count"] == 2
+        assert [t["name"] for t in details["tracks"]] == ["Song One", "Song Two"]
+        assert details["tracks"][0]["uri"] == _uri("t1")
+
+    async def test_api_error_propagates(self, mock_manager, mock_spotify):
+        mock_spotify.playlist.side_effect = _http_error()
+
+        with pytest.raises(tk.HTTPError):
+            await mock_manager.get_playlist_details("pl1")
 
 
 # ===================================================================
@@ -330,239 +306,124 @@ class TestGetPlaylistTracks:
 
 
 class TestDeduplicate:
-    """Tests for PlaylistManager.deduplicate."""
+    async def test_no_duplicates_is_a_noop(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        for tid in ("a", "b", "c"):
+            fake_spotify.add_track(tid)
+        fake_spotify.add_playlist("pl", track_ids=["a", "b", "c"])
+        manager = PlaylistManager(client_for())
 
-    async def test_no_duplicates(self, manager, mock_spotify):
-        """When there are no duplicates, no remove call is made."""
-        items = [
-            _make_playlist_item(_make_track("t1", uri="spotify:track:t1")),
-            _make_playlist_item(_make_track("t2", uri="spotify:track:t2")),
-            _make_playlist_item(_make_track("t3", uri="spotify:track:t3")),
+        removed = await manager.deduplicate("pl")
+
+        assert removed == 0
+        assert fake_spotify.playlist_tracks["pl"] == ["a", "b", "c"]
+        assert _requests_for(fake_spotify, "DELETE", "/v1/playlists/pl/tracks") == []
+        assert _requests_for(fake_spotify, "POST", "/v1/playlists/pl/tracks") == []
+
+    async def test_removes_all_copies_then_reinserts_in_place(self, fake_spotify, client_for):
+        """Order-preserving: the final playlist is the original sequence with
+        2nd+ occurrences dropped, and the count is duplicate *occurrences*."""
+        fake_spotify.add_user("user1")
+        for tid in ("a", "b", "c"):
+            fake_spotify.add_track(tid)
+        fake_spotify.add_playlist("pl", track_ids=["a", "b", "a", "c", "b", "a"])
+        manager = PlaylistManager(client_for())
+
+        removed = await manager.deduplicate("pl")
+
+        assert removed == 3  # extra a (x2) + extra b (x1)
+        assert fake_spotify.playlist_tracks["pl"] == ["a", "b", "c"]
+
+    async def test_remove_happens_before_reinsert(self, fake_spotify, client_for):
+        """Remove-by-URI kills every copy, so the kept copy must be re-added
+        afterwards — DELETE first, then POST."""
+        fake_spotify.add_user("user1")
+        for tid in ("x", "a"):
+            fake_spotify.add_track(tid)
+        fake_spotify.add_playlist("pl", track_ids=["x", "a", "a"])
+        manager = PlaylistManager(client_for())
+
+        removed = await manager.deduplicate("pl")
+
+        assert removed == 1
+        assert fake_spotify.playlist_tracks["pl"] == ["x", "a"]
+        mutations = [
+            m
+            for m, p in fake_spotify.requests
+            if p == "/v1/playlists/pl/tracks" and m in ("POST", "DELETE")
         ]
-        mock_spotify.playlist_items.return_value = _make_paging(items, next_url=None)
+        assert mutations == ["DELETE", "POST"]
 
-        removed = await manager.deduplicate("pl1")
+    async def test_duplicate_of_first_track_keeps_position_zero(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        for tid in ("a", "b"):
+            fake_spotify.add_track(tid)
+        fake_spotify.add_playlist("pl", track_ids=["a", "a", "b"])
+        manager = PlaylistManager(client_for())
+
+        removed = await manager.deduplicate("pl")
+
+        assert removed == 1
+        assert fake_spotify.playlist_tracks["pl"] == ["a", "b"]
+
+    async def test_over_100_duplicated_uris_chunk_the_removal(self, fake_spotify, client_for):
+        ids = [f"t{i:03d}" for i in range(120)]
+        fake_spotify.add_user("user1")
+        for tid in ids:
+            fake_spotify.add_track(tid)
+        fake_spotify.add_playlist("pl", track_ids=ids + ids)  # every track duplicated
+        manager = PlaylistManager(client_for())
+
+        removed = await manager.deduplicate("pl")
+
+        assert removed == 120
+        assert fake_spotify.playlist_tracks["pl"] == ids
+        deletes = _requests_for(fake_spotify, "DELETE", "/v1/playlists/pl/tracks")
+        assert len(deletes) == 2
+
+    async def test_skips_items_without_track_or_uri(self, mock_manager, mock_spotify):
+        """Local/unavailable items must not count as duplicates of None."""
+        track = SimpleNamespace(uri=_uri("a"))
+        items = [
+            SimpleNamespace(track=track, added_at=None, added_by=None),
+            SimpleNamespace(track=None, added_at=None, added_by=None),
+            SimpleNamespace(track=SimpleNamespace(uri=None), added_at=None, added_by=None),
+        ]
+        mock_spotify.playlist.return_value = SimpleNamespace(snapshot_id="snap")
+        mock_spotify.playlist_items.return_value = SimpleNamespace(items=items, next=None)
+
+        removed = await mock_manager.deduplicate("pl1")
 
         assert removed == 0
         mock_spotify.playlist_remove.assert_not_awaited()
 
-    async def test_with_duplicates(self, manager, mock_spotify):
-        """Duplicate URIs should be removed, keeping only the first occurrence."""
-        items = [
-            _make_playlist_item(_make_track("t1", uri="spotify:track:t1")),
-            _make_playlist_item(_make_track("t2", uri="spotify:track:t2")),
-            _make_playlist_item(_make_track("t1_dup", uri="spotify:track:t1")),  # dup of t1
-            _make_playlist_item(_make_track("t3", uri="spotify:track:t3")),
-            _make_playlist_item(_make_track("t2_dup", uri="spotify:track:t2")),  # dup of t2
-        ]
-        mock_spotify.playlist_items.return_value = _make_paging(items, next_url=None)
-        mock_spotify.playlist_remove.return_value = "snap_dedup"
-
-        removed = await manager.deduplicate("pl1")
-
-        assert removed == 2
-        # The remove call should contain exactly the duplicate URIs.
-        mock_spotify.playlist_remove.assert_awaited_once()
-        call_uris = mock_spotify.playlist_remove.call_args.args[1]
-        assert call_uris == ["spotify:track:t1", "spotify:track:t2"]
-
-    async def test_all_duplicates(self, manager, mock_spotify):
-        """A playlist where every track is repeated once."""
-        items = [
-            _make_playlist_item(_make_track("t1", uri="spotify:track:t1")),
-            _make_playlist_item(_make_track("t1_dup", uri="spotify:track:t1")),
-        ]
-        mock_spotify.playlist_items.return_value = _make_paging(items, next_url=None)
-        mock_spotify.playlist_remove.return_value = "snap_x"
-
-        removed = await manager.deduplicate("pl1")
-
-        assert removed == 1
-
-    async def test_skips_none_track(self, manager, mock_spotify):
-        """Items with track=None should be silently skipped."""
-        items = [
-            _make_playlist_item(_make_track("t1", uri="spotify:track:t1")),
-            SimpleNamespace(track=None, added_at=None, added_by=None),
-            _make_playlist_item(_make_track("t1_dup", uri="spotify:track:t1")),
-        ]
-        mock_spotify.playlist_items.return_value = _make_paging(items, next_url=None)
-        mock_spotify.playlist_remove.return_value = "snap_y"
-
-        removed = await manager.deduplicate("pl1")
-
-        assert removed == 1
-
-    async def test_skips_none_uri(self, manager, mock_spotify):
-        """Items where track.uri is None should be skipped."""
-        items = [
-            _make_playlist_item(_make_track("t1", uri=None)),
-            _make_playlist_item(_make_track("t2", uri="spotify:track:t2")),
-        ]
-        mock_spotify.playlist_items.return_value = _make_paging(items, next_url=None)
-
-        removed = await manager.deduplicate("pl1")
-
-        assert removed == 0
-
-
-# ===================================================================
-# snapshot_check
-# ===================================================================
-
-
-class TestSnapshotCheck:
-    """Tests for PlaylistManager.snapshot_check."""
-
-    async def test_snapshot_changed(self, manager, mock_spotify):
-        """Returns True when the remote snapshot differs from the known one."""
-        mock_spotify.playlist.return_value = SimpleNamespace(snapshot_id="snap_new")
-
-        changed = await manager.snapshot_check("pl1", "snap_old")
-
-        assert changed is True
-        mock_spotify.playlist.assert_awaited_once_with("pl1", fields="snapshot_id")
-
-    async def test_snapshot_unchanged(self, manager, mock_spotify):
-        """Returns False when the remote snapshot matches the known one."""
-        mock_spotify.playlist.return_value = SimpleNamespace(snapshot_id="snap_same")
-
-        changed = await manager.snapshot_check("pl1", "snap_same")
-
-        assert changed is False
-
-    async def test_snapshot_check_api_error(self, manager, mock_spotify):
-        mock_spotify.playlist.side_effect = tk.HTTPError(
-            "not found", request=MagicMock(), response=MagicMock()
-        )
+    async def test_api_error_propagates(self, mock_manager, mock_spotify):
+        mock_spotify.playlist.side_effect = _http_error()
 
         with pytest.raises(tk.HTTPError):
-            await manager.snapshot_check("pl1", "snap_old")
+            await mock_manager.deduplicate("pl1")
 
 
 # ===================================================================
-# create_playlist
-# ===================================================================
-
-
-class TestCreatePlaylist:
-    """Tests for PlaylistManager.create_playlist."""
-
-    @patch("spotifyforge.core.playlist_manager.get_async_session")
-    async def test_create_playlist_basic(self, mock_get_session, manager, mock_spotify):
-        """Verify the API is called with correct params and a DB row is created."""
-        # Mock the Spotify API responses.
-        mock_spotify.current_user.return_value = SimpleNamespace(id="user123")
-        mock_spotify.playlist_create.return_value = SimpleNamespace(
-            id="sp_new_pl",
-            name="Test Playlist",
-            snapshot_id="snap_new",
-        )
-
-        # Mock the async session context manager.
-        mock_session = AsyncMock()
-        mock_ctx = AsyncMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_get_session.return_value = mock_ctx
-
-        # Make session.refresh populate the model with an id.
-        async def _fake_refresh(obj):
-            obj.id = 42
-
-        mock_session.refresh.side_effect = _fake_refresh
-
-        result = await manager.create_playlist(
-            name="Test Playlist",
-            description="A test",
-            public=False,
-        )
-
-        # Verify Spotify API calls.
-        mock_spotify.current_user.assert_awaited_once()
-        mock_spotify.playlist_create.assert_awaited_once_with(
-            "user123",
-            "Test Playlist",
-            public=False,
-            description="A test",
-        )
-
-        # Verify the returned object.
-        assert result.spotify_id == "sp_new_pl"
-        assert result.name == "Test Playlist"
-        assert result.public is False
-
-    @patch("spotifyforge.core.playlist_manager.get_async_session")
-    async def test_create_playlist_default_params(self, mock_get_session, manager, mock_spotify):
-        """Defaults: public=True, description=''."""
-        mock_spotify.current_user.return_value = SimpleNamespace(id="user1")
-        mock_spotify.playlist_create.return_value = SimpleNamespace(
-            id="sp_pl2", name="PL", snapshot_id="snap2"
-        )
-
-        mock_session = AsyncMock()
-        mock_ctx = AsyncMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_get_session.return_value = mock_ctx
-
-        async def _fake_refresh(obj):
-            obj.id = 99
-
-        mock_session.refresh.side_effect = _fake_refresh
-
-        result = await manager.create_playlist(name="PL")
-
-        mock_spotify.playlist_create.assert_awaited_once_with(
-            "user1", "PL", public=True, description=""
-        )
-        assert result.public is True
-        assert result.description == ""
-
-    async def test_create_playlist_api_error(self, manager, mock_spotify):
-        """HTTPError during user lookup should propagate."""
-        mock_spotify.current_user.side_effect = tk.HTTPError(
-            "auth error", request=MagicMock(), response=MagicMock()
-        )
-
-        with pytest.raises(tk.HTTPError):
-            await manager.create_playlist(name="Fail")
-
-    async def test_create_playlist_api_error_on_create(self, manager, mock_spotify):
-        """HTTPError during playlist_create should propagate."""
-        mock_spotify.current_user.return_value = SimpleNamespace(id="user1")
-        mock_spotify.playlist_create.side_effect = tk.HTTPError(
-            "server error", request=MagicMock(), response=MagicMock()
-        )
-
-        with pytest.raises(tk.HTTPError):
-            await manager.create_playlist(name="Fail")
-
-
-# ===================================================================
-# reorder_tracks
+# reorder_tracks (no fake endpoint — unit tests against the mock)
 # ===================================================================
 
 
 class TestReorderTracks:
-    """Tests for PlaylistManager.reorder_tracks."""
-
-    async def test_reorder_default_range(self, manager, mock_spotify):
-        """Reorder a single track (range_length=1, the default)."""
+    async def test_reorder_default_range(self, mock_manager, mock_spotify):
         mock_spotify.playlist_reorder.return_value = "snap_reorder"
 
-        result = await manager.reorder_tracks("pl1", range_start=2, insert_before=5)
+        result = await mock_manager.reorder_tracks("pl1", range_start=2, insert_before=5)
 
         assert result == "snap_reorder"
         mock_spotify.playlist_reorder.assert_awaited_once_with(
             "pl1", range_start=2, insert_before=5, range_length=1
         )
 
-    async def test_reorder_block(self, manager, mock_spotify):
-        """Reorder a block of 3 tracks."""
+    async def test_reorder_block(self, mock_manager, mock_spotify):
         mock_spotify.playlist_reorder.return_value = "snap_r2"
 
-        result = await manager.reorder_tracks(
+        result = await mock_manager.reorder_tracks(
             "pl1", range_start=0, insert_before=10, range_length=3
         )
 
@@ -571,89 +432,167 @@ class TestReorderTracks:
             "pl1", range_start=0, insert_before=10, range_length=3
         )
 
-    async def test_reorder_api_error(self, manager, mock_spotify):
-        mock_spotify.playlist_reorder.side_effect = tk.HTTPError(
-            "bad request", request=MagicMock(), response=MagicMock()
-        )
+    async def test_reorder_api_error(self, mock_manager, mock_spotify):
+        mock_spotify.playlist_reorder.side_effect = _http_error()
 
         with pytest.raises(tk.HTTPError):
-            await manager.reorder_tracks("pl1", range_start=0, insert_before=5)
+            await mock_manager.reorder_tracks("pl1", range_start=0, insert_before=5)
 
 
 # ===================================================================
-# Edge cases & integration-style scenarios
+# create_playlist (writes to the real DB — isolated_db)
 # ===================================================================
 
 
-class TestEdgeCases:
-    """Miscellaneous edge-case tests."""
+class TestCreatePlaylist:
+    async def test_creates_on_spotify_and_locally(self, isolated_db, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        owner_pk = _create_db_user("user1")
+        manager = PlaylistManager(client_for())
 
-    async def test_add_tracks_101_produces_two_chunks(self, manager, mock_spotify):
-        """101 tracks => 2 API calls (100 + 1)."""
-        uris = [f"spotify:track:{i}" for i in range(101)]
-        mock_spotify.playlist_add.return_value = "snap"
+        row = await manager.create_playlist(
+            name="Fresh Cuts", owner_id=owner_pk, description="new stuff", public=True
+        )
 
-        await manager.add_tracks("pl1", uris)
+        # Created on (fake) Spotify...
+        assert row.spotify_id in fake_spotify.playlists
+        meta = fake_spotify.playlists[row.spotify_id]
+        assert meta["name"] == "Fresh Cuts"
+        assert meta["description"] == "new stuff"
+        assert meta["public"] is True
+        # ...and persisted locally, scoped to the owner.
+        assert row.id is not None
+        assert row.owner_id == owner_pk
+        assert row.name == "Fresh Cuts"
+        assert row.public is True
+        assert row.collaborative is False
+        assert row.track_count == 0
 
-        assert mock_spotify.playlist_add.await_count == 2
-        calls = mock_spotify.playlist_add.call_args_list
-        assert len(calls[0].args[1]) == 100
-        assert len(calls[1].args[1]) == 1
+    async def test_collaborative_created_private_then_flipped(
+        self, isolated_db, fake_spotify, client_for
+    ):
+        """Spotify requires collaborative playlists to be non-public; the
+        create endpoint has no collaborative flag so it is set via a
+        follow-up playlist_change_details call."""
+        fake_spotify.add_user("user1")
+        owner_pk = _create_db_user("user1")
+        manager = PlaylistManager(client_for())
 
-    async def test_chunk_size_constant(self):
-        """Verify the chunk size constant is 100 (Spotify's documented limit)."""
-        assert _CHUNK_SIZE == 100
+        row = await manager.create_playlist(
+            name="Shared", owner_id=owner_pk, public=True, collaborative=True
+        )
 
-    async def test_remove_tracks_large_batch(self, manager, mock_spotify):
-        """350 tracks => 4 API calls (100 + 100 + 100 + 50)."""
-        uris = [f"spotify:track:{i}" for i in range(350)]
-        mock_spotify.playlist_remove.return_value = "snap"
+        meta = fake_spotify.playlists[row.spotify_id]
+        assert meta["public"] is False  # forced private
+        assert meta["collaborative"] is True  # flipped by the PUT
+        assert row.public is False
+        assert row.collaborative is True
 
-        await manager.remove_tracks("pl1", uris)
+    async def test_api_error_propagates_and_writes_nothing(
+        self, isolated_db, mock_manager, mock_spotify
+    ):
+        from spotifyforge.db.engine import get_engine
 
-        assert mock_spotify.playlist_remove.await_count == 4
-        calls = mock_spotify.playlist_remove.call_args_list
-        assert len(calls[0].args[1]) == 100
-        assert len(calls[1].args[1]) == 100
-        assert len(calls[2].args[1]) == 100
-        assert len(calls[3].args[1]) == 50
+        mock_spotify.current_user.side_effect = _http_error()
 
-    async def test_deduplicate_with_many_dupes_chunking(self, manager, mock_spotify):
-        """If dedup produces >100 duplicates, remove_tracks should chunk them."""
-        # Build 150 unique items, then 150 duplicates of the first ones.
-        unique_items = [
-            _make_playlist_item(_make_track(f"t{i}", uri=f"spotify:track:t{i}")) for i in range(150)
-        ]
-        duplicate_items = [
-            _make_playlist_item(_make_track(f"t{i}_dup", uri=f"spotify:track:t{i}"))
-            for i in range(150)
-        ]
-        all_items = unique_items + duplicate_items
+        with pytest.raises(tk.HTTPError):
+            await mock_manager.create_playlist(name="Fail", owner_id=1)
 
-        mock_spotify.playlist_items.return_value = _make_paging(all_items, next_url=None)
-        mock_spotify.playlist_remove.return_value = "snap_d"
+        with Session(get_engine()) as session:
+            assert session.exec(select(Playlist)).all() == []
 
-        removed = await manager.deduplicate("pl1")
 
-        assert removed == 150
-        # 150 duplicates / 100 chunk size = 2 calls
-        assert mock_spotify.playlist_remove.await_count == 2
+# ===================================================================
+# sync_playlist (writes to the real DB — isolated_db)
+# ===================================================================
 
-    async def test_add_tracks_position_none(self, manager, mock_spotify):
-        """When position is None, every chunk should pass position=None."""
-        uris = [f"spotify:track:{i}" for i in range(150)]
-        mock_spotify.playlist_add.return_value = "snap"
 
-        await manager.add_tracks("pl1", uris, position=None)
+class TestSyncPlaylist:
+    async def test_sync_mirrors_spotify_including_duplicates(
+        self, isolated_db, fake_spotify, client_for
+    ):
+        from spotifyforge.db.engine import get_engine
 
-        for call in mock_spotify.playlist_add.call_args_list:
-            assert call.kwargs["position"] is None
+        fake_spotify.add_user("user1")
+        owner_pk = _create_db_user("user1")
+        fake_spotify.add_track("t1", name="One")
+        fake_spotify.add_track("t2", name="Two")
+        fake_spotify.add_playlist("pl", name="Sync Me", track_ids=["t1", "t2", "t1"])
+        manager = PlaylistManager(client_for())
 
-    async def test_snapshot_check_identical_snapshots(self, manager, mock_spotify):
-        """Even very long snapshot IDs should compare correctly."""
-        long_snap = "a" * 200
-        mock_spotify.playlist.return_value = SimpleNamespace(snapshot_id=long_snap)
+        row = await manager.sync_playlist("pl", owner_id=owner_pk)
 
-        changed = await manager.snapshot_check("pl1", long_snap)
+        assert row.owner_id == owner_pk
+        assert row.name == "Sync Me"
+        assert row.track_count == 3
+        assert row.snapshot_id == fake_spotify.playlists["pl"]["snapshot_id"]
+        assert row.last_synced_at is not None
 
-        assert changed is False
+        with Session(get_engine()) as session:
+            assocs = session.exec(
+                select(PlaylistTrack)
+                .where(PlaylistTrack.playlist_id == row.id)
+                .order_by(PlaylistTrack.position)
+            ).all()
+            assert [a.position for a in assocs] == [0, 1, 2]
+            tracks_by_pk = {t.id: t.spotify_id for t in session.exec(select(Track)).all()}
+            # The duplicate is mirrored: same track at positions 0 and 2.
+            assert [tracks_by_pk[a.track_id] for a in assocs] == ["t1", "t2", "t1"]
+            assert len(tracks_by_pk) == 2  # tracks table itself is deduped
+            assert all(a.added_by == "user1" for a in assocs)
+            assert all(a.added_at is not None for a in assocs)
+
+    async def test_resync_updates_in_place(self, isolated_db, fake_spotify, client_for):
+        from spotifyforge.db.engine import get_engine
+
+        fake_spotify.add_user("user1")
+        owner_pk = _create_db_user("user1")
+        fake_spotify.add_track("t1")
+        fake_spotify.add_track("t2")
+        fake_spotify.add_playlist("pl", track_ids=["t1"])
+        manager = PlaylistManager(client_for())
+
+        first = await manager.sync_playlist("pl", owner_id=owner_pk)
+        fake_spotify.playlist_tracks["pl"] = ["t2", "t1"]
+        fake_spotify.playlists["pl"]["name"] = "Renamed"
+        second = await manager.sync_playlist("pl", owner_id=owner_pk)
+
+        assert second.id == first.id  # updated, not duplicated
+        assert second.name == "Renamed"
+        assert second.track_count == 2
+
+        with Session(get_engine()) as session:
+            rows = session.exec(select(Playlist)).all()
+            assert len(rows) == 1
+            assocs = session.exec(
+                select(PlaylistTrack)
+                .where(PlaylistTrack.playlist_id == second.id)
+                .order_by(PlaylistTrack.position)
+            ).all()
+            assert len(assocs) == 2
+
+    async def test_same_playlist_two_owners_get_two_rows(
+        self, isolated_db, fake_spotify, client_for
+    ):
+        from spotifyforge.db.engine import get_engine
+
+        fake_spotify.add_user("user1")
+        fake_spotify.add_user("user2")
+        owner1 = _create_db_user("user1")
+        owner2 = _create_db_user("user2")
+        fake_spotify.add_track("t1")
+        fake_spotify.add_playlist("pl", track_ids=["t1"])
+
+        row1 = await PlaylistManager(client_for("user1")).sync_playlist("pl", owner_id=owner1)
+        row2 = await PlaylistManager(client_for("user2")).sync_playlist("pl", owner_id=owner2)
+
+        assert row1.id != row2.id
+        with Session(get_engine()) as session:
+            rows = session.exec(select(Playlist).where(Playlist.spotify_id == "pl")).all()
+            assert {r.owner_id for r in rows} == {owner1, owner2}
+
+    async def test_api_error_propagates(self, mock_manager, mock_spotify):
+        mock_spotify.playlist.side_effect = _http_error()
+
+        with pytest.raises(tk.HTTPError):
+            await mock_manager.sync_playlist("pl1", owner_id=1)

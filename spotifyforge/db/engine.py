@@ -17,52 +17,47 @@ _engine = None
 _async_engine = None
 
 
-def get_engine():
-    """Return a singleton database engine.
+def _base_url() -> str:
+    """Resolve the configured database URL with any driver suffix stripped.
 
-    If ``Settings.database_url`` is set, it is used directly.  Otherwise a
-    SQLite URL is constructed from ``Settings.db_path`` (creating the parent
-    directory automatically).
+    Accepts ``sqlite://``, ``sqlite+aiosqlite://``, ``postgresql://`` and
+    ``postgresql+asyncpg://`` forms; sync and async engines each re-attach
+    the driver they need, so either URL form works for both engines.
     """
+    if settings.database_url:
+        url = settings.database_url
+        return url.replace("sqlite+aiosqlite://", "sqlite://", 1).replace(
+            "postgresql+asyncpg://", "postgresql://", 1
+        )
+    db_path = settings.db_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{db_path}"
+
+
+def get_engine():
+    """Return a singleton synchronous database engine."""
     global _engine  # noqa: PLW0603
 
     if _engine is None:
-        if settings.database_url:
-            url = settings.database_url
-        else:
-            db_path = settings.db_path
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            url = f"sqlite:///{db_path}"
-
+        url = _base_url()
         kwargs: dict = {"echo": False, "pool_pre_ping": True}
         if url.startswith("sqlite"):
             kwargs["connect_args"] = {"check_same_thread": False}
-
         _engine = create_engine(url, **kwargs)
 
     return _engine
 
 
 def _get_async_engine():
-    """Return a singleton async database engine.
-
-    If ``Settings.database_url`` is set the URL is adapted for async drivers
-    (``asyncpg`` for PostgreSQL, ``aiosqlite`` for SQLite).  Otherwise a
-    SQLite+aiosqlite URL is constructed from ``Settings.db_path``.
-    """
+    """Return a singleton async database engine (aiosqlite / asyncpg)."""
     global _async_engine  # noqa: PLW0603
 
     if _async_engine is None:
-        if settings.database_url:
-            url = settings.database_url
-            if url.startswith("postgresql://"):
-                url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-            elif url.startswith("sqlite://"):
-                url = url.replace("sqlite://", "sqlite+aiosqlite://", 1)
-        else:
-            db_path = settings.db_path
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            url = f"sqlite+aiosqlite:///{db_path}"
+        url = _base_url()
+        if url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif url.startswith("sqlite://"):
+            url = url.replace("sqlite://", "sqlite+aiosqlite://", 1)
 
         kwargs: dict = {"echo": False, "pool_pre_ping": True}
         if url.startswith("sqlite"):
@@ -74,6 +69,16 @@ def _get_async_engine():
         _async_engine = create_async_engine(url, **kwargs)
 
     return _async_engine
+
+
+def reset_engines() -> None:
+    """Drop the cached engines so the next call rebuilds from settings.
+
+    Needed by tests that point ``database_url`` at a fresh database.
+    """
+    global _engine, _async_engine  # noqa: PLW0603
+    _engine = None
+    _async_engine = None
 
 
 # ---------------------------------------------------------------------------

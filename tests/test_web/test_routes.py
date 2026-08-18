@@ -1,1148 +1,702 @@
-"""Comprehensive tests for the SpotifyForge FastAPI web routes.
+"""Route-level tests for the SpotifyForge web API, against the fake Spotify.
 
-Uses ``fastapi.testclient.TestClient`` with ``dependency_overrides`` to
-exercise all API endpoints without a real database, Spotify connection,
-or background scheduler.
+Unlike the e2e suite (which proves one long happy path plus restart
+semantics), these tests cover the breadth of the API surface: every
+route, auth guards, request validation, error paths, and ownership
+isolation between users.
+
+No mocks and no dependency overrides: the real app boots with its
+lifespan (DB init + scheduler), authentication happens through the real
+OAuth dance against the fake accounts service, and every Spotify-backed
+route talks to the in-memory fake through tekore's real client stack.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
-import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlmodel import Session, select
 
-from spotifyforge.models.models import (
-    JobType,
-    Playlist,
-    ScheduledJob,
-    User,
-)
+from spotifyforge.db.engine import get_engine
+from spotifyforge.models.models import PlaylistTrack, Track
+from tests.fake_spotify import _full_artist
 
 # ---------------------------------------------------------------------------
-# Fixtures & helpers
-# ---------------------------------------------------------------------------
-
-# Build a minimal test user that all authenticated endpoints will use.
-_NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
-
-
-def _make_user(
-    id: int = 1,
-    spotify_id: str = "sp_user_001",
-    display_name: str = "Test User",
-    email: str = "test@example.com",
-    is_premium: bool = True,
-) -> User:
-    return User(
-        id=id,
-        spotify_id=spotify_id,
-        display_name=display_name,
-        email=email,
-        access_token_enc="fake_access_token",
-        refresh_token_enc="fake_refresh_token",
-        token_expiry=_NOW,
-        is_premium=is_premium,
-        created_at=_NOW,
-        updated_at=_NOW,
-    )
-
-
-def _make_playlist(
-    id: int = 1,
-    owner_id: int = 1,
-    spotify_id: str = "sp_pl_001",
-    name: str = "Test Playlist",
-) -> Playlist:
-    return Playlist(
-        id=id,
-        spotify_id=spotify_id,
-        owner_id=owner_id,
-        name=name,
-        description="A test playlist",
-        public=True,
-        collaborative=False,
-        snapshot_id="snap_001",
-        follower_count=42,
-        track_count=10,
-        last_synced_at=_NOW,
-        created_at=_NOW,
-        updated_at=_NOW,
-    )
-
-
-def _make_scheduled_job(
-    id: int = 1,
-    user_id: int = 1,
-    playlist_id: int | None = 1,
-    name: str = "Nightly Sync",
-) -> ScheduledJob:
-    return ScheduledJob(
-        id=id,
-        user_id=user_id,
-        name=name,
-        job_type=JobType.playlist_sync,
-        playlist_id=playlist_id,
-        config=None,
-        cron_expression="0 0 * * *",
-        enabled=True,
-        last_run_at=None,
-        next_run_at=_NOW,
-        created_at=_NOW,
-        updated_at=_NOW,
-    )
-
-
-class _FakeScalarsResult:
-    """Mimics the ``ScalarResult`` returned by ``session.execute().scalars()``."""
-
-    def __init__(self, items: list[Any] | None = None, first_item: Any = None):
-        self._items = items or []
-        self._first_item = first_item
-
-    def all(self) -> list[Any]:
-        return self._items
-
-    def first(self) -> Any:
-        return self._first_item
-
-
-class _FakeExecuteResult:
-    """Mimics the ``Result`` returned by ``session.execute(...)``."""
-
-    def __init__(self, items: list[Any] | None = None, first_item: Any = None):
-        self._items = items or []
-        self._first_item = first_item
-
-    def scalars(self) -> _FakeScalarsResult:
-        return _FakeScalarsResult(items=self._items, first_item=self._first_item)
-
-
-class _FakeSession:
-    """A lightweight stand-in for ``AsyncSession``.
-
-    Supports ``execute``, ``add``, ``commit``, ``refresh``, ``delete``,
-    and ``close`` with sensible defaults.  Tests can customise behaviour
-    via the ``execute_results`` list (consumed in FIFO order).
-    """
-
-    def __init__(self, execute_results: list[_FakeExecuteResult] | None = None):
-        self._execute_results = list(execute_results or [])
-        self._added: list[Any] = []
-        self._deleted: list[Any] = []
-        self._committed = False
-
-    async def execute(self, stmt) -> _FakeExecuteResult:
-        if self._execute_results:
-            return self._execute_results.pop(0)
-        return _FakeExecuteResult()
-
-    def add(self, obj: Any) -> None:
-        self._added.append(obj)
-
-    async def commit(self) -> None:
-        self._committed = True
-
-    async def refresh(self, obj: Any) -> None:
-        # Set an id if the object doesn't have one yet
-        if hasattr(obj, "id") and obj.id is None:
-            obj.id = 99
-
-    async def delete(self, obj: Any) -> None:
-        self._deleted.append(obj)
-
-    async def close(self) -> None:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# App factory with dependency overrides
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _build_test_app(
-    user: User | None = None,
-    session: _FakeSession | None = None,
-) -> FastAPI:
-    """Create a fresh FastAPI test app with overridden dependencies.
-
-    We patch the lifespan to be a no-op so we don't initialize a real DB
-    or start the scheduler.
-    """
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def _noop_lifespan(app: FastAPI):
-        yield
-
-    # Patch the lifespan BEFORE creating the app, so no real DB init happens
-    with patch("spotifyforge.web.app._lifespan", _noop_lifespan):
-        from spotifyforge.web.app import create_app, get_current_user, get_db_session
-
-        test_app = create_app()
-
-    # Override dependencies
-    mock_user = user or _make_user()
-    mock_session = session or _FakeSession()
-
-    async def _override_get_current_user():
-        return mock_user
-
-    async def _override_get_db_session():
-        return mock_session
-
-    test_app.dependency_overrides[get_current_user] = _override_get_current_user
-    test_app.dependency_overrides[get_db_session] = _override_get_db_session
-
-    return test_app
+def login(client: TestClient, fake, user_id: str = "user1") -> None:
+    """Drive the full OAuth dance: login URL -> callback -> session cookie."""
+    fake.add_user(user_id)
+    resp = client.get("/api/auth/login")
+    assert resp.status_code == 200
+    state = parse_qs(urlparse(resp.json()["auth_url"]).query)["state"][0]
+    code = fake.issue_code(user_id)
+    resp = client.get(f"/api/auth/callback?code={code}&state={state}", follow_redirects=False)
+    assert resp.status_code == 302, resp.text
+    assert "spotifyforge_session" in client.cookies
 
 
-def _build_unauthed_test_app(
-    session: _FakeSession | None = None,
-) -> FastAPI:
-    """Build a test app where get_current_user raises a 401."""
-    from contextlib import asynccontextmanager
+def create_playlist(client: TestClient, name: str = "My List", **fields) -> dict:
+    resp = client.post("/api/playlists", json={"name": name, **fields})
+    assert resp.status_code == 201, resp.text
+    return resp.json()
 
-    from fastapi import HTTPException, status
 
-    @asynccontextmanager
-    async def _noop_lifespan(app: FastAPI):
-        yield
+def uri(track_id: str) -> str:
+    return f"spotify:track:{track_id}"
 
-    with patch("spotifyforge.web.app._lifespan", _noop_lifespan):
-        from spotifyforge.web.app import create_app, get_current_user, get_db_session
 
-        test_app = create_app()
+# ---------------------------------------------------------------------------
+# Ops endpoints
+# ---------------------------------------------------------------------------
 
-    mock_session = session or _FakeSession()
 
-    async def _override_deny_user():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated.",
+class TestOps:
+    def test_health(self, env):
+        resp = env.client.get("/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "healthy"
+        assert "version" in body
+
+    def test_dashboard(self, env):
+        resp = env.client.get("/dashboard")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "SpotifyForge" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+
+class TestAuth:
+    def test_login_returns_auth_url_and_sets_state_cookie(self, env):
+        resp = env.client.get("/api/auth/login")
+        assert resp.status_code == 200
+        auth_url = resp.json()["auth_url"]
+        assert auth_url.startswith("https://accounts.spotify.com/authorize")
+        assert "client_id=test-client-id" in auth_url
+        state = parse_qs(urlparse(auth_url).query)["state"][0]
+        # The state embedded in the URL is the same one stored in the cookie.
+        assert env.client.cookies["spotifyforge_oauth_state"] == state
+
+    def test_me_without_cookie_is_401(self, env):
+        resp = env.client.get("/api/auth/me")
+        assert resp.status_code == 401
+
+    def test_me_after_login(self, env):
+        login(env.client, env.fake)
+        resp = env.client.get("/api/auth/me")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["spotify_id"] == "user1"
+        assert body["display_name"] == "Test User"
+        assert body["email"] == "user1@example.com"
+        assert body["is_premium"] is True
+
+    def test_logout_clears_session_cookie(self, env):
+        login(env.client, env.fake)
+        assert env.client.get("/api/auth/me").status_code == 200
+
+        resp = env.client.post("/api/auth/logout")
+        assert resp.status_code == 200
+        # The response instructs the browser to drop the session cookie...
+        assert "spotifyforge_session" in resp.headers.get("set-cookie", "")
+        # ...and a client honouring it is logged out.
+        assert "spotifyforge_session" not in env.client.cookies
+        assert env.client.get("/api/auth/me").status_code == 401
+
+    def test_all_protected_routes_require_auth(self, env):
+        cases = [
+            ("GET", "/api/auth/me", None),
+            ("GET", "/api/playlists", None),
+            ("POST", "/api/playlists", {"name": "x"}),
+            ("GET", "/api/playlists/1", None),
+            ("PUT", "/api/playlists/1", {"name": "x"}),
+            ("POST", "/api/playlists/1/sync", None),
+            ("POST", "/api/playlists/1/deduplicate", None),
+            ("POST", "/api/playlists/1/tracks", [uri("abcdefghij")]),
+            ("DELETE", "/api/playlists/1/tracks", [uri("abcdefghij")]),
+            ("GET", "/api/discover/top-tracks", None),
+            ("GET", "/api/discover/top-artists", None),
+            ("GET", "/api/discover/deep-cuts/art1", None),
+            ("POST", "/api/discover/genre-playlist?genre=rock", None),
+            ("POST", "/api/discover/time-capsule", None),
+            ("GET", "/api/schedules", None),
+            (
+                "POST",
+                "/api/schedules",
+                {"name": "x", "job_type": "time_capsule", "cron_expression": "0 0 * * *"},
+            ),
+            ("DELETE", "/api/schedules/1", None),
+            ("PUT", "/api/schedules/1/toggle", None),
+        ]
+        for method, path, body in cases:
+            resp = env.client.request(method, path, json=body)
+            assert resp.status_code == 401, f"{method} {path} -> {resp.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# Playlists
+# ---------------------------------------------------------------------------
+
+
+class TestPlaylists:
+    def test_list_empty_then_populated(self, env):
+        login(env.client, env.fake)
+        assert env.client.get("/api/playlists").json() == []
+
+        created = create_playlist(env.client, "First List")
+        listed = env.client.get("/api/playlists").json()
+        assert [p["id"] for p in listed] == [created["id"]]
+        assert listed[0]["name"] == "First List"
+
+    def test_list_pagination(self, env):
+        login(env.client, env.fake)
+        ids = {create_playlist(env.client, f"P{i}")["id"] for i in range(3)}
+
+        page1 = env.client.get("/api/playlists?limit=2&offset=0").json()
+        page2 = env.client.get("/api/playlists?limit=2&offset=2").json()
+        assert len(page1) == 2
+        assert len(page2) == 1
+        assert {p["id"] for p in page1} | {p["id"] for p in page2} == ids
+        assert {p["id"] for p in page1} & {p["id"] for p in page2} == set()
+
+        assert env.client.get("/api/playlists?limit=0").status_code == 422
+        assert env.client.get("/api/playlists?offset=-1").status_code == 422
+
+    def test_create_playlist(self, env):
+        login(env.client, env.fake)
+        body = create_playlist(env.client, "Fresh Cuts", description="new stuff", public=True)
+
+        # Local row is real and readable.
+        assert body["owner_id"] == env.client.get("/api/auth/me").json()["id"]
+        got = env.client.get(f"/api/playlists/{body['id']}")
+        assert got.status_code == 200
+        assert got.json()["name"] == "Fresh Cuts"
+
+        # And the playlist exists on (fake) Spotify with matching state.
+        sid = body["spotify_id"]
+        assert sid in env.fake.playlists
+        assert env.fake.playlists[sid]["name"] == "Fresh Cuts"
+        assert env.fake.playlists[sid]["description"] == "new stuff"
+        assert env.fake.playlists[sid]["public"] is True
+
+    def test_create_collaborative_playlist_is_private_and_collaborative(self, env):
+        login(env.client, env.fake)
+        body = create_playlist(env.client, "Group Mix", public=True, collaborative=True)
+
+        sid = body["spotify_id"]
+        # Spotify requires collaborative playlists to be non-public: the
+        # manager creates them private and then flips the collaborative flag.
+        assert env.fake.playlists[sid]["public"] is False
+        assert env.fake.playlists[sid]["collaborative"] is True
+        assert body["collaborative"] is True
+        assert body["public"] is False
+
+    def test_get_missing_playlist_404(self, env):
+        login(env.client, env.fake)
+        resp = env.client.get("/api/playlists/9999")
+        assert resp.status_code == 404
+
+    def test_update_playlist_changes_spotify_and_local_row(self, env):
+        login(env.client, env.fake)
+        body = create_playlist(env.client, "Old Name")
+        sid = body["spotify_id"]
+
+        resp = env.client.put(
+            f"/api/playlists/{body['id']}",
+            json={"name": "New Name", "description": "renamed", "public": False},
         )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "New Name"
+        assert resp.json()["public"] is False
 
-    async def _override_get_db_session():
-        return mock_session
+        # Fake Spotify state changed...
+        assert env.fake.playlists[sid]["name"] == "New Name"
+        assert env.fake.playlists[sid]["description"] == "renamed"
+        assert env.fake.playlists[sid]["public"] is False
+        # ...and so did the local row.
+        got = env.client.get(f"/api/playlists/{body['id']}").json()
+        assert got["name"] == "New Name"
+        assert got["public"] is False
 
-    test_app.dependency_overrides[get_current_user] = _override_deny_user
-    test_app.dependency_overrides[get_db_session] = _override_get_db_session
+        # An empty update is a no-op, not an error.
+        resp = env.client.put(f"/api/playlists/{body['id']}", json={})
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "New Name"
 
-    return test_app
+    def test_update_spotify_failure_is_502_and_local_row_unchanged(self, env):
+        login(env.client, env.fake)
+        body = create_playlist(env.client, "Fragile")
+
+        # Simulate Spotify no longer knowing the playlist: tekore raises
+        # tk.NotFound (an HTTPError), which the route maps to 502.
+        del env.fake.playlists[body["spotify_id"]]
+
+        resp = env.client.put(f"/api/playlists/{body['id']}", json={"name": "Nope"})
+        assert resp.status_code == 502, resp.text
+
+        # The local row was NOT updated: Spotify and local state never diverge.
+        got = env.client.get(f"/api/playlists/{body['id']}").json()
+        assert got["name"] == "Fragile"
+
+    def test_sync_with_duplicate_tracks(self, env):
+        login(env.client, env.fake)
+        env.fake.add_track("duptrack01", name="Dup Song")
+        env.fake.add_track("solotrck01", name="Solo Song")
+        body = create_playlist(env.client, "Dup List")
+
+        resp = env.client.post(
+            f"/api/playlists/{body['id']}/tracks",
+            json=[uri("duptrack01"), uri("solotrck01"), uri("duptrack01")],
+        )
+        assert resp.status_code == 201, resp.text
+
+        resp = env.client.post(f"/api/playlists/{body['id']}/sync")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tracks_synced"] == 3
+
+        # The duplicate synced as two association rows (no IntegrityError):
+        # same track, different positions, mirroring Spotify exactly.
+        with Session(get_engine()) as session:
+            rows = session.exec(
+                select(PlaylistTrack)
+                .where(PlaylistTrack.playlist_id == body["id"])
+                .order_by(PlaylistTrack.position)  # type: ignore[arg-type]
+            ).all()
+            assert [r.position for r in rows] == [0, 1, 2]
+            assert rows[0].track_id == rows[2].track_id
+            assert rows[0].track_id != rows[1].track_id
+            tracks = session.exec(
+                select(Track).where(Track.spotify_id.in_(["duptrack01", "solotrck01"]))  # type: ignore[attr-defined]
+            ).all()
+            assert len(tracks) == 2
+
+    def test_sync_missing_on_spotify_is_502(self, env):
+        login(env.client, env.fake)
+        body = create_playlist(env.client, "Ghost")
+        del env.fake.playlists[body["spotify_id"]]
+        resp = env.client.post(f"/api/playlists/{body['id']}/sync")
+        assert resp.status_code == 502
+
+    def test_deduplicate_removes_dups_and_keeps_order(self, env):
+        login(env.client, env.fake)
+        for tid in ("dedtrack01", "dedtrack02", "dedtrack03"):
+            env.fake.add_track(tid)
+        body = create_playlist(env.client, "Dedup List")
+        sid = body["spotify_id"]
+
+        resp = env.client.post(
+            f"/api/playlists/{body['id']}/tracks",
+            json=[uri("dedtrack01"), uri("dedtrack02"), uri("dedtrack01"), uri("dedtrack03")],
+        )
+        assert resp.status_code == 201
+        assert env.fake.playlist_tracks[sid] == [
+            "dedtrack01",
+            "dedtrack02",
+            "dedtrack01",
+            "dedtrack03",
+        ]
+
+        resp = env.client.post(f"/api/playlists/{body['id']}/deduplicate")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["duplicates_removed"] == 1
+        # One copy of each survives, in the original first-seen order.
+        assert env.fake.playlist_tracks[sid] == ["dedtrack01", "dedtrack02", "dedtrack03"]
+
+        # Idempotent: a second pass removes nothing.
+        resp = env.client.post(f"/api/playlists/{body['id']}/deduplicate")
+        assert resp.json()["duplicates_removed"] == 0
+
+    def test_add_and_remove_tracks(self, env):
+        login(env.client, env.fake)
+        env.fake.add_track("addtrack01")
+        env.fake.add_track("addtrack02")
+        body = create_playlist(env.client, "Mutable")
+        sid = body["spotify_id"]
+
+        resp = env.client.post(
+            f"/api/playlists/{body['id']}/tracks",
+            json=[uri("addtrack01"), uri("addtrack02")],
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["tracks_added"] == 2
+        assert resp.json()["snapshot_id"]
+        assert env.fake.playlist_tracks[sid] == ["addtrack01", "addtrack02"]
+
+        resp = env.client.request(
+            "DELETE",
+            f"/api/playlists/{body['id']}/tracks",
+            json=[uri("addtrack01")],
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tracks_removed"] == 1
+        assert env.fake.playlist_tracks[sid] == ["addtrack02"]
+
+    def test_track_uri_validation(self, env):
+        login(env.client, env.fake)
+        body = create_playlist(env.client, "Validated")
+        url = f"/api/playlists/{body['id']}/tracks"
+
+        # Empty list.
+        assert env.client.post(url, json=[]).status_code == 422
+        assert env.client.request("DELETE", url, json=[]).status_code == 422
+        # Malformed URIs.
+        assert env.client.post(url, json=["not-a-uri"]).status_code == 422
+        assert env.client.post(url, json=["spotify:track:short"]).status_code == 422
+        assert env.client.post(url, json=["spotify:album:abcdefghij"]).status_code == 422
+        # Too many URIs.
+        too_many = [uri(f"track{i:07d}") for i in range(1001)]
+        assert env.client.post(url, json=too_many).status_code == 422
+        # Nothing leaked into the fake despite all the attempts.
+        assert env.fake.playlist_tracks[body["spotify_id"]] == []
+
+    def test_track_ops_on_missing_playlist_404(self, env):
+        login(env.client, env.fake)
+        resp = env.client.post("/api/playlists/9999/tracks", json=[uri("abcdefghij")])
+        assert resp.status_code == 404
 
 
-# =========================================================================
-# Health check
-# =========================================================================
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
 
 
-class TestHealthCheck:
-    """Tests for GET /health."""
+class TestDiscovery:
+    def test_top_tracks(self, env):
+        login(env.client, env.fake)
+        env.fake.add_track("toptrack01", name="Hit One", popularity=90)
+        env.fake.add_track("toptrack02", name="Hit Two", popularity=80)
+        env.fake.top_tracks["user1"] = ["toptrack01", "toptrack02"]
 
-    def test_health_returns_200(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-        response = client.get("/health")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "healthy"
-        assert "version" in data
+        resp = env.client.get("/api/discover/top-tracks?time_range=short_term")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert [t["spotify_id"] for t in body] == ["toptrack01", "toptrack02"]
+        assert body[0]["name"] == "Hit One"
+        assert body[0]["artist_names"] == ["Artist One"]
 
-    def test_health_includes_version(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-        response = client.get("/health")
-        data = response.json()
-        assert data["version"] == "0.1.0"
+        # limit is honoured.
+        resp = env.client.get("/api/discover/top-tracks?limit=1")
+        assert len(resp.json()) == 1
+
+        # Bad params are rejected by validation.
+        assert env.client.get("/api/discover/top-tracks?time_range=forever").status_code == 422
+        assert env.client.get("/api/discover/top-tracks?limit=0").status_code == 422
+
+    def test_top_artists(self, env):
+        login(env.client, env.fake)
+        env.fake.top_artists["user1"] = [
+            _full_artist("artaaa0001", "Alpha Artist", popularity=70, genres=["shoegaze"]),
+            _full_artist("artbbb0002", "Beta Artist", popularity=55, genres=["dream-pop"]),
+        ]
+
+        resp = env.client.get("/api/discover/top-artists")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert [a["id"] for a in body] == ["artaaa0001", "artbbb0002"]
+        assert body[0]["name"] == "Alpha Artist"
+        assert body[0]["genres"] == ["shoegaze"]
+        assert body[0]["popularity"] == 70
+        assert body[0]["followers"] == 1000
+
+    def test_deep_cuts(self, env):
+        login(env.client, env.fake)
+        env.fake.add_track(
+            "deeptrck01",
+            name="Obscure Gem",
+            popularity=10,
+            artist_id="artdeep",
+            artist_name="Deep Artist",
+            album_id="albdeep",
+            album_name="Deep Album",
+        )
+        env.fake.add_track(
+            "poptrack01",
+            name="Radio Hit",
+            popularity=90,
+            artist_id="artdeep",
+            artist_name="Deep Artist",
+            album_id="albdeep",
+            album_name="Deep Album",
+        )
+        env.fake.artist_albums["artdeep"] = ["albdeep"]
+        env.fake.album_tracks["albdeep"] = ["deeptrck01", "poptrack01"]
+
+        resp = env.client.get("/api/discover/deep-cuts/artdeep?threshold=30")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert [t["spotify_id"] for t in body] == ["deeptrck01"]
+        assert body[0]["popularity"] == 10
+
+        # A threshold of 100 lets everything through, sorted by popularity.
+        resp = env.client.get("/api/discover/deep-cuts/artdeep?threshold=100")
+        assert [t["spotify_id"] for t in resp.json()] == ["deeptrck01", "poptrack01"]
+
+    def test_genre_playlist_is_owned_by_current_user(self, env):
+        login(env.client, env.fake)
+        env.fake.add_track("genretrk01", name="Indie Anthem")
+        env.fake.add_track("genretrk02", name="Indie Ballad")
+
+        resp = env.client.post("/api/discover/genre-playlist?genre=indie-rock&limit=10")
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+
+        me_id = env.client.get("/api/auth/me").json()["id"]
+        assert body["owner_id"] == me_id
+        assert body["name"] == "SpotifyForge: Indie-Rock"
+
+        sid = body["spotify_id"]
+        assert sid in env.fake.playlists
+        assert set(env.fake.playlist_tracks[sid]) == {"genretrk01", "genretrk02"}
+
+        # The regression this locks in: the playlist is owned by the real
+        # user (not owner_id=0), so it shows up in the user's own listing.
+        listed = env.client.get("/api/playlists").json()
+        assert body["id"] in [p["id"] for p in listed]
+
+        # genre is required.
+        assert env.client.post("/api/discover/genre-playlist").status_code == 422
+
+    def test_time_capsule(self, env):
+        login(env.client, env.fake)
+        env.fake.add_track("capstrck01", name="Memory One")
+        env.fake.add_track("capstrck02", name="Memory Two")
+        env.fake.top_tracks["user1"] = ["capstrck01", "capstrck02"]
+
+        resp = env.client.post("/api/discover/time-capsule?time_range=short_term")
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert "short_term" in body["name"]
+        assert body["public"] is False
+
+        sid = body["spotify_id"]
+        assert env.fake.playlists[sid]["public"] is False
+        assert env.fake.playlist_tracks[sid] == ["capstrck01", "capstrck02"]
+
+        # Shows up in the user's playlist listing too.
+        listed = env.client.get("/api/playlists").json()
+        assert body["id"] in [p["id"] for p in listed]
+
+        assert env.client.post("/api/discover/time-capsule?time_range=forever").status_code == 422
 
 
-# =========================================================================
-# Auth routes
-# =========================================================================
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
 
 
-class TestAuthRoutes:
-    """Tests for /api/auth/* endpoints."""
-
-    def test_login_returns_auth_url(self):
-        import types
-
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # The route handler does a lazy import:
-        #   from spotifyforge.auth.oauth import build_auth_url
-        # We inject a fake module into sys.modules so the import finds our mock.
-        fake_oauth = types.ModuleType("spotifyforge.auth.oauth")
-        fake_oauth.build_auth_url = lambda: "https://accounts.spotify.com/authorize?client_id=test"
-
-        with patch.dict(
-            "sys.modules",
-            {"spotifyforge.auth.oauth": fake_oauth},
-        ):
-            response = client.get("/api/auth/login")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert "auth_url" in data
-        assert "spotify" in data["auth_url"].lower()
-
-    def test_me_returns_user_info(self):
-        user = _make_user(display_name="Alice", email="alice@test.com")
-        app = _build_test_app(user=user)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/auth/me")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["display_name"] == "Alice"
-        assert data["email"] == "alice@test.com"
-        assert data["spotify_id"] == "sp_user_001"
-        assert data["is_premium"] is True
-
-    def test_me_unauthenticated_returns_401(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/auth/me")
-        assert response.status_code == 401
-
-    def test_logout_returns_success(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post("/api/auth/logout")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["detail"] == "Logged out successfully."
-
-
-# =========================================================================
-# Playlist routes
-# =========================================================================
-
-
-class TestPlaylistRoutes:
-    """Tests for /api/playlists/* endpoints."""
-
-    def test_list_playlists_returns_list(self):
-        playlist = _make_playlist()
-        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[playlist])])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/playlists")
-        assert response.status_code == 200
-        data = response.json()
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["name"] == "Test Playlist"
-        assert data[0]["spotify_id"] == "sp_pl_001"
-
-    def test_list_playlists_empty(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[])])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/playlists")
-        assert response.status_code == 200
-        data = response.json()
-        assert data == []
-
-    def test_list_playlists_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/playlists")
-        assert response.status_code == 401
-
-    def test_list_playlists_with_pagination(self):
-        playlist = _make_playlist()
-        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[playlist])])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/playlists?offset=0&limit=10")
-        assert response.status_code == 200
-
-    def test_create_playlist_success(self):
-        import types
-
-        mock_spotify_playlist = {
-            "id": "sp_new_pl_001",
-            "snapshot_id": "snap_new_001",
+class TestSchedules:
+    def _schedule_body(self, playlist_id: int, **overrides) -> dict:
+        body = {
+            "name": "nightly sync",
+            "job_type": "sync",
+            "playlist_id": playlist_id,
+            "cron_expression": "0 3 * * *",
         }
+        body.update(overrides)
+        return body
 
-        session = _FakeSession()
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
+    def test_create_valid_schedule_registers_with_scheduler(self, env):
+        from spotifyforge.core.scheduler import get_scheduler_service
 
-        # The route does a lazy import:
-        #   from spotifyforge.core.playlists import create_spotify_playlist
-        fake_playlists = types.ModuleType("spotifyforge.core.playlists")
-        fake_playlists.create_spotify_playlist = AsyncMock(return_value=mock_spotify_playlist)
+        login(env.client, env.fake)
+        playlist = create_playlist(env.client, "Synced Nightly")
 
-        with patch.dict(
-            "sys.modules",
-            {"spotifyforge.core.playlists": fake_playlists},
-        ):
-            response = client.post(
-                "/api/playlists",
-                json={
-                    "name": "Brand New Playlist",
-                    "description": "Created via API",
-                    "public": True,
-                    "collaborative": False,
-                },
+        resp = env.client.post("/api/schedules", json=self._schedule_body(playlist["id"]))
+        assert resp.status_code == 201, resp.text
+        job = resp.json()
+        assert job["job_type"] == "sync"
+        assert job["enabled"] is True
+        # Registered with the live scheduler, not just stored.
+        assert get_scheduler_service().next_run_time(job["id"]) is not None
+
+    def test_invalid_cron_is_422(self, env):
+        login(env.client, env.fake)
+        playlist = create_playlist(env.client, "P")
+        for bad_cron in ("not a cron", "0 3 * *", "99 99 * * *"):
+            resp = env.client.post(
+                "/api/schedules",
+                json=self._schedule_body(playlist["id"], cron_expression=bad_cron),
             )
-
-        assert response.status_code == 201
-        data = response.json()
-        assert data["name"] == "Brand New Playlist"
-        assert data["spotify_id"] == "sp_new_pl_001"
-
-    def test_create_playlist_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post(
-            "/api/playlists",
-            json={"name": "Unauthed", "public": True, "collaborative": False},
-        )
-        assert response.status_code == 401
-
-    def test_create_playlist_spotify_failure(self):
-        session = _FakeSession()
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.create_spotify_playlist = AsyncMock(side_effect=Exception("Spotify API down"))
-        with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
-            response = client.post(
-                "/api/playlists",
-                json={
-                    "name": "Broken Playlist",
-                    "public": True,
-                    "collaborative": False,
-                },
-            )
-
-        assert response.status_code == 502
-
-    def test_get_playlist_success(self):
-        playlist = _make_playlist(id=5)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/playlists/5")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["id"] == 5
-        assert data["name"] == "Test Playlist"
-
-    def test_get_playlist_not_found(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/playlists/999")
-        assert response.status_code == 404
-
-    def test_sync_playlist_success(self):
-        playlist = _make_playlist(id=3)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.sync_playlist_from_spotify = AsyncMock(return_value={"tracks_synced": 25})
-        with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
-            response = client.post("/api/playlists/3/sync")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["detail"] == "Playlist synced successfully."
-        assert data["tracks_synced"] == 25
-        assert data["playlist_id"] == 3
-
-    def test_sync_playlist_not_found(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post("/api/playlists/999/sync")
-        assert response.status_code == 404
-
-    def test_sync_playlist_spotify_failure(self):
-        playlist = _make_playlist(id=7)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.sync_playlist_from_spotify = AsyncMock(
-            side_effect=Exception("Spotify unreachable")
-        )
-        with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
-            response = client.post("/api/playlists/7/sync")
-
-        assert response.status_code == 502
-
-    def test_sync_playlist_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post("/api/playlists/1/sync")
-        assert response.status_code == 401
-
-    def test_deduplicate_playlist_success(self):
-        playlist = _make_playlist(id=4)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.deduplicate_playlist_tracks = AsyncMock(return_value={"duplicates_removed": 3})
-        with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
-            response = client.post("/api/playlists/4/deduplicate")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["detail"] == "Deduplication complete."
-        assert data["duplicates_removed"] == 3
-        assert data["playlist_id"] == 4
-
-    def test_deduplicate_playlist_not_found(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post("/api/playlists/999/deduplicate")
-        assert response.status_code == 404
-
-    def test_deduplicate_playlist_failure(self):
-        playlist = _make_playlist(id=6)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.deduplicate_playlist_tracks = AsyncMock(
-            side_effect=Exception("dedup engine error")
-        )
-        with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
-            response = client.post("/api/playlists/6/deduplicate")
-
-        assert response.status_code == 502
-
-    def test_deduplicate_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post("/api/playlists/1/deduplicate")
-        assert response.status_code == 401
-
-    def test_update_playlist_success(self):
-        playlist = _make_playlist(id=2)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.update_spotify_playlist = AsyncMock(return_value=None)
-        with patch.dict("sys.modules", {"spotifyforge.core.playlists": mock_module}):
-            response = client.put(
-                "/api/playlists/2",
-                json={"name": "Updated Name"},
-            )
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["name"] == "Updated Name"
-
-    def test_update_playlist_not_found(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.put(
-            "/api/playlists/999",
-            json={"name": "Ghost"},
-        )
-        assert response.status_code == 404
-
-
-# =========================================================================
-# Discovery routes
-# =========================================================================
-
-
-class TestDiscoveryRoutes:
-    """Tests for /api/discover/* endpoints."""
-
-    def test_top_tracks_success(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_tracks = [
-            {
-                "id": 1,
-                "spotify_id": "sp_track_1",
-                "name": "Hit Song",
-                "artist_names": ["Artist A"],
-                "album_name": "Album X",
-                "album_id": "alb_1",
-                "duration_ms": 210000,
-                "popularity": 95,
-                "isrc": "US1234567890",
-                "cached_at": _NOW.isoformat(),
-            },
-        ]
-
-        mock_module = MagicMock()
-        mock_module.get_top_tracks = AsyncMock(return_value=mock_tracks)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.get("/api/discover/top-tracks")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["name"] == "Hit Song"
-
-    def test_top_tracks_with_time_range(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.get_top_tracks = AsyncMock(return_value=[])
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.get("/api/discover/top-tracks?time_range=short_term&limit=10")
-
-        assert response.status_code == 200
-        mock_module.get_top_tracks.assert_called_once()
-        call_kwargs = mock_module.get_top_tracks.call_args
-        assert call_kwargs.kwargs.get("time_range") == "short_term"
-        assert call_kwargs.kwargs.get("limit") == 10
-
-    def test_top_tracks_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/discover/top-tracks")
-        assert response.status_code == 401
-
-    def test_top_tracks_spotify_failure(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.get_top_tracks = AsyncMock(side_effect=Exception("Spotify rate limit"))
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.get("/api/discover/top-tracks")
-
-        assert response.status_code == 502
-
-    def test_top_artists_success(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_artists = [
-            {"id": "art_1", "name": "Great Band", "genres": ["rock"], "popularity": 80},
-        ]
-        mock_module = MagicMock()
-        mock_module.get_top_artists = AsyncMock(return_value=mock_artists)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.get("/api/discover/top-artists")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data) == 1
-        assert data[0]["name"] == "Great Band"
-
-    def test_top_artists_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/discover/top-artists")
-        assert response.status_code == 401
-
-    def test_deep_cuts_success(self):
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_tracks = [
-            {
-                "id": 10,
-                "spotify_id": "sp_deep_1",
-                "name": "Underground Hit",
-                "artist_names": ["Indie Act"],
-                "album_name": "Deep Album",
-                "album_id": "alb_deep",
-                "duration_ms": 240000,
-                "popularity": 15,
-                "isrc": None,
-                "cached_at": _NOW.isoformat(),
-            },
-        ]
-        mock_module = MagicMock()
-        mock_module.get_deep_cuts = AsyncMock(return_value=mock_tracks)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.get("/api/discover/deep-cuts/artist_xyz?threshold=20")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data) == 1
-        assert data[0]["name"] == "Underground Hit"
-
-    def test_deep_cuts_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/discover/deep-cuts/some_artist")
-        assert response.status_code == 401
-
-    def test_genre_playlist_success(self):
-        playlist = _make_playlist(id=50, name="Indie Rock Mix", spotify_id="sp_genre_pl")
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.create_genre_based_playlist = AsyncMock(return_value=playlist)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.post("/api/discover/genre-playlist?genre=indie-rock&limit=20")
-
-        assert response.status_code == 201
-        data = response.json()
-        assert data["name"] == "Indie Rock Mix"
-
-    def test_time_capsule_success(self):
-        playlist = _make_playlist(id=60, name="Time Capsule 2020", spotify_id="sp_tc_pl")
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_module = MagicMock()
-        mock_module.create_time_capsule_playlist = AsyncMock(return_value=playlist)
-
-        with patch.dict("sys.modules", {"spotifyforge.core.discovery": mock_module}):
-            response = client.post("/api/discover/time-capsule?year=2020")
-
-        assert response.status_code == 201
-        data = response.json()
-        assert data["name"] == "Time Capsule 2020"
-
-
-# =========================================================================
-# Schedule routes
-# =========================================================================
-
-
-class TestScheduleRoutes:
-    """Tests for /api/schedules/* endpoints."""
-
-    def test_list_schedules_returns_list(self):
-        job = _make_scheduled_job()
-        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[job])])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/schedules")
-        assert response.status_code == 200
-        data = response.json()
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["name"] == "Nightly Sync"
-        assert data[0]["job_type"] == "playlist_sync"
-        assert data[0]["cron_expression"] == "0 0 * * *"
-
-    def test_list_schedules_empty(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(items=[])])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/schedules")
-        assert response.status_code == 200
-        data = response.json()
-        assert data == []
-
-    def test_list_schedules_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.get("/api/schedules")
-        assert response.status_code == 401
-
-    def test_create_schedule_success(self):
-        # The ScheduledJobCreate model uses strict=True in its ConfigDict,
-        # causing Pydantic to reject plain string values for the JobType
-        # StrEnum field when receiving JSON.  To exercise the route logic we
-        # rebuild the model class *without* strict mode and swap it in via
-        # the ``models`` module before the app is constructed.
-        from pydantic import BaseModel, ConfigDict
-        from pydantic import Field as PydanticField
-
-        from spotifyforge.models import models as models_mod
-
-        class _RelaxedJobCreate(BaseModel):
-            """Non-strict copy of ScheduledJobCreate for test use."""
-
-            model_config = ConfigDict(strict=False)
-            name: str = PydanticField(min_length=1, max_length=256)
-            job_type: JobType
-            playlist_id: int | None = None
-            config: dict | None = None
-            cron_expression: str = PydanticField(min_length=1, max_length=128)
-            enabled: bool = True
-
-        playlist = _make_playlist(id=1)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=playlist)])
-
-        mock_scheduler_module = MagicMock()
-        mock_scheduler_module.register_job = MagicMock()
-
-        # Swap the model in both the models module and the routes module
-        # BEFORE building the test app so the FastAPI endpoint uses it.
-        import spotifyforge.web.routes as routes_mod
-
-        orig_routes = routes_mod.ScheduledJobCreate
-        orig_models = models_mod.ScheduledJobCreate
-
-        try:
-            routes_mod.ScheduledJobCreate = _RelaxedJobCreate
-            models_mod.ScheduledJobCreate = _RelaxedJobCreate
-
-            # Build the app *after* the swap so the route parameter annotation
-            # picks up the relaxed model.
-            app = _build_test_app(session=session)
-            client = TestClient(app, raise_server_exceptions=False)
-
-            with patch.dict(
-                "sys.modules",
-                {"spotifyforge.core.scheduler": mock_scheduler_module},
-            ):
-                response = client.post(
-                    "/api/schedules",
-                    json={
-                        "name": "Weekly Sync",
-                        "job_type": "playlist_sync",
-                        "playlist_id": 1,
-                        "cron_expression": "0 8 * * 1",
-                        "enabled": True,
-                    },
-                )
-        finally:
-            routes_mod.ScheduledJobCreate = orig_routes
-            models_mod.ScheduledJobCreate = orig_models
-
-        assert response.status_code == 201
-        data = response.json()
-        assert data["name"] == "Weekly Sync"
-        assert data["job_type"] == "playlist_sync"
-        assert data["cron_expression"] == "0 8 * * 1"
-        assert data["enabled"] is True
-
-    def test_create_schedule_rejects_invalid_job_type_with_strict_mode(self):
-        """With strict=True on the model, passing a plain string for job_type
-        via JSON returns 422 because Pydantic refuses the coercion."""
-        app = _build_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post(
-            "/api/schedules",
-            json={
-                "name": "Strict Test",
-                "job_type": "playlist_sync",
-                "cron_expression": "0 0 * * *",
-            },
-        )
-        assert response.status_code == 422
-
-    def test_create_schedule_playlist_not_found(self):
-        from pydantic import BaseModel, ConfigDict
-        from pydantic import Field as PydanticField
-
-        from spotifyforge.models import models as models_mod
-
-        class _RelaxedJobCreate(BaseModel):
-            model_config = ConfigDict(strict=False)
-            name: str = PydanticField(min_length=1, max_length=256)
-            job_type: JobType
-            playlist_id: int | None = None
-            config: dict | None = None
-            cron_expression: str = PydanticField(min_length=1, max_length=128)
-            enabled: bool = True
-
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
-
-        import spotifyforge.web.routes as routes_mod
-
-        orig_routes = routes_mod.ScheduledJobCreate
-        orig_models = models_mod.ScheduledJobCreate
-
-        try:
-            routes_mod.ScheduledJobCreate = _RelaxedJobCreate
-            models_mod.ScheduledJobCreate = _RelaxedJobCreate
-
-            app = _build_test_app(session=session)
-            client = TestClient(app, raise_server_exceptions=False)
-
-            response = client.post(
+            assert resp.status_code == 422, f"{bad_cron!r} -> {resp.status_code}"
+
+    def test_playlist_job_types_require_playlist_id(self, env):
+        login(env.client, env.fake)
+        for job_type in ("sync", "archive", "deduplicate", "genre_refresh"):
+            resp = env.client.post(
                 "/api/schedules",
                 json={
-                    "name": "Orphan Job",
-                    "job_type": "playlist_sync",
-                    "playlist_id": 999,
-                    "cron_expression": "0 0 * * *",
-                    "enabled": True,
+                    "name": f"{job_type} job",
+                    "job_type": job_type,
+                    "cron_expression": "0 3 * * *",
                 },
             )
-        finally:
-            routes_mod.ScheduledJobCreate = orig_routes
-            models_mod.ScheduledJobCreate = orig_models
+            assert resp.status_code == 422, f"{job_type} -> {resp.status_code}"
 
-        assert response.status_code == 404
+    def test_genre_refresh_requires_genre_config(self, env):
+        login(env.client, env.fake)
+        playlist = create_playlist(env.client, "Genre Target")
+        resp = env.client.post(
+            "/api/schedules",
+            json=self._schedule_body(playlist["id"], job_type="genre_refresh", config={}),
+        )
+        assert resp.status_code == 422
+        # With the genre supplied it goes through.
+        resp = env.client.post(
+            "/api/schedules",
+            json=self._schedule_body(
+                playlist["id"], job_type="genre_refresh", config={"genre": "indie-rock"}
+            ),
+        )
+        assert resp.status_code == 201, resp.text
 
-    def test_create_schedule_without_playlist_id(self):
-        """A job with no playlist_id should skip the playlist lookup."""
-        from pydantic import BaseModel, ConfigDict
-        from pydantic import Field as PydanticField
+    def test_archive_requires_source_playlist_config(self, env):
+        login(env.client, env.fake)
+        playlist = create_playlist(env.client, "Archive Target")
+        resp = env.client.post(
+            "/api/schedules",
+            json=self._schedule_body(playlist["id"], job_type="archive", config={}),
+        )
+        assert resp.status_code == 422
+        resp = env.client.post(
+            "/api/schedules",
+            json=self._schedule_body(
+                playlist["id"], job_type="archive", config={"source_playlist_id": "discweekly"}
+            ),
+        )
+        assert resp.status_code == 201, resp.text
 
-        from spotifyforge.models import models as models_mod
+    def test_schedule_for_unowned_playlist_is_404(self, env):
+        login(env.client, env.fake)
+        resp = env.client.post("/api/schedules", json=self._schedule_body(9999))
+        assert resp.status_code == 404
 
-        class _RelaxedJobCreate(BaseModel):
-            model_config = ConfigDict(strict=False)
-            name: str = PydanticField(min_length=1, max_length=256)
-            job_type: JobType
-            playlist_id: int | None = None
-            config: dict | None = None
-            cron_expression: str = PydanticField(min_length=1, max_length=128)
-            enabled: bool = True
+    def test_list_schedules_pagination(self, env):
+        login(env.client, env.fake)
+        ids = set()
+        for i in range(3):
+            resp = env.client.post(
+                "/api/schedules",
+                json={
+                    "name": f"capsule {i}",
+                    "job_type": "time_capsule",
+                    "cron_expression": "0 0 1 * *",
+                },
+            )
+            assert resp.status_code == 201, resp.text
+            ids.add(resp.json()["id"])
 
-        session = _FakeSession()  # No execute results needed
+        page1 = env.client.get("/api/schedules?limit=2&offset=0").json()
+        page2 = env.client.get("/api/schedules?limit=2&offset=2").json()
+        assert len(page1) == 2
+        assert len(page2) == 1
+        assert {j["id"] for j in page1} | {j["id"] for j in page2} == ids
+        assert {j["id"] for j in page1} & {j["id"] for j in page2} == set()
 
-        mock_scheduler_module = MagicMock()
-        mock_scheduler_module.register_job = MagicMock()
+        assert env.client.get("/api/schedules?limit=0").status_code == 422
 
-        import spotifyforge.web.routes as routes_mod
+    def test_delete_schedule_removes_row_and_unregisters(self, env):
+        from spotifyforge.core.scheduler import get_scheduler_service
 
-        orig_routes = routes_mod.ScheduledJobCreate
-        orig_models = models_mod.ScheduledJobCreate
+        login(env.client, env.fake)
+        playlist = create_playlist(env.client, "Doomed Sync")
+        job = env.client.post("/api/schedules", json=self._schedule_body(playlist["id"])).json()
+        assert get_scheduler_service().next_run_time(job["id"]) is not None
 
-        try:
-            routes_mod.ScheduledJobCreate = _RelaxedJobCreate
-            models_mod.ScheduledJobCreate = _RelaxedJobCreate
+        resp = env.client.delete(f"/api/schedules/{job['id']}")
+        assert resp.status_code == 204
 
-            app = _build_test_app(session=session)
-            client = TestClient(app, raise_server_exceptions=False)
+        assert env.client.get("/api/schedules").json() == []
+        assert get_scheduler_service().next_run_time(job["id"]) is None
+        # Deleting again is a 404, not a crash.
+        assert env.client.delete(f"/api/schedules/{job['id']}").status_code == 404
 
-            with patch.dict(
-                "sys.modules",
-                {"spotifyforge.core.scheduler": mock_scheduler_module},
-            ):
-                response = client.post(
-                    "/api/schedules",
-                    json={
-                        "name": "Health Check Job",
-                        "job_type": "health_check",
-                        "playlist_id": None,
-                        "cron_expression": "*/5 * * * *",
-                        "enabled": True,
-                    },
-                )
-        finally:
-            routes_mod.ScheduledJobCreate = orig_routes
-            models_mod.ScheduledJobCreate = orig_models
+    def test_toggle_schedule_follows_registration(self, env):
+        from spotifyforge.core.scheduler import get_scheduler_service
 
-        assert response.status_code == 201
-        data = response.json()
-        assert data["name"] == "Health Check Job"
-        assert data["playlist_id"] is None
+        login(env.client, env.fake)
+        playlist = create_playlist(env.client, "Toggled Sync")
+        job = env.client.post("/api/schedules", json=self._schedule_body(playlist["id"])).json()
+        service = get_scheduler_service()
+        assert service.next_run_time(job["id"]) is not None
 
-    def test_create_schedule_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
+        # Disable: row updated AND job unregistered.
+        resp = env.client.put(f"/api/schedules/{job['id']}/toggle")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["enabled"] is False
+        assert service.next_run_time(job["id"]) is None
 
-        response = client.post(
+        # Enable: registration comes back.
+        resp = env.client.put(f"/api/schedules/{job['id']}/toggle")
+        assert resp.json()["enabled"] is True
+        assert service.next_run_time(job["id"]) is not None
+
+    def test_toggle_missing_schedule_404(self, env):
+        login(env.client, env.fake)
+        assert env.client.put("/api/schedules/9999/toggle").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Ownership isolation
+# ---------------------------------------------------------------------------
+
+
+class TestOwnershipIsolation:
+    def test_user2_cannot_see_or_modify_user1_resources(self, env):
+        # User 1 creates a playlist and a schedule.
+        login(env.client, env.fake, "user1")
+        playlist = create_playlist(env.client, "User1 Private")
+        job = env.client.post(
             "/api/schedules",
             json={
-                "name": "Unauthed Job",
-                "job_type": "playlist_sync",
-                "cron_expression": "0 0 * * *",
+                "name": "user1 sync",
+                "job_type": "sync",
+                "playlist_id": playlist["id"],
+                "cron_expression": "0 3 * * *",
             },
-        )
-        assert response.status_code == 401
+        ).json()
 
-    def test_delete_schedule_success(self):
-        job = _make_scheduled_job(id=10)
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=job)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
+        # User 2 logs in through a separate client sharing the same app + DB.
+        with TestClient(env.app) as client2:
+            login(client2, env.fake, "user2")
+            assert client2.get("/api/auth/me").json()["spotify_id"] == "user2"
 
-        mock_scheduler_module = MagicMock()
-        mock_scheduler_module.unregister_job = MagicMock()
+            # User 1's playlist is invisible in every way: list, read, write.
+            assert client2.get("/api/playlists").json() == []
+            pid = playlist["id"]
+            assert client2.get(f"/api/playlists/{pid}").status_code == 404
+            assert client2.put(f"/api/playlists/{pid}", json={"name": "hax"}).status_code == 404
+            assert client2.post(f"/api/playlists/{pid}/sync").status_code == 404
+            assert client2.post(f"/api/playlists/{pid}/deduplicate").status_code == 404
+            assert (
+                client2.post(f"/api/playlists/{pid}/tracks", json=[uri("abcdefghij")]).status_code
+                == 404
+            )
 
-        with patch.dict(
-            "sys.modules",
-            {"spotifyforge.core.scheduler": mock_scheduler_module},
-        ):
-            response = client.delete("/api/schedules/10")
+            # Same for schedules.
+            assert client2.get("/api/schedules").json() == []
+            assert client2.delete(f"/api/schedules/{job['id']}").status_code == 404
+            assert client2.put(f"/api/schedules/{job['id']}/toggle").status_code == 404
+            # And user 2 cannot schedule jobs against user 1's playlist.
+            resp = client2.post(
+                "/api/schedules",
+                json={
+                    "name": "steal",
+                    "job_type": "sync",
+                    "playlist_id": pid,
+                    "cron_expression": "0 3 * * *",
+                },
+            )
+            assert resp.status_code == 404
 
-        assert response.status_code == 204
-
-    def test_delete_schedule_not_found(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.delete("/api/schedules/999")
-        assert response.status_code == 404
-
-    def test_delete_schedule_unauthenticated(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.delete("/api/schedules/1")
-        assert response.status_code == 401
-
-    def test_toggle_schedule_enable(self):
-        job = _make_scheduled_job(id=15)
-        job.enabled = False  # Start disabled
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=job)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_scheduler_module = MagicMock()
-        mock_scheduler_module.register_job = MagicMock()
-        mock_scheduler_module.unregister_job = MagicMock()
-
-        with patch.dict(
-            "sys.modules",
-            {"spotifyforge.core.scheduler": mock_scheduler_module},
-        ):
-            response = client.put("/api/schedules/15/toggle")
-
-        assert response.status_code == 200
-        data = response.json()
-        # The job was disabled, toggling should enable it
-        assert data["enabled"] is True
-
-    def test_toggle_schedule_not_found(self):
-        session = _FakeSession(execute_results=[_FakeExecuteResult(first_item=None)])
-        app = _build_test_app(session=session)
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.put("/api/schedules/999/toggle")
-        assert response.status_code == 404
-
-
-# =========================================================================
-# Authentication required (global check)
-# =========================================================================
-
-
-class TestAuthenticationRequired:
-    """Verify that all protected endpoints return 401 when unauthenticated."""
-
-    @pytest.mark.parametrize(
-        "method,path",
-        [
-            ("GET", "/api/auth/me"),
-            ("GET", "/api/playlists"),
-            ("POST", "/api/playlists"),
-            ("GET", "/api/playlists/1"),
-            ("PUT", "/api/playlists/1"),
-            ("POST", "/api/playlists/1/sync"),
-            ("POST", "/api/playlists/1/deduplicate"),
-            ("POST", "/api/playlists/1/tracks"),
-            ("DELETE", "/api/playlists/1/tracks"),
-            ("GET", "/api/discover/top-tracks"),
-            ("GET", "/api/discover/top-artists"),
-            ("GET", "/api/discover/deep-cuts/artist_x"),
-            ("POST", "/api/discover/genre-playlist?genre=rock"),
-            ("POST", "/api/discover/time-capsule"),
-            ("GET", "/api/schedules"),
-            ("POST", "/api/schedules"),
-            ("DELETE", "/api/schedules/1"),
-            ("PUT", "/api/schedules/1/toggle"),
-        ],
-    )
-    def test_protected_endpoint_returns_401(self, method: str, path: str):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Build a minimal valid body for POST/PUT/DELETE that expects one
-        body: dict | list | None = None
-        if method == "POST" and path == "/api/playlists":
-            body = {"name": "x", "public": True, "collaborative": False}
-        elif method == "POST" and path.endswith("/tracks"):
-            body = ["spotify:track:abc"]
-        elif method == "DELETE" and path.endswith("/tracks"):
-            body = ["spotify:track:abc"]
-        elif method == "POST" and path == "/api/schedules":
-            body = {
-                "name": "x",
-                "job_type": "health_check",
-                "cron_expression": "* * * * *",
-            }
-        elif method == "PUT" and "/playlists/" in path and "toggle" not in path:
-            body = {"name": "x"}
-
-        kwargs: dict[str, Any] = {}
-        if body is not None:
-            kwargs["json"] = body
-
-        response = client.request(method, path, **kwargs)
-        assert response.status_code == 401, (
-            f"Expected 401 for {method} {path}, got {response.status_code}"
-        )
-
-
-# =========================================================================
-# Edge cases: unauthenticated endpoints (health, login, logout)
-# =========================================================================
-
-
-class TestPublicEndpoints:
-    """Verify that public endpoints work without authentication."""
-
-    def test_health_no_auth_needed(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-        response = client.get("/health")
-        assert response.status_code == 200
-
-    def test_login_no_auth_needed(self):
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        mock_oauth = MagicMock()
-        mock_oauth.build_auth_url.return_value = "https://accounts.spotify.com/authorize"
-        with patch.dict(
-            "sys.modules",
-            {
-                "spotifyforge.auth.oauth": mock_oauth,
-                "spotifyforge.auth": MagicMock(),
-            },
-        ):
-            response = client.get("/api/auth/login")
-
-        assert response.status_code == 200
-
-    def test_logout_no_auth_needed(self):
-        """The logout endpoint doesn't require the get_current_user dep."""
-        app = _build_unauthed_test_app()
-        client = TestClient(app, raise_server_exceptions=False)
-
-        response = client.post("/api/auth/logout")
-        assert response.status_code == 200
+            # Nothing was harmed: user 1 still sees everything intact.
+            assert [p["id"] for p in env.client.get("/api/playlists").json()] == [pid]
+            assert env.client.get(f"/api/playlists/{pid}").json()["name"] == "User1 Private"
+            assert [j["id"] for j in env.client.get("/api/schedules").json()] == [job["id"]]

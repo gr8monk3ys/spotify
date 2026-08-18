@@ -1,7 +1,11 @@
 """SpotifyForge CLI — the main user-facing interface.
 
-Built with Typer + Rich.  Every sub-command group is its own ``typer.Typer``
+Built with Typer + Rich. Every sub-command group is its own ``typer.Typer``
 instance, added to the root ``app`` via ``app.add_typer()``.
+
+Command bodies are thin async wrappers over the same core services the web
+API uses (:class:`PlaylistManager`, :class:`DiscoveryEngine`,
+:class:`SchedulerService`), authenticated through the OS keyring.
 
 Entry-point (registered in ``pyproject.toml``):
     spotifyforge = "spotifyforge.cli.app:app"
@@ -13,15 +17,17 @@ import asyncio
 import csv
 import io
 import json
+import webbrowser
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Any, NoReturn
 
+import tekore
 import typer
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 import spotifyforge
@@ -38,7 +44,7 @@ err_console = Console(stderr=True)
 # ---------------------------------------------------------------------------
 
 
-def _error_panel(message: str, *, title: str = "Error") -> None:
+def _error_panel(message: str, *, title: str = "Error") -> NoReturn:
     """Display a Rich error panel on *stderr* and exit with code 1."""
     err_console.print(Panel(message, title=title, border_style="red", expand=False))
     raise typer.Exit(code=1)
@@ -54,6 +60,152 @@ def _version_callback(value: bool) -> None:
     if value:
         console.print(f"[bold]SpotifyForge[/bold] version [cyan]{spotifyforge.__version__}[/cyan]")
         raise typer.Exit()
+
+
+def _current_user_file() -> Path:
+    return settings.db_path.parent / "current_user"
+
+
+def _current_spotify_user_id() -> str:
+    """Return the Spotify user id of the logged-in CLI user, or exit."""
+    path = _current_user_file()
+    if not path.exists():
+        _error_panel(
+            "Not logged in. Run [bold]spotifyforge auth login[/bold] first.",
+            title="Authentication Required",
+        )
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _make_auth():
+    """Build a keyring-backed :class:`SpotifyAuth`, or exit with guidance."""
+    from spotifyforge.auth.oauth import AuthenticationError, KeyringTokenStore, SpotifyAuth
+
+    try:
+        return SpotifyAuth(token_store=KeyringTokenStore())
+    except AuthenticationError as exc:
+        _error_panel(str(exc), title="Configuration Error")
+
+
+def _load_token(auth: Any, spotify_user_id: str) -> tekore.Token:
+    """Load (and refresh if expiring) the stored token for a user.
+
+    A refreshed token is persisted to both the keyring and the local DB
+    row — scheduled jobs authenticate from the DB, so it must not go stale.
+    """
+    token = auth.token_store.load_token(spotify_user_id)
+    if token.is_expiring:
+        if not token.refresh_token:
+            raise RuntimeError("Stored token expired with no refresh token; log in again.")
+        token = auth.credentials.refresh_user_token(token.refresh_token)
+        auth.token_store.save_token(spotify_user_id, token)
+        _persist_tokens_to_db(spotify_user_id, token)
+    return token
+
+
+def _persist_tokens_to_db(spotify_user_id: str, token: tekore.Token) -> None:
+    """Best-effort sync of refreshed tokens onto the local User row."""
+    from sqlmodel import Session, select
+
+    from spotifyforge.core.clients import apply_user_tokens
+    from spotifyforge.db.engine import get_engine, init_db
+    from spotifyforge.models.models import User
+
+    init_db()
+    with Session(get_engine()) as session:
+        user = session.exec(select(User).where(User.spotify_id == spotify_user_id)).first()
+        if user is not None:
+            apply_user_tokens(user, token.access_token, token.refresh_token, token.expires_at)
+            session.add(user)
+            session.commit()
+
+
+def _spotify_client() -> tekore.Spotify:
+    """Return an authenticated async Spotify client for the CLI user."""
+    from spotifyforge.core.clients import build_spotify
+
+    auth = _make_auth()
+    spotify_user_id = _current_spotify_user_id()
+    try:
+        token = _load_token(auth, spotify_user_id)
+    except Exception as exc:
+        _error_panel(
+            f"Could not load stored credentials: {exc}\n"
+            "Run [bold]spotifyforge auth login[/bold] to re-authenticate.",
+            title="Authentication Error",
+        )
+    return build_spotify(token.access_token)
+
+
+def _run_spotify(status_msg: str, error_msg: str, coro_fn):
+    """Run an async Spotify operation with the standard CLI scaffolding.
+
+    Builds the authenticated client, shows a status spinner, always closes
+    the client, and converts any failure into an error panel (exit 1).
+    ``coro_fn`` receives the client and returns the result.
+    """
+    sp = _spotify_client()
+
+    async def _impl():
+        try:
+            return await coro_fn(sp)
+        finally:
+            await sp.close()
+
+    with console.status(status_msg):
+        try:
+            return _run(_impl())
+        except Exception as exc:
+            _error_panel(f"{error_msg}: {exc}")
+
+
+def _db_user_id() -> int:
+    """Return the local DB user id for the logged-in CLI user, or exit.
+
+    The row is created at login; if it is missing (e.g. the database was
+    deleted), the user is asked to log in again.
+    """
+    from sqlmodel import Session, select
+
+    from spotifyforge.db.engine import get_engine, init_db
+    from spotifyforge.models.models import User
+
+    init_db()
+    spotify_user_id = _current_spotify_user_id()
+    with Session(get_engine()) as session:
+        user = session.exec(select(User).where(User.spotify_id == spotify_user_id)).first()
+        if user is None or user.id is None:
+            _error_panel(
+                "Local user record not found. Run [bold]spotifyforge auth login[/bold] again.",
+                title="Authentication Required",
+            )
+        return user.id
+
+
+def _upsert_db_user(profile: dict[str, Any], token: tekore.Token) -> int:
+    """Create or update the local User row (with encrypted tokens).
+
+    Tokens are persisted so scheduled jobs (which authenticate from the
+    database) can run for CLI-authenticated users too.
+    """
+    from sqlmodel import Session, select
+
+    from spotifyforge.core.clients import apply_user_profile, apply_user_tokens
+    from spotifyforge.db.engine import get_engine, init_db
+    from spotifyforge.models.models import User
+
+    init_db()
+    with Session(get_engine()) as session:
+        user = session.exec(select(User).where(User.spotify_id == profile["user_id"])).first()
+        if user is None:
+            user = User(spotify_id=profile["user_id"])
+        apply_user_profile(user, profile)
+        apply_user_tokens(user, token.access_token, token.refresh_token, token.expires_at)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        assert user.id is not None
+        return user.id
 
 
 # ---------------------------------------------------------------------------
@@ -86,38 +238,48 @@ def main(
 # ╚═════════════════════════════════════════════════════════════════════════╝
 auth_app = typer.Typer(
     name="auth",
-    help="Manage Spotify authentication (OAuth 2.0 PKCE).",
+    help="Manage Spotify authentication (OAuth 2.0 authorization-code flow).",
     no_args_is_help=True,
 )
 app.add_typer(auth_app)
 
 
 @auth_app.command("login")
-def auth_login() -> None:
-    """Open the browser for Spotify OAuth and store the access token."""
+def auth_login(
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Print the URL instead of opening a browser."
+    ),
+) -> None:
+    """Log in to Spotify: opens the authorization page, then asks for the redirect URL."""
+    auth = _make_auth()
+    auth_url, state = auth.begin_login()
+
+    console.print("\nOpen this URL and authorize SpotifyForge:\n")
+    console.print(f"  [link]{auth_url}[/link]\n")
+    if not no_browser:
+        webbrowser.open(auth_url)
+
+    console.print(
+        "After authorizing, your browser is sent to the redirect URI "
+        "(the page itself may not load — that's fine)."
+    )
+    redirect_url = typer.prompt("Paste the full redirect URL here")
+
     try:
-        from spotifyforge.auth.oauth import SpotifyAuth
+        profile = auth.complete_login(redirect_url, expected_state=state)
+        token = auth.token_store.load_token(profile["user_id"])
+        _upsert_db_user(profile, token)
     except Exception as exc:
-        _error_panel(f"Failed to import auth module: {exc}")
+        _error_panel(f"Login failed: {exc}", title="Authentication Error")
 
-    auth = SpotifyAuth()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Opening browser for Spotify login...", total=None)
-        try:
-            _run(auth.login())
-        except Exception as exc:
-            _error_panel(f"Login failed: {exc}", title="Authentication Error")
+    _current_user_file().parent.mkdir(parents=True, exist_ok=True)
+    _current_user_file().write_text(profile["user_id"], encoding="utf-8")
 
     console.print(
         Panel(
-            "[green]Successfully authenticated with Spotify![/green]\n"
-            "Your access token has been stored securely.",
+            f"[green]Successfully authenticated as "
+            f"[bold]{profile.get('display_name') or profile['user_id']}[/bold]![/green]\n"
+            "Your tokens are stored in the OS keyring.",
             title="Login Successful",
             border_style="green",
             expand=False,
@@ -128,19 +290,8 @@ def auth_login() -> None:
 @auth_app.command("status")
 def auth_status() -> None:
     """Display the current authentication status."""
-    try:
-        from spotifyforge.auth.oauth import SpotifyAuth
-    except Exception as exc:
-        _error_panel(f"Failed to import auth module: {exc}")
-
-    auth = SpotifyAuth()
-
-    try:
-        status = _run(auth.status())
-    except Exception as exc:
-        _error_panel(f"Could not retrieve auth status: {exc}")
-
-    if not status.get("logged_in"):
+    path = _current_user_file()
+    if not path.exists():
         console.print(
             Panel(
                 "[yellow]Not logged in.[/yellow]\n"
@@ -152,36 +303,52 @@ def auth_status() -> None:
         )
         return
 
+    spotify_user_id = path.read_text(encoding="utf-8").strip()
+    auth = _make_auth()
+    try:
+        token = auth.token_store.load_token(spotify_user_id)
+    except Exception:
+        console.print(
+            Panel(
+                f"[yellow]Stored login for [bold]{spotify_user_id}[/bold] has no usable "
+                "token.[/yellow]\nRun [bold]spotifyforge auth login[/bold] again.",
+                title="Auth Status",
+                border_style="yellow",
+                expand=False,
+            )
+        )
+        return
+
+    expires_at = datetime.fromtimestamp(token.expires_at, tz=UTC)
     table = Table(title="Auth Status", box=box.ROUNDED, show_lines=True)
     table.add_column("Property", style="bold cyan")
     table.add_column("Value", style="white")
-
-    table.add_row("User", status.get("display_name", "N/A"))
-    table.add_row("Email", status.get("email", "N/A"))
-    table.add_row("User ID", status.get("user_id", "N/A"))
-    table.add_row("Token Expiry", status.get("token_expiry", "N/A"))
+    table.add_row("User ID", spotify_user_id)
+    table.add_row("Token Expiry", expires_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
     table.add_row(
         "Status",
-        "[green]Active[/green]" if status.get("token_valid") else "[red]Expired[/red]",
+        "[yellow]Expiring (auto-refreshes on use)[/yellow]"
+        if token.is_expiring
+        else "[green]Active[/green]",
     )
-
     console.print(table)
 
 
 @auth_app.command("logout")
 def auth_logout() -> None:
     """Remove stored Spotify tokens."""
-    try:
-        from spotifyforge.auth.oauth import SpotifyAuth
-    except Exception as exc:
-        _error_panel(f"Failed to import auth module: {exc}")
+    path = _current_user_file()
+    if not path.exists():
+        console.print("[yellow]Not logged in — nothing to do.[/yellow]")
+        return
 
-    auth = SpotifyAuth()
-
+    spotify_user_id = path.read_text(encoding="utf-8").strip()
+    auth = _make_auth()
     try:
-        _run(auth.logout())
-    except Exception as exc:
-        _error_panel(f"Logout failed: {exc}")
+        auth.token_store.delete_token(spotify_user_id)
+    except Exception:
+        pass  # token already gone from the keyring
+    path.unlink(missing_ok=True)
 
     console.print(
         Panel(
@@ -206,25 +373,14 @@ app.add_typer(playlist_app)
 
 @playlist_app.command("list")
 def playlist_list() -> None:
-    """Show all user playlists in a Rich table."""
-    try:
-        from spotifyforge.core.playlist_manager import PlaylistManager
-    except Exception as exc:
-        _error_panel(f"Failed to import playlist manager: {exc}")
+    """Show all your playlists in a table."""
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    manager = PlaylistManager()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Fetching playlists...", total=None)
-        try:
-            playlists = _run(manager.get_user_playlists())
-        except Exception as exc:
-            _error_panel(f"Failed to fetch playlists: {exc}")
+    playlists = _run_spotify(
+        "Fetching playlists...",
+        "Failed to fetch playlists",
+        lambda sp: PlaylistManager(sp).get_user_playlists(),
+    )
 
     if not playlists:
         console.print("[yellow]No playlists found.[/yellow]")
@@ -240,7 +396,6 @@ def playlist_list() -> None:
     table.add_column("Name", style="bold white", no_wrap=True)
     table.add_column("Tracks", justify="right", style="cyan")
     table.add_column("Visibility", justify="center")
-    table.add_column("Followers", justify="right", style="green")
     table.add_column("ID", style="dim")
 
     for idx, pl in enumerate(playlists, start=1):
@@ -250,7 +405,6 @@ def playlist_list() -> None:
             pl.get("name", "—"),
             str(pl.get("track_count", 0)),
             visibility,
-            str(pl.get("followers", 0)),
             pl.get("id", "—"),
         )
 
@@ -262,26 +416,14 @@ def playlist_show(
     playlist_id: str = typer.Argument(..., help="Spotify playlist ID to inspect."),
 ) -> None:
     """Display playlist details and its tracks."""
-    try:
-        from spotifyforge.core.playlist_manager import PlaylistManager
-    except Exception as exc:
-        _error_panel(f"Failed to import playlist manager: {exc}")
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    manager = PlaylistManager()
+    details = _run_spotify(
+        "Loading playlist details...",
+        "Failed to fetch playlist",
+        lambda sp: PlaylistManager(sp).get_playlist_details(playlist_id),
+    )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Loading playlist details...", total=None)
-        try:
-            details = _run(manager.get_playlist_details(playlist_id))
-        except Exception as exc:
-            _error_panel(f"Failed to fetch playlist: {exc}")
-
-    # -- Header panel --
     meta = details.get("meta", {})
     visibility = "Public" if meta.get("public") else "Private"
     header_text = (
@@ -294,7 +436,6 @@ def playlist_show(
     )
     console.print(Panel(header_text, title="Playlist Details", border_style="cyan", expand=False))
 
-    # -- Tracks table --
     tracks = details.get("tracks", [])
     if not tracks:
         console.print("[yellow]Playlist has no tracks.[/yellow]")
@@ -332,32 +473,23 @@ def playlist_create(
     ),
 ) -> None:
     """Create a new Spotify playlist."""
-    try:
-        from spotifyforge.core.playlist_manager import PlaylistManager
-    except Exception as exc:
-        _error_panel(f"Failed to import playlist manager: {exc}")
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    manager = PlaylistManager()
+    owner_id = _db_user_id()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Creating playlist...", total=None)
-        try:
-            result = _run(
-                manager.create_playlist(name=name, description=description, public=public)
-            )
-        except Exception as exc:
-            _error_panel(f"Failed to create playlist: {exc}")
+    playlist = _run_spotify(
+        "Creating playlist...",
+        "Failed to create playlist",
+        lambda sp: PlaylistManager(sp).create_playlist(
+            name=name, owner_id=owner_id, description=description, public=public
+        ),
+    )
 
     console.print(
         Panel(
             f"[green]Playlist created![/green]\n\n"
-            f"  Name:        [bold]{result.get('name', name)}[/bold]\n"
-            f"  ID:          {result.get('id', 'N/A')}\n"
+            f"  Name:        [bold]{playlist.name}[/bold]\n"
+            f"  Spotify ID:  {playlist.spotify_id}\n"
             f"  Visibility:  {'Public' if public else 'Private'}\n"
             f"  Description: {description or '(none)'}",
             title="New Playlist",
@@ -372,32 +504,20 @@ def playlist_sync(
     playlist_id: str = typer.Argument(..., help="Spotify playlist ID to sync."),
 ) -> None:
     """Sync a playlist to the local cache database."""
-    try:
-        from spotifyforge.core.playlist_manager import PlaylistManager
-    except Exception as exc:
-        _error_panel(f"Failed to import playlist manager: {exc}")
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    manager = PlaylistManager()
+    owner_id = _db_user_id()
+    playlist = _run_spotify(
+        "Syncing playlist...",
+        "Sync failed",
+        lambda sp: PlaylistManager(sp).sync_playlist(playlist_id, owner_id=owner_id),
+    )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Syncing playlist...", total=None)
-        try:
-            result = _run(manager.sync_playlist(playlist_id))
-        except Exception as exc:
-            _error_panel(f"Sync failed: {exc}")
-        progress.update(task, completed=True)
-
-    tracks_synced = result.get("tracks_synced", 0)
     console.print(
         Panel(
             f"[green]Playlist synced to local cache.[/green]\n\n"
-            f"  Playlist: [bold]{result.get('name', playlist_id)}[/bold]\n"
-            f"  Tracks synced: {tracks_synced}\n"
+            f"  Playlist: [bold]{playlist.name}[/bold]\n"
+            f"  Tracks synced: {playlist.track_count}\n"
             f"  Last synced: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
             title="Sync Complete",
             border_style="green",
@@ -410,27 +530,15 @@ def playlist_sync(
 def playlist_deduplicate(
     playlist_id: str = typer.Argument(..., help="Spotify playlist ID to deduplicate."),
 ) -> None:
-    """Find and remove duplicate tracks from a playlist."""
-    try:
-        from spotifyforge.core.playlist_manager import PlaylistManager
-    except Exception as exc:
-        _error_panel(f"Failed to import playlist manager: {exc}")
+    """Find and remove duplicate tracks from a playlist (keeps one copy of each)."""
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    manager = PlaylistManager()
+    removed = _run_spotify(
+        "Scanning for duplicates...",
+        "Deduplication failed",
+        lambda sp: PlaylistManager(sp).deduplicate(playlist_id),
+    )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Scanning for duplicates...", total=None)
-        try:
-            result = _run(manager.deduplicate(playlist_id))
-        except Exception as exc:
-            _error_panel(f"Deduplication failed: {exc}")
-
-    removed = result.get("removed", 0)
     if removed == 0:
         console.print(
             Panel(
@@ -444,8 +552,7 @@ def playlist_deduplicate(
         console.print(
             Panel(
                 f"[green]Deduplication complete.[/green]\n\n"
-                f"  Removed [bold]{removed}[/bold] duplicate track(s).\n"
-                f"  Remaining tracks: {result.get('remaining', 'N/A')}",
+                f"  Removed [bold]{removed}[/bold] duplicate occurrence(s).",
                 title="Deduplication",
                 border_style="green",
                 expand=False,
@@ -478,24 +585,13 @@ def playlist_export(
     ),
 ) -> None:
     """Export playlist tracks to CSV or JSON."""
-    try:
-        from spotifyforge.core.playlist_manager import PlaylistManager
-    except Exception as exc:
-        _error_panel(f"Failed to import playlist manager: {exc}")
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    manager = PlaylistManager()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Fetching playlist for export...", total=None)
-        try:
-            details = _run(manager.get_playlist_details(playlist_id))
-        except Exception as exc:
-            _error_panel(f"Export failed: {exc}")
+    details = _run_spotify(
+        "Fetching playlist for export...",
+        "Export failed",
+        lambda sp: PlaylistManager(sp).get_playlist_details(playlist_id),
+    )
 
     tracks = details.get("tracks", [])
     if not tracks:
@@ -538,6 +634,17 @@ class TimeRange(StrEnum):
     long_term = "long_term"
 
 
+_RANGE_LABELS = {
+    "short_term": "Last 4 Weeks",
+    "medium_term": "Last 6 Months",
+    "long_term": "All Time",
+}
+
+
+def _artist_names(track: Any) -> str:
+    return ", ".join(a.name for a in track.artists) if track.artists else "Unknown"
+
+
 @discover_app.command("top-tracks")
 def discover_top_tracks(
     time_range: TimeRange = typer.Option(
@@ -557,37 +664,22 @@ def discover_top_tracks(
     ),
 ) -> None:
     """Show your top tracks on Spotify."""
-    try:
-        from spotifyforge.core.discovery import DiscoveryEngine
-    except Exception as exc:
-        _error_panel(f"Failed to import discovery module: {exc}")
+    from spotifyforge.core.discovery import DiscoveryEngine
 
-    discovery = DiscoveryEngine()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Fetching your top tracks...", total=None)
-        try:
-            tracks = _run(discovery.get_top_tracks(time_range=time_range.value, limit=limit))
-        except Exception as exc:
-            _error_panel(f"Failed to fetch top tracks: {exc}")
+    tracks = _run_spotify(
+        "Fetching your top tracks...",
+        "Failed to fetch top tracks",
+        lambda sp: DiscoveryEngine(sp).get_user_top_tracks(
+            time_range=time_range.value, limit=limit
+        ),
+    )
 
     if not tracks:
         console.print("[yellow]No top tracks found for the selected time range.[/yellow]")
         return
 
-    range_labels = {
-        "short_term": "Last 4 Weeks",
-        "medium_term": "Last 6 Months",
-        "long_term": "All Time",
-    }
-
     table = Table(
-        title=f"Your Top Tracks — {range_labels.get(time_range.value, time_range.value)}",
+        title=f"Your Top Tracks — {_RANGE_LABELS.get(time_range.value, time_range.value)}",
         box=box.ROUNDED,
         header_style="bold magenta",
     )
@@ -598,14 +690,12 @@ def discover_top_tracks(
     table.add_column("Popularity", justify="right", style="cyan")
 
     for idx, track in enumerate(tracks, start=1):
-        popularity = track.get("popularity", 0)
-        pop_display = f"{popularity}/100"
         table.add_row(
             str(idx),
-            track.get("name", "—"),
-            track.get("artist", "—"),
-            track.get("album", "—"),
-            pop_display,
+            track.name or "—",
+            _artist_names(track),
+            track.album.name if track.album else "—",
+            f"{track.popularity or 0}/100",
         )
 
     console.print(table)
@@ -613,51 +703,37 @@ def discover_top_tracks(
 
 @discover_app.command("deep-cuts")
 def discover_deep_cuts(
-    artist: str = typer.Argument(..., help="Artist name or Spotify artist ID."),
+    artist_id: str = typer.Argument(..., help="Spotify artist ID."),
     threshold: int = typer.Option(
         30,
         "--threshold",
         "-t",
         min=0,
         max=100,
-        help="Maximum popularity score to qualify as a deep cut (0-100).",
+        help="Tracks with popularity strictly below this value qualify (0-100).",
     ),
 ) -> None:
     """Find an artist's lesser-known tracks (deep cuts)."""
-    try:
-        from spotifyforge.core.discovery import DiscoveryEngine
-    except Exception as exc:
-        _error_panel(f"Failed to import discovery module: {exc}")
+    from spotifyforge.core.discovery import DiscoveryEngine
 
-    discovery = DiscoveryEngine()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task(f"Searching for deep cuts (popularity < {threshold})...", total=None)
-        try:
-            result = _run(discovery.find_deep_cuts(artist=artist, threshold=threshold))
-        except Exception as exc:
-            _error_panel(f"Failed to find deep cuts: {exc}")
-
-    tracks = result.get("tracks", [])
-    artist_name = result.get("artist_name", artist)
+    tracks = _run_spotify(
+        f"Searching for deep cuts (popularity < {threshold})...",
+        "Failed to find deep cuts",
+        lambda sp: DiscoveryEngine(sp).find_deep_cuts(
+            artist_id=artist_id, popularity_threshold=threshold
+        ),
+    )
 
     if not tracks:
         console.print(
-            f"[yellow]No deep cuts found for [bold]{artist_name}[/bold] "
+            f"[yellow]No deep cuts found for artist [bold]{artist_id}[/bold] "
             f"with popularity below {threshold}.[/yellow]"
         )
         return
 
     console.print(
         Panel(
-            f"Found [bold]{len(tracks)}[/bold] deep cuts for "
-            f"[bold cyan]{artist_name}[/bold cyan] "
-            f"(popularity < {threshold})",
+            f"Found [bold]{len(tracks)}[/bold] deep cuts (popularity < {threshold})",
             border_style="cyan",
             expand=False,
         )
@@ -671,13 +747,13 @@ def discover_deep_cuts(
     table.add_column("Duration", justify="right", style="cyan")
 
     for idx, track in enumerate(tracks, start=1):
-        duration_ms = track.get("duration_ms", 0)
+        duration_ms = track.duration_ms or 0
         minutes, seconds = divmod(duration_ms // 1000, 60)
         table.add_row(
             str(idx),
-            track.get("name", "—"),
-            track.get("album", "—"),
-            str(track.get("popularity", 0)),
+            track.name or "—",
+            track.album.name if track.album else "—",
+            str(track.popularity or 0),
             f"{minutes}:{seconds:02d}",
         )
 
@@ -692,39 +768,41 @@ def discover_genre(
         "--limit",
         "-l",
         min=1,
-        max=100,
-        help="Number of tracks to include in the genre playlist (1-100).",
+        max=50,
+        help="Number of tracks to include in the genre playlist (1-50).",
+    ),
+    name: str | None = typer.Option(
+        None, "--name", "-n", help="Playlist name (auto-generated if omitted)."
     ),
 ) -> None:
-    """Build a playlist from a specific genre."""
-    try:
-        from spotifyforge.core.discovery import DiscoveryEngine
-    except Exception as exc:
-        _error_panel(f"Failed to import discovery module: {exc}")
+    """Create a playlist populated with tracks from a genre search."""
+    from spotifyforge.core.discovery import DiscoveryEngine
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    discovery = DiscoveryEngine()
+    owner_id = _db_user_id()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task(f"Building genre playlist for '{genre_name}'...", total=None)
-        try:
-            result = _run(discovery.build_genre_playlist(genre=genre_name, limit=limit))
-        except Exception as exc:
-            _error_panel(f"Failed to build genre playlist: {exc}")
+    async def _build(sp):
+        tracks = await DiscoveryEngine(sp).build_genre_playlist(genre=genre_name, limit=limit)
+        playlist = await PlaylistManager(sp).create_playlist_with_tracks(
+            name=name or f"SpotifyForge: {genre_name.title()}",
+            owner_id=owner_id,
+            tracks=tracks,
+            description=f"Genre playlist: {genre_name}",
+        )
+        return playlist, tracks
 
-    playlist = result.get("playlist", {})
-    tracks = result.get("tracks", [])
+    playlist, tracks = _run_spotify(
+        f"Building genre playlist for '{genre_name}'...",
+        "Failed to build genre playlist",
+        _build,
+    )
 
     console.print(
         Panel(
             f"[green]Genre playlist created![/green]\n\n"
-            f"  Name:   [bold]{playlist.get('name', genre_name)}[/bold]\n"
-            f"  ID:     {playlist.get('id', 'N/A')}\n"
-            f"  Tracks: {len(tracks)}",
+            f"  Name:       [bold]{playlist.name}[/bold]\n"
+            f"  Spotify ID: {playlist.spotify_id}\n"
+            f"  Tracks:     {len(tracks)}",
             title=f"Genre: {genre_name}",
             border_style="green",
             expand=False,
@@ -736,10 +814,8 @@ def discover_genre(
         table.add_column("#", style="dim", justify="right")
         table.add_column("Title", style="white", no_wrap=True, max_width=50)
         table.add_column("Artist", style="green", no_wrap=True, max_width=35)
-
         for idx, track in enumerate(tracks, start=1):
-            table.add_row(str(idx), track.get("name", "—"), track.get("artist", "—"))
-
+            table.add_row(str(idx), track.name or "—", _artist_names(track))
         console.print(table)
 
 
@@ -752,44 +828,38 @@ def discover_time_capsule(
         help="Time range for the capsule: short_term, medium_term, long_term.",
         case_sensitive=False,
     ),
+    name: str | None = typer.Option(
+        None, "--name", "-n", help="Playlist name (auto-generated if omitted)."
+    ),
 ) -> None:
     """Create a time-capsule playlist from your listening history."""
-    try:
-        from spotifyforge.core.discovery import DiscoveryEngine
-    except Exception as exc:
-        _error_panel(f"Failed to import discovery module: {exc}")
+    from spotifyforge.core.discovery import DiscoveryEngine
+    from spotifyforge.core.playlist_manager import PlaylistManager
 
-    discovery = DiscoveryEngine()
+    owner_id = _db_user_id()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Building your time capsule...", total=None)
-        try:
-            result = _run(discovery.create_time_capsule(time_range=time_range.value))
-        except Exception as exc:
-            _error_panel(f"Failed to create time capsule: {exc}")
+    async def _build(sp):
+        tracks = await DiscoveryEngine(sp).build_time_capsule(time_range=time_range.value)
+        playlist = await PlaylistManager(sp).create_playlist_with_tracks(
+            name=name or f"SpotifyForge: Time Capsule ({time_range.value})",
+            owner_id=owner_id,
+            tracks=tracks,
+            description=f"Time capsule playlist ({time_range.value})",
+            public=False,
+        )
+        return playlist, len(tracks)
 
-    playlist = result.get("playlist", {})
-    track_count = result.get("track_count", 0)
-
-    range_labels = {
-        "short_term": "Last 4 Weeks",
-        "medium_term": "Last 6 Months",
-        "long_term": "All Time",
-    }
+    playlist, track_count = _run_spotify(
+        "Building your time capsule...", "Failed to create time capsule", _build
+    )
 
     console.print(
         Panel(
             f"[green]Time capsule created![/green]\n\n"
-            f"  Name:       [bold]{playlist.get('name', 'Time Capsule')}[/bold]\n"
-            f"  ID:         {playlist.get('id', 'N/A')}\n"
+            f"  Name:       [bold]{playlist.name}[/bold]\n"
+            f"  Spotify ID: {playlist.spotify_id}\n"
             f"  Tracks:     {track_count}\n"
-            f"  Time range: {range_labels.get(time_range.value, time_range.value)}\n"
-            f"  Created:    {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            f"  Time range: {_RANGE_LABELS.get(time_range.value, time_range.value)}",
             title="Time Capsule",
             border_style="magenta",
             expand=False,
@@ -810,18 +880,19 @@ app.add_typer(schedule_app)
 
 @schedule_app.command("list")
 def schedule_list() -> None:
-    """Display all scheduled jobs in a table."""
-    try:
-        from spotifyforge.core.scheduler import Scheduler
-    except Exception as exc:
-        _error_panel(f"Failed to import scheduler module: {exc}")
+    """Display your scheduled jobs in a table."""
+    from sqlmodel import Session, select
 
-    scheduler = Scheduler()
+    from spotifyforge.db.engine import get_engine
+    from spotifyforge.models.models import Playlist, ScheduledJob
 
-    try:
-        jobs = _run(scheduler.list_jobs())
-    except Exception as exc:
-        _error_panel(f"Failed to list scheduled jobs: {exc}")
+    user_id = _db_user_id()
+    with Session(get_engine()) as session:
+        jobs = list(session.exec(select(ScheduledJob).where(ScheduledJob.user_id == user_id)).all())
+        playlist_names = {
+            p.id: p.name
+            for p in session.exec(select(Playlist).where(Playlist.owner_id == user_id)).all()
+        }
 
     if not jobs:
         console.print(
@@ -841,31 +912,26 @@ def schedule_list() -> None:
         show_lines=True,
         header_style="bold magenta",
     )
-    table.add_column("ID", style="bold cyan")
+    table.add_column("ID", style="bold cyan", justify="right")
     table.add_column("Name", style="white")
     table.add_column("Type", style="green")
     table.add_column("Playlist", style="dim")
     table.add_column("Cron", style="yellow")
-    table.add_column("Next Run", style="cyan")
+    table.add_column("Last Run", style="cyan")
     table.add_column("Status", justify="center")
 
     for job in jobs:
-        status = job.get("status", "unknown")
-        if status == "active":
-            status_display = "[green]Active[/green]"
-        elif status == "paused":
-            status_display = "[yellow]Paused[/yellow]"
-        else:
-            status_display = f"[dim]{status}[/dim]"
-
+        status = "[green]Enabled[/green]" if job.enabled else "[yellow]Disabled[/yellow]"
+        if job.failure_count:
+            status = f"[red]Failing ({job.failure_count})[/red]"
         table.add_row(
-            job.get("id", "—"),
-            job.get("name", "—"),
-            job.get("type", "—"),
-            job.get("playlist_id", "—"),
-            job.get("cron", "—"),
-            job.get("next_run", "—"),
-            status_display,
+            str(job.id),
+            job.name,
+            str(job.job_type),
+            playlist_names.get(job.playlist_id, "—") if job.playlist_id else "—",
+            job.cron_expression,
+            job.last_run_at.strftime("%Y-%m-%d %H:%M") if job.last_run_at else "never",
+            status,
         )
 
     console.print(table)
@@ -874,42 +940,122 @@ def schedule_list() -> None:
 @schedule_app.command("add")
 def schedule_add(
     name: str = typer.Option(..., "--name", "-n", help="Human-friendly name for the job."),
-    type: str = typer.Option(
+    job_type: str = typer.Option(
         ...,
         "--type",
         "-t",
-        help="Job type (e.g. 'sync', 'deduplicate', 'discover', 'time-capsule').",
+        help="Job type: sync, archive, deduplicate, genre_refresh, or time_capsule.",
     ),
-    playlist: str = typer.Option(..., "--playlist", "-p", help="Target Spotify playlist ID."),
     cron: str = typer.Option(
         ...,
         "--cron",
         "-c",
-        help="Cron expression for scheduling (e.g. '0 8 * * 1' for Mondays at 8 AM).",
+        help="Cron expression (5 fields, e.g. '0 8 * * 1' for Mondays at 8 AM).",
+    ),
+    playlist: str | None = typer.Option(
+        None,
+        "--playlist",
+        "-p",
+        help="Target Spotify playlist ID (required for all types except time_capsule).",
+    ),
+    genre: str | None = typer.Option(
+        None, "--genre", "-g", help="Genre seed (required for genre_refresh jobs)."
+    ),
+    source_playlist: str | None = typer.Option(
+        None,
+        "--source-playlist",
+        help="Source Spotify playlist ID (required for archive jobs).",
+    ),
+    time_range: TimeRange = typer.Option(
+        TimeRange.short_term,
+        "--time-range",
+        help="Time range for time_capsule jobs.",
+        case_sensitive=False,
     ),
 ) -> None:
-    """Add a new scheduled job."""
-    try:
-        from spotifyforge.core.scheduler import Scheduler
-    except Exception as exc:
-        _error_panel(f"Failed to import scheduler module: {exc}")
+    """Add a new scheduled job (stored in the database; run by the server or 'schedule run')."""
+    from sqlmodel import Session, select
 
-    scheduler = Scheduler()
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.scheduler import validate_cron
+    from spotifyforge.db.engine import get_engine
+    from spotifyforge.models.models import JobType, Playlist, ScheduledJob
 
     try:
-        result = _run(scheduler.add_job(name=name, job_type=type, playlist_id=playlist, cron=cron))
-    except Exception as exc:
-        _error_panel(f"Failed to add scheduled job: {exc}")
+        jt = JobType(job_type)
+    except ValueError:
+        _error_panel(
+            f"Unknown job type [bold]{job_type}[/bold].\n"
+            f"Valid types: {', '.join(t.value for t in JobType)}",
+            title="Invalid Job Type",
+        )
+
+    if validate_cron(cron) is None:
+        _error_panel(
+            f"Invalid cron expression: [bold]{cron}[/bold]\n"
+            "Expected 5 fields: 'minute hour day month day_of_week'.",
+            title="Invalid Cron Expression",
+        )
+
+    needs_playlist = jt is not JobType.time_capsule
+    if needs_playlist and not playlist:
+        _error_panel(f"Job type '{jt.value}' requires --playlist.")
+    if jt is JobType.genre_refresh and not genre:
+        _error_panel("genre_refresh jobs require --genre.")
+    if jt is JobType.archive and not source_playlist:
+        _error_panel("archive jobs require --source-playlist.")
+
+    user_id = _db_user_id()
+
+    # Resolve (or auto-sync) the local playlist row for the FK.
+    playlist_pk: int | None = None
+    if playlist:
+        with Session(get_engine()) as session:
+            row = session.exec(
+                select(Playlist).where(
+                    Playlist.spotify_id == playlist, Playlist.owner_id == user_id
+                )
+            ).first()
+        if row is None:
+            console.print(f"[dim]Playlist {playlist} not in local cache — syncing it first.[/dim]")
+            row = _run_spotify(
+                f"Syncing playlist {playlist}...",
+                f"Could not sync playlist {playlist}",
+                lambda sp: PlaylistManager(sp).sync_playlist(playlist, owner_id=user_id),
+            )
+        playlist_pk = row.id
+
+    config: dict[str, Any] = {}
+    if genre:
+        config["genre"] = genre
+    if source_playlist:
+        config["source_playlist_id"] = source_playlist
+    if jt is JobType.time_capsule:
+        config["time_range"] = time_range.value
+
+    with Session(get_engine()) as session:
+        job = ScheduledJob(
+            user_id=user_id,
+            name=name,
+            job_type=jt,
+            playlist_id=playlist_pk,
+            config=config or None,
+            cron_expression=cron,
+            enabled=True,
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
 
     console.print(
         Panel(
             f"[green]Job scheduled successfully![/green]\n\n"
-            f"  Job ID:   [bold]{result.get('id', 'N/A')}[/bold]\n"
+            f"  Job ID:   [bold]{job.id}[/bold]\n"
             f"  Name:     {name}\n"
-            f"  Type:     {type}\n"
-            f"  Playlist: {playlist}\n"
-            f"  Cron:     {cron}\n"
-            f"  Next run: {result.get('next_run', 'N/A')}",
+            f"  Type:     {jt.value}\n"
+            f"  Playlist: {playlist or '—'}\n"
+            f"  Cron:     {cron}\n\n"
+            "It runs whenever the API server or [bold]spotifyforge schedule run[/bold] is up.",
             title="Job Added",
             border_style="green",
             expand=False,
@@ -919,20 +1065,23 @@ def schedule_add(
 
 @schedule_app.command("remove")
 def schedule_remove(
-    job_id: str = typer.Argument(..., help="ID of the scheduled job to remove."),
+    job_id: int = typer.Argument(..., help="ID of the scheduled job to remove."),
 ) -> None:
     """Remove a scheduled job."""
-    try:
-        from spotifyforge.core.scheduler import Scheduler
-    except Exception as exc:
-        _error_panel(f"Failed to import scheduler module: {exc}")
+    from sqlmodel import Session, select
 
-    scheduler = Scheduler()
+    from spotifyforge.db.engine import get_engine
+    from spotifyforge.models.models import ScheduledJob
 
-    try:
-        _run(scheduler.remove_job(job_id))
-    except Exception as exc:
-        _error_panel(f"Failed to remove job: {exc}")
+    user_id = _db_user_id()
+    with Session(get_engine()) as session:
+        job = session.exec(
+            select(ScheduledJob).where(ScheduledJob.id == job_id, ScheduledJob.user_id == user_id)
+        ).first()
+        if job is None:
+            _error_panel(f"Scheduled job {job_id} not found.")
+        session.delete(job)
+        session.commit()
 
     console.print(f"[green]Job [bold]{job_id}[/bold] removed successfully.[/green]")
 
@@ -940,10 +1089,8 @@ def schedule_remove(
 @schedule_app.command("run")
 def schedule_run() -> None:
     """Start the scheduler daemon (foreground process)."""
-    try:
-        from spotifyforge.core.scheduler import Scheduler
-    except Exception as exc:
-        _error_panel(f"Failed to import scheduler module: {exc}")
+    from spotifyforge.core.scheduler import get_scheduler_service
+    from spotifyforge.db.engine import init_db
 
     if not settings.scheduler_enabled:
         _error_panel(
@@ -952,7 +1099,7 @@ def schedule_run() -> None:
             title="Scheduler Disabled",
         )
 
-    scheduler = Scheduler()
+    init_db()
 
     console.print(
         Panel(
@@ -964,12 +1111,20 @@ def schedule_run() -> None:
         )
     )
 
+    async def _daemon():
+        service = get_scheduler_service()
+        service.start()
+        count = await service.load_jobs_from_db()
+        console.print(f"[dim]Loaded {count} enabled job(s).[/dim]")
+        try:
+            await asyncio.Event().wait()  # run until interrupted
+        finally:
+            service.stop(wait=False)
+
     try:
-        _run(scheduler.start())
+        _run(_daemon())
     except KeyboardInterrupt:
         console.print("\n[yellow]Scheduler stopped by user.[/yellow]")
-    except Exception as exc:
-        _error_panel(f"Scheduler error: {exc}")
 
 
 # ╔═════════════════════════════════════════════════════════════════════════╗
@@ -982,10 +1137,14 @@ config_app = typer.Typer(
 )
 app.add_typer(config_app)
 
+_SECRET_FIELDS = {"spotify_client_id", "spotify_client_secret", "secret_key"}
+
 
 @config_app.command("show")
 def config_show() -> None:
-    """Display the current SpotifyForge configuration."""
+    """Display the current SpotifyForge configuration (secrets masked)."""
+    import os
+
     table = Table(
         title="SpotifyForge Configuration",
         box=box.ROUNDED,
@@ -996,24 +1155,15 @@ def config_show() -> None:
     table.add_column("Value", style="white")
     table.add_column("Source", style="dim")
 
-    # Iterate over all fields in Settings and display their current values.
-    # Mask secrets for safety.
-    secret_fields = {"spotify_client_id", "spotify_client_secret"}
-
-    for field_name, field_info in Settings.model_fields.items():
+    for field_name in Settings.model_fields:
         value = getattr(settings, field_name)
         display_value = str(value)
 
-        if field_name in secret_fields and value:
-            # Mask all but the last 4 characters.
+        if field_name in _SECRET_FIELDS and value:
             display_value = "****" + display_value[-4:] if len(display_value) > 4 else "****"
 
-        # Determine source — environment variable or default.
         env_key = f"SPOTIFYFORGE_{field_name.upper()}"
-        import os
-
         source = "env" if os.environ.get(env_key) else "default"
-
         table.add_row(field_name, display_value, source)
 
     console.print(table)
@@ -1024,11 +1174,7 @@ def config_set(
     key: str = typer.Argument(..., help="Configuration key (e.g. 'spotify_client_id')."),
     value: str = typer.Argument(..., help="New value for the configuration key."),
 ) -> None:
-    """Set a configuration value in the .env file.
-
-    This writes or updates the key in the project-level ``.env`` file so
-    the value persists across sessions.
-    """
+    """Set a configuration value in the .env file."""
     valid_keys = set(Settings.model_fields.keys())
     if key not in valid_keys:
         _error_panel(
@@ -1040,7 +1186,6 @@ def config_set(
     env_key = f"SPOTIFYFORGE_{key.upper()}"
     env_path = Path(".env")
 
-    # Read existing .env content.
     lines: list[str] = []
     found = False
     if env_path.exists():
@@ -1058,9 +1203,10 @@ def config_set(
 
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    display_value = "****" if key in _SECRET_FIELDS else value
     console.print(
         f"[green]Configuration updated:[/green] "
-        f"[bold]{key}[/bold] = [cyan]{value}[/cyan]  "
+        f"[bold]{key}[/bold] = [cyan]{display_value}[/cyan]  "
         f"(written to .env as {env_key})"
     )
 

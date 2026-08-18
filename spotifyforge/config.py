@@ -46,8 +46,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_config(self) -> "Settings":
-        """Validate that required settings are present for production."""
-        if self.environment == "production":
+        """Validate required settings and normalise paths.
+
+        Any environment other than the literal ``development`` is treated
+        as production-like: credentials and the secret key must be set
+        explicitly so nothing silently falls back to insecure defaults.
+        """
+        self.db_path = self.db_path.expanduser()
+        if self.environment != "development":
             missing = []
             if not self.spotify_client_id:
                 missing.append("SPOTIFYFORGE_SPOTIFY_CLIENT_ID")
@@ -57,7 +63,8 @@ class Settings(BaseSettings):
                 missing.append("SPOTIFYFORGE_SECRET_KEY")
             if missing:
                 raise ValueError(
-                    f"Production mode requires these environment variables: {', '.join(missing)}"
+                    f"Environment {self.environment!r} requires these "
+                    f"environment variables: {', '.join(missing)}"
                 )
         return self
 

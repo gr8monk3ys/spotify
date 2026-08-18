@@ -70,8 +70,10 @@ cp .env.example .env
 spotifyforge auth login
 ```
 
-This opens your browser for Spotify OAuth. Tokens are stored securely via
-`keyring`.
+This opens your browser for Spotify OAuth. After you authorize, your browser
+lands on the redirect URI (the page itself may not load — that's expected
+when the API server isn't running); paste that full redirect URL back into
+the prompt. Tokens are stored securely via `keyring`.
 
 ### 4. Run Your First Command
 
@@ -101,9 +103,9 @@ spotifyforge playlist export <playlist_id> -f csv -o tracks.csv
 
 # Discovery
 spotifyforge discover top-tracks --time-range short_term --limit 10
-spotifyforge discover deep-cuts "Radiohead" --threshold 25
-spotifyforge discover genre indie-rock --limit 30
-spotifyforge discover time-capsule --time-range long_term
+spotifyforge discover deep-cuts 4Z8W4fKeB5YxbusRsdQVPb --threshold 25   # takes a Spotify artist ID
+spotifyforge discover genre indie-rock --limit 30                       # creates a playlist (max 50 tracks)
+spotifyforge discover time-capsule --time-range long_term               # creates a playlist
 
 # Scheduling
 spotifyforge schedule list
@@ -145,8 +147,9 @@ Interactive API docs are available at `http://localhost:8000/docs` (Swagger UI).
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
-| `GET` | `/api/auth/login` | Get Spotify OAuth URL |
+| `GET` | `/api/auth/login` | Get Spotify OAuth URL (sets CSRF state cookie) |
 | `GET` | `/api/auth/me` | Current user profile |
+| `POST` | `/api/auth/logout` | Clear the session cookie |
 | `GET` | `/api/playlists` | List user playlists |
 | `POST` | `/api/playlists` | Create a playlist |
 | `GET` | `/api/playlists/{id}` | Get playlist details |
@@ -168,7 +171,18 @@ Interactive API docs are available at `http://localhost:8000/docs` (Swagger UI).
 ## Scheduling Examples
 
 SpotifyForge uses APScheduler with standard 5-field cron expressions
-(`minute hour day month day_of_week`).
+(`minute hour day month day_of_week`). Jobs run inside the API server, or in
+the standalone daemon started with `spotifyforge schedule run`.
+
+The job types (shared by the CLI, API, and scheduler):
+
+| Type | Does | Extra options |
+|------|------|---------------|
+| `sync` | Sync a playlist into the local cache | `--playlist` |
+| `archive` | Append a source playlist into a target (e.g. Discover Weekly) | `--playlist`, `--source-playlist` |
+| `deduplicate` | Remove duplicate tracks, keeping one copy of each | `--playlist` |
+| `genre_refresh` | Refresh a playlist from a genre search | `--playlist`, `--genre` |
+| `time_capsule` | Snapshot your current top tracks into a new playlist | `--time-range` |
 
 ```bash
 # Sync a playlist every Monday at 8:00 AM
@@ -177,6 +191,14 @@ spotifyforge schedule add \
     --type sync \
     --playlist 37i9dQZF1DXcBWIGoYBM5M \
     --cron "0 8 * * 1"
+
+# Archive Discover Weekly into a keeper playlist every Monday
+spotifyforge schedule add \
+    --name "DW archive" \
+    --type archive \
+    --playlist <target_playlist_id> \
+    --source-playlist <discover_weekly_id> \
+    --cron "0 9 * * 1"
 
 # Deduplicate a playlist daily at midnight
 spotifyforge schedule add \
@@ -196,13 +218,14 @@ prefix) or a `.env` file. See `.env.example` for a complete template.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SPOTIFYFORGE_ENVIRONMENT` | `development` | Set to `production` to enforce required settings |
-| `SPOTIFYFORGE_SECRET_KEY` | `""` | Encryption key for tokens (required in production) |
+| `SPOTIFYFORGE_ENVIRONMENT` | `development` | Any other value enforces required settings (secret key + credentials) |
+| `SPOTIFYFORGE_SECRET_KEY` | `""` | Encryption/signing key (required outside development) |
 | `SPOTIFYFORGE_SPOTIFY_CLIENT_ID` | `""` | Spotify app client ID (required) |
 | `SPOTIFYFORGE_SPOTIFY_CLIENT_SECRET` | `""` | Spotify app client secret (required) |
 | `SPOTIFYFORGE_SPOTIFY_REDIRECT_URI` | `http://localhost:8000/api/auth/callback` | OAuth redirect URI |
 | `SPOTIFYFORGE_DB_PATH` | `~/.spotifyforge/spotifyforge.db` | SQLite database path |
 | `SPOTIFYFORGE_DATABASE_URL` | `""` | Database URL; overrides DB_PATH (e.g. `postgresql://...`) |
+| `SPOTIFYFORGE_CORS_ORIGINS` | localhost dev origins | Comma-separated allowed CORS origins |
 | `SPOTIFYFORGE_WEB_HOST` | `127.0.0.1` | API server bind address |
 | `SPOTIFYFORGE_WEB_PORT` | `8000` | API server port |
 | `SPOTIFYFORGE_LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |

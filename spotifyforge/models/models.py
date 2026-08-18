@@ -6,7 +6,7 @@ request/response schemas consumed by the CLI and FastAPI web layers.
 """
 
 import enum
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -30,14 +30,33 @@ class AudioFeaturesSource(enum.StrEnum):
 
 
 class JobType(enum.StrEnum):
-    """Kinds of scheduled jobs the platform can execute."""
+    """Kinds of scheduled jobs the platform can execute.
 
-    playlist_update = "playlist_update"
-    playlist_sync = "playlist_sync"
-    playlist_archive = "playlist_archive"
-    discovery_refresh = "discovery_refresh"
-    stats_snapshot = "stats_snapshot"
-    health_check = "health_check"
+    This is the single job vocabulary: the API validates against it, the
+    scheduler dispatches on it, and the CLI offers it as choices. Every
+    member has a real handler in ``core.scheduler``.
+    """
+
+    sync = "sync"
+    archive = "archive"
+    deduplicate = "deduplicate"
+    genre_refresh = "genre_refresh"
+    time_capsule = "time_capsule"
+
+
+def utc_now() -> datetime:
+    """Timezone-aware UTC now, used for every model timestamp.
+
+    SQLite stores these naive; :func:`as_utc` re-attaches UTC on read.
+    """
+    return datetime.now(UTC)
+
+
+def as_utc(dt: datetime | None) -> datetime | None:
+    """Interpret a (possibly naive) stored timestamp as UTC."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 class RuleType(enum.StrEnum):
@@ -73,12 +92,11 @@ class User(SQLModel, table=True):
     )
     refresh_token_enc: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     token_expiry: datetime | None = Field(default=None)
-    token_hash: str | None = Field(default=None, index=True)
 
     is_premium: bool = Field(default=False)
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     # Relationships
     playlists: list["Playlist"] = Relationship(back_populates="owner")
@@ -100,7 +118,7 @@ class Track(SQLModel, table=True):
     duration_ms: int = Field(default=0)
     popularity: int | None = Field(default=None, ge=0, le=100)
     isrc: str | None = Field(default=None, max_length=16)
-    cached_at: datetime = Field(default_factory=datetime.utcnow)
+    cached_at: datetime = Field(default_factory=utc_now)
 
     # Relationships
     audio_features: list["AudioFeatures"] = Relationship(back_populates="track")
@@ -117,7 +135,7 @@ class Artist(SQLModel, table=True):
     name: str = Field(max_length=512)
     genres: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     popularity: int | None = Field(default=None, ge=0, le=100)
-    cached_at: datetime = Field(default_factory=datetime.utcnow)
+    cached_at: datetime = Field(default_factory=utc_now)
 
 
 class Album(SQLModel, table=True):
@@ -131,7 +149,7 @@ class Album(SQLModel, table=True):
     artist_ids: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     release_date: str | None = Field(default=None, max_length=16)
     total_tracks: int | None = Field(default=None)
-    cached_at: datetime = Field(default_factory=datetime.utcnow)
+    cached_at: datetime = Field(default_factory=utc_now)
 
 
 class AudioFeatures(SQLModel, table=True):
@@ -165,7 +183,7 @@ class AudioFeatures(SQLModel, table=True):
     instrumentalness: float | None = Field(default=None, ge=0.0, le=1.0)
     liveness: float | None = Field(default=None, ge=0.0, le=1.0)
 
-    cached_at: datetime = Field(default_factory=datetime.utcnow)
+    cached_at: datetime = Field(default_factory=utc_now)
 
     # Relationship
     track: Track | None = Relationship(back_populates="audio_features")
@@ -189,8 +207,8 @@ class Playlist(SQLModel, table=True):
     last_synced_at: datetime | None = Field(default=None)
     deleted_at: datetime | None = Field(default=None, index=True)
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     # Relationships
     owner: User | None = Relationship(back_populates="playlists")
@@ -203,10 +221,9 @@ class PlaylistTrack(SQLModel, table=True):
     """Association between a playlist and its tracks, preserving order."""
 
     __tablename__ = "playlist_tracks"
-    __table_args__ = (
-        UniqueConstraint("playlist_id", "track_id", name="uq_playlist_track"),
-        Index("ix_playlist_tracks_playlist_position", "playlist_id", "position"),
-    )
+    # No (playlist_id, track_id) uniqueness: Spotify playlists can legally
+    # contain the same track at multiple positions, and sync must mirror that.
+    __table_args__ = (Index("ix_playlist_tracks_playlist_position", "playlist_id", "position"),)
 
     id: int | None = Field(default=None, primary_key=True)
     playlist_id: int = Field(foreign_key="playlists.id", index=True)
@@ -247,8 +264,8 @@ class ScheduledJob(SQLModel, table=True):
     next_run_at: datetime | None = Field(default=None)
     failure_count: int = Field(default=0)
     last_error: str | None = Field(default=None)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     # Relationships
     user: User | None = Relationship(back_populates="scheduled_jobs")
@@ -275,8 +292,8 @@ class CurationRule(SQLModel, table=True):
     enabled: bool = Field(default=True)
     priority: int = Field(default=0)
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     # Relationships
     user: User | None = Relationship(back_populates="curation_rules")
@@ -377,7 +394,9 @@ class ScheduledJobCreate(BaseModel):
     model_config = ConfigDict(strict=True)
 
     name: str = PydanticField(min_length=1, max_length=256)
-    job_type: JobType
+    # strict=False: JSON carries the enum as its string value ("sync");
+    # model-level strict mode would reject every real API request.
+    job_type: JobType = PydanticField(strict=False)
     playlist_id: int | None = None
     config: dict[str, Any] | None = None
     cron_expression: str = PydanticField(min_length=1, max_length=128)

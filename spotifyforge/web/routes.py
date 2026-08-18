@@ -4,24 +4,35 @@ Organizes all endpoints into four ``APIRouter`` instances:
 
 * **auth_router** -- authentication and session management
 * **playlist_router** -- CRUD and operations on Spotify playlists
-* **discovery_router** -- music discovery and recommendation features
+* **discovery_router** -- music discovery features
 * **schedule_router** -- scheduled automation job management
 
 Each router is included by :func:`spotifyforge.web.app.create_app`.
+All Spotify-backed routes obtain their client through the
+``get_spotify`` dependency, which decrypts (and refreshes) the user's
+stored tokens — routes never touch token material directly.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
+import tekore as tk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from sqlmodel import col, select
 
+from spotifyforge.auth.oauth import build_auth_url, exchange_code, get_spotify_user
+from spotifyforge.core.clients import apply_user_profile, apply_user_tokens
+from spotifyforge.core.discovery import DiscoveryEngine, artist_to_dict, track_to_dict
+from spotifyforge.core.playlist_manager import PlaylistManager
+from spotifyforge.core.scheduler import register_job, unregister_job, validate_cron
 from spotifyforge.models.models import (
+    JobType,
     Playlist,
     PlaylistCreate,
     PlaylistResponse,
@@ -32,16 +43,24 @@ from spotifyforge.models.models import (
     TrackResponse,
     User,
 )
-from spotifyforge.security import encrypt_token, hash_token
+from spotifyforge.security import (
+    SESSION_TTL_SECONDS,
+    generate_csrf_state,
+    sign_session,
+    verify_csrf_state,
+)
+from spotifyforge.web.deps import SESSION_COOKIE, get_current_user, get_db_session, get_spotify
 
 logger = logging.getLogger("spotifyforge.web.routes")
 
+STATE_COOKIE = "spotifyforge_oauth_state"
 
-# ---------------------------------------------------------------------------
-# Dependency injection helpers (imported from dedicated module to avoid
-# circular imports with app.py)
-# ---------------------------------------------------------------------------
-from spotifyforge.web.deps import get_current_user, get_db_session
+# Shared attributes for every cookie we set or delete; mismatched
+# attributes between set_cookie and delete_cookie silently break deletion.
+_COOKIE_ATTRS: dict[str, Any] = {"httponly": True, "samesite": "lax"}
+
+_TRACK_URI_RE = re.compile(r"^spotify:track:[A-Za-z0-9]{10,64}$")
+_MAX_TRACK_URIS = 1000
 
 # =========================================================================
 # Auth Router
@@ -50,16 +69,24 @@ auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 @auth_router.get("/login", summary="Get Spotify login URL")
-async def auth_login() -> dict[str, str]:
-    """Return the Spotify authorization URL.
+async def auth_login(request: Request) -> JSONResponse:
+    """Return the Spotify authorization URL and set the CSRF state cookie.
 
-    The front-end should redirect the user's browser to the returned URL
-    so they can grant SpotifyForge access to their Spotify account.
+    The front-end should redirect the user's browser to the returned URL.
+    The random ``state`` embedded in it is also stored in a short-lived,
+    HttpOnly cookie; the callback requires the two to match.
     """
-    from spotifyforge.auth.oauth import build_auth_url
-
-    auth_url = build_auth_url()
-    return {"auth_url": auth_url}
+    state = generate_csrf_state()
+    auth_url = build_auth_url(state=state)
+    response = JSONResponse(content={"auth_url": auth_url})
+    response.set_cookie(
+        key=STATE_COOKIE,
+        value=state,
+        secure=request.url.scheme == "https",
+        max_age=600,  # the OAuth dance should take minutes, not hours
+        **_COOKIE_ATTRS,
+    )
+    return response
 
 
 @auth_router.get(
@@ -71,18 +98,23 @@ async def auth_callback(
     request: Request,
     code: str = Query(..., description="Authorization code from Spotify"),
     state: str | None = Query(default=None, description="Anti-CSRF state parameter"),
+    db: AsyncSession = Depends(get_db_session),
 ) -> RedirectResponse:
     """Handle the Spotify OAuth callback.
 
-    Exchanges the authorization code for tokens, upserts the user record
-    in the database, sets a session cookie, and redirects to the
-    front-end dashboard.
+    Validates the CSRF state against the login cookie, exchanges the
+    authorization code for tokens, upserts the user record, and sets the
+    signed session cookie.
     """
-    from spotifyforge.auth.oauth import exchange_code, get_spotify_user
-    from spotifyforge.web.app import get_db_session
+    expected_state = request.cookies.get(STATE_COOKIE)
+    if not expected_state or not verify_csrf_state(expected_state, state):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth state mismatch. Please restart the login flow.",
+        )
 
     try:
-        token_info = await exchange_code(code, state=state)
+        token_info = await exchange_code(code)
     except Exception as exc:
         logger.error("Token exchange failed: %s", exc)
         raise HTTPException(
@@ -99,63 +131,33 @@ async def auth_callback(
             detail="Failed to retrieve Spotify user profile.",
         ) from exc
 
-    # Obtain a database session manually (not via Depends in redirect handler)
-    session_gen = get_db_session()
-    db: AsyncSession = await session_gen.__anext__()
-    try:
-        result = await db.execute(select(User).where(User.spotify_id == spotify_user["id"]))
-        user = result.scalars().first()
+    result = await db.execute(select(User).where(User.spotify_id == spotify_user["id"]))
+    user = result.scalars().first()
+    if user is None:
+        user = User(spotify_id=spotify_user["id"])
 
-        if user is None:
-            user = User(
-                spotify_id=spotify_user["id"],
-                display_name=spotify_user.get("display_name"),
-                email=spotify_user.get("email"),
-                access_token_enc=encrypt_token(token_info["access_token"]),
-                refresh_token_enc=encrypt_token(token_info["refresh_token"])
-                if token_info.get("refresh_token")
-                else None,
-                token_expiry=datetime.fromtimestamp(token_info["expires_at"], tz=UTC)
-                if token_info.get("expires_at")
-                else None,
-                token_hash=hash_token(token_info["access_token"]),
-                is_premium=spotify_user.get("product") == "premium",
-            )
-            db.add(user)
-        else:
-            user.access_token_enc = encrypt_token(token_info["access_token"])
-            user.refresh_token_enc = (
-                encrypt_token(token_info["refresh_token"])
-                if token_info.get("refresh_token")
-                else user.refresh_token_enc
-            )
-            user.token_expiry = (
-                datetime.fromtimestamp(token_info["expires_at"], tz=UTC)
-                if token_info.get("expires_at")
-                else None
-            )
-            user.token_hash = hash_token(token_info["access_token"])
-            user.display_name = spotify_user.get("display_name", user.display_name)
-            user.email = spotify_user.get("email", user.email)
-            user.is_premium = spotify_user.get("product") == "premium"
-            user.updated_at = datetime.now(UTC)
-            db.add(user)
+    apply_user_profile(user, spotify_user)
+    apply_user_tokens(
+        user,
+        token_info["access_token"],
+        token_info.get("refresh_token"),
+        token_info.get("expires_at"),
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    assert user.id is not None  # persisted above
 
-        await db.commit()
-        await db.refresh(user)
-
-        response = RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-        response.set_cookie(
-            key="spotifyforge_user_id",
-            value=str(user.id),
-            httponly=True,
-            secure=request.url.scheme == "https",  # Secure in production
-            samesite="lax",
-            max_age=60 * 60 * 24 * 7,  # 7 days (was 30)
-        )
-        return response
-    finally:
-        await db.close()
+    response = RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=sign_session(user.id),
+        secure=request.url.scheme == "https",
+        max_age=SESSION_TTL_SECONDS,
+        **_COOKIE_ATTRS,
+    )
+    response.delete_cookie(key=STATE_COOKIE, **_COOKIE_ATTRS)
+    return response
 
 
 @auth_router.get("/me", summary="Get current user info")
@@ -174,28 +176,55 @@ async def auth_me(
 
 
 @auth_router.post("/logout", summary="Log out current user")
-async def auth_logout() -> dict[str, str]:
-    """Clear the session cookie and log the user out.
-
-    The front-end should discard any cached auth state after calling
-    this endpoint.
-    """
-    response_data = {"detail": "Logged out successfully."}
-    from fastapi.responses import JSONResponse
-
-    response = JSONResponse(content=response_data)
-    response.delete_cookie(
-        key="spotifyforge_user_id",
-        httponly=True,
-        samesite="lax",
-    )
-    return response  # type: ignore[return-value]
+async def auth_logout() -> JSONResponse:
+    """Clear the session cookie and log the user out."""
+    response = JSONResponse(content={"detail": "Logged out successfully."})
+    response.delete_cookie(key=SESSION_COOKIE, **_COOKIE_ATTRS)
+    return response
 
 
 # =========================================================================
 # Playlist Router
 # =========================================================================
 playlist_router = APIRouter(prefix="/api/playlists", tags=["playlists"])
+
+
+async def _owned_playlist(playlist_id: int, user: User, db: AsyncSession) -> Playlist:
+    """Load a playlist owned by *user* or raise 404."""
+    result = await db.execute(
+        select(Playlist).where(
+            Playlist.id == playlist_id,
+            Playlist.owner_id == user.id,
+        )
+    )
+    playlist = result.scalars().first()
+    if playlist is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Playlist {playlist_id} not found.",
+        )
+    return playlist
+
+
+def _validated_uris(uris: list[str]) -> list[str]:
+    """Validate a track-URI payload: non-empty, bounded, well-formed."""
+    if not uris:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one track URI is required.",
+        )
+    if len(uris) > _MAX_TRACK_URIS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"At most {_MAX_TRACK_URIS} track URIs per request.",
+        )
+    bad = [u for u in uris if not _TRACK_URI_RE.match(u)]
+    if bad:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid track URI(s): {bad[:5]}",
+        )
+    return uris
 
 
 @playlist_router.get(
@@ -209,14 +238,11 @@ async def list_playlists(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> list[Playlist]:
-    """Return the authenticated user's playlists with pagination.
-
-    Results are ordered by most recently updated first.
-    """
+    """Return the authenticated user's playlists with pagination."""
     stmt = (
         select(Playlist)
         .where(Playlist.owner_id == current_user.id)
-        .order_by(Playlist.updated_at.desc())  # type: ignore[union-attr]
+        .order_by(col(Playlist.updated_at).desc())
         .offset(offset)
         .limit(limit)
     )
@@ -233,43 +259,24 @@ async def list_playlists(
 async def create_playlist(
     body: PlaylistCreate,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> Playlist:
-    """Create a new Spotify playlist and register it in SpotifyForge.
-
-    The playlist is created on Spotify first, then stored locally for
-    tracking and automation purposes.
-    """
-    from spotifyforge.core.playlists import create_spotify_playlist
-
+    """Create a new Spotify playlist and register it in SpotifyForge."""
+    manager = PlaylistManager(spotify)
     try:
-        spotify_playlist = await create_spotify_playlist(
-            user=current_user,
+        return await manager.create_playlist(
             name=body.name,
-            description=body.description,
+            owner_id=current_user.id,  # type: ignore[arg-type]
+            description=body.description or "",
             public=body.public,
             collaborative=body.collaborative,
         )
-    except Exception as exc:
+    except tk.HTTPError as exc:
         logger.error("Spotify playlist creation failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to create playlist on Spotify.",
         ) from exc
-
-    playlist = Playlist(
-        spotify_id=spotify_playlist["id"],
-        owner_id=current_user.id,  # type: ignore[arg-type]
-        name=body.name,
-        description=body.description,
-        public=body.public,
-        collaborative=body.collaborative,
-        snapshot_id=spotify_playlist.get("snapshot_id"),
-    )
-    db.add(playlist)
-    await db.commit()
-    await db.refresh(playlist)
-    return playlist
 
 
 @playlist_router.get(
@@ -282,23 +289,8 @@ async def get_playlist(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> Playlist:
-    """Return full details for a specific playlist, including track list.
-
-    Only the playlist owner can access this endpoint.
-    """
-    result = await db.execute(
-        select(Playlist).where(
-            Playlist.id == playlist_id,
-            Playlist.owner_id == current_user.id,
-        )
-    )
-    playlist = result.scalars().first()
-    if playlist is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Playlist {playlist_id} not found.",
-        )
-    return playlist
+    """Return details for a specific playlist. Owner only."""
+    return await _owned_playlist(playlist_id, current_user, db)
 
 
 @playlist_router.put(
@@ -311,43 +303,38 @@ async def update_playlist(
     body: PlaylistUpdate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> Playlist:
     """Update the name, description, or visibility of a playlist.
 
-    Only non-``None`` fields in the request body are applied.
+    Spotify is updated first; the local row only changes if Spotify
+    accepted the update, so the two never silently diverge.
     """
-    result = await db.execute(
-        select(Playlist).where(
-            Playlist.id == playlist_id,
-            Playlist.owner_id == current_user.id,
-        )
-    )
-    playlist = result.scalars().first()
-    if playlist is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Playlist {playlist_id} not found.",
-        )
+    playlist = await _owned_playlist(playlist_id, current_user, db)
 
     update_data = body.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(playlist, field, value)
-
-    playlist.updated_at = datetime.now(UTC)
-    db.add(playlist)
-
-    # Sync changes to Spotify
-    from spotifyforge.core.playlists import update_spotify_playlist
+    if not update_data:
+        return playlist
 
     try:
-        await update_spotify_playlist(
-            user=current_user,
-            spotify_id=playlist.spotify_id,
-            **update_data,
+        await spotify.playlist_change_details(
+            playlist.spotify_id,
+            name=update_data.get("name"),
+            description=update_data.get("description"),
+            public=update_data.get("public"),
+            collaborative=update_data.get("collaborative"),
         )
-    except Exception as exc:
-        logger.warning("Failed to sync playlist update to Spotify: %s", exc)
+    except tk.HTTPError as exc:
+        logger.error("Failed to update playlist %s on Spotify: %s", playlist.spotify_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to update playlist on Spotify.",
+        ) from exc
 
+    for field, value in update_data.items():
+        setattr(playlist, field, value)
+    playlist.updated_at = datetime.now(UTC)
+    db.add(playlist)
     await db.commit()
     await db.refresh(playlist)
     return playlist
@@ -361,49 +348,32 @@ async def sync_playlist(
     playlist_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> dict[str, Any]:
     """Trigger a full sync of the playlist from Spotify.
 
     Pulls the latest track listing, metadata, and snapshot ID from
-    Spotify and updates the local database.
+    Spotify and rebuilds the local track associations.
     """
-    result = await db.execute(
-        select(Playlist).where(
-            Playlist.id == playlist_id,
-            Playlist.owner_id == current_user.id,
-        )
-    )
-    playlist = result.scalars().first()
-    if playlist is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Playlist {playlist_id} not found.",
-        )
+    playlist = await _owned_playlist(playlist_id, current_user, db)
 
-    from spotifyforge.core.playlists import sync_playlist_from_spotify
-
+    manager = PlaylistManager(spotify)
     try:
-        sync_result = await sync_playlist_from_spotify(
-            user=current_user,
-            playlist=playlist,
-            db=db,
+        synced = await manager.sync_playlist(
+            playlist.spotify_id,
+            owner_id=current_user.id,  # type: ignore[arg-type]
         )
-    except Exception as exc:
+    except tk.HTTPError as exc:
         logger.error("Playlist sync failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to sync playlist from Spotify.",
         ) from exc
 
-    playlist.last_synced_at = datetime.now(UTC)
-    playlist.updated_at = datetime.now(UTC)
-    db.add(playlist)
-    await db.commit()
-
     return {
         "detail": "Playlist synced successfully.",
         "playlist_id": playlist_id,
-        "tracks_synced": sync_result.get("tracks_synced", 0),
+        "tracks_synced": synced.track_count,
     }
 
 
@@ -415,34 +385,15 @@ async def deduplicate_playlist(
     playlist_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> dict[str, Any]:
-    """Scan the playlist for duplicate tracks and remove them.
+    """Remove duplicate tracks from the playlist, keeping one copy of each."""
+    playlist = await _owned_playlist(playlist_id, current_user, db)
 
-    Duplicates are identified by Spotify track URI and, where available,
-    by ISRC code to catch re-releases.
-    """
-    result = await db.execute(
-        select(Playlist).where(
-            Playlist.id == playlist_id,
-            Playlist.owner_id == current_user.id,
-        )
-    )
-    playlist = result.scalars().first()
-    if playlist is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Playlist {playlist_id} not found.",
-        )
-
-    from spotifyforge.core.playlists import deduplicate_playlist_tracks
-
+    manager = PlaylistManager(spotify)
     try:
-        dedup_result = await deduplicate_playlist_tracks(
-            user=current_user,
-            playlist=playlist,
-            db=db,
-        )
-    except Exception as exc:
+        removed = await manager.deduplicate(playlist.spotify_id)
+    except tk.HTTPError as exc:
         logger.error("Deduplication failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -452,7 +403,7 @@ async def deduplicate_playlist(
     return {
         "detail": "Deduplication complete.",
         "playlist_id": playlist_id,
-        "duplicates_removed": dedup_result.get("duplicates_removed", 0),
+        "duplicates_removed": removed,
     }
 
 
@@ -466,41 +417,16 @@ async def add_tracks(
     uris: list[str],
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> dict[str, Any]:
-    """Add one or more tracks to a playlist by Spotify URI.
+    """Add tracks to a playlist by Spotify URI (``spotify:track:...``)."""
+    playlist = await _owned_playlist(playlist_id, current_user, db)
+    uris = _validated_uris(uris)
 
-    Accepts a JSON array of Spotify track URIs (e.g.
-    ``["spotify:track:abc123"]``).
-    """
-    result = await db.execute(
-        select(Playlist).where(
-            Playlist.id == playlist_id,
-            Playlist.owner_id == current_user.id,
-        )
-    )
-    playlist = result.scalars().first()
-    if playlist is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Playlist {playlist_id} not found.",
-        )
-
-    if not uris:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="At least one track URI is required.",
-        )
-
-    from spotifyforge.core.playlists import add_tracks_to_playlist
-
+    manager = PlaylistManager(spotify)
     try:
-        add_result = await add_tracks_to_playlist(
-            user=current_user,
-            playlist=playlist,
-            track_uris=uris,
-            db=db,
-        )
-    except Exception as exc:
+        snapshot_id = await manager.add_tracks(playlist.spotify_id, uris)
+    except tk.HTTPError as exc:
         logger.error("Failed to add tracks: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -510,8 +436,8 @@ async def add_tracks(
     return {
         "detail": "Tracks added successfully.",
         "playlist_id": playlist_id,
-        "tracks_added": add_result.get("tracks_added", len(uris)),
-        "snapshot_id": add_result.get("snapshot_id"),
+        "tracks_added": len(uris),
+        "snapshot_id": snapshot_id,
     }
 
 
@@ -524,40 +450,19 @@ async def remove_tracks(
     uris: list[str],
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> dict[str, Any]:
-    """Remove one or more tracks from a playlist by Spotify URI.
+    """Remove tracks from a playlist by Spotify URI.
 
-    Accepts a JSON array of Spotify track URIs to remove.
+    Removes every occurrence of each given URI (Spotify semantics).
     """
-    result = await db.execute(
-        select(Playlist).where(
-            Playlist.id == playlist_id,
-            Playlist.owner_id == current_user.id,
-        )
-    )
-    playlist = result.scalars().first()
-    if playlist is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Playlist {playlist_id} not found.",
-        )
+    playlist = await _owned_playlist(playlist_id, current_user, db)
+    uris = _validated_uris(uris)
 
-    if not uris:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="At least one track URI is required.",
-        )
-
-    from spotifyforge.core.playlists import remove_tracks_from_playlist
-
+    manager = PlaylistManager(spotify)
     try:
-        remove_result = await remove_tracks_from_playlist(
-            user=current_user,
-            playlist=playlist,
-            track_uris=uris,
-            db=db,
-        )
-    except Exception as exc:
+        snapshot_id = await manager.remove_tracks(playlist.spotify_id, uris)
+    except tk.HTTPError as exc:
         logger.error("Failed to remove tracks: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -567,8 +472,8 @@ async def remove_tracks(
     return {
         "detail": "Tracks removed successfully.",
         "playlist_id": playlist_id,
-        "tracks_removed": remove_result.get("tracks_removed", len(uris)),
-        "snapshot_id": remove_result.get("snapshot_id"),
+        "tracks_removed": len(uris),
+        "snapshot_id": snapshot_id,
     }
 
 
@@ -590,30 +495,19 @@ async def top_tracks(
         description="Spotify time range: short_term, medium_term, or long_term",
     ),
     limit: int = Query(default=50, ge=1, le=50, description="Number of results"),
-    current_user: User = Depends(get_current_user),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> list[dict[str, Any]]:
-    """Return the user's top tracks from Spotify.
-
-    Powered by the Spotify ``/me/top/tracks`` endpoint.  Results can be
-    scoped to short-term (~4 weeks), medium-term (~6 months), or
-    long-term (all time).
-    """
-    from spotifyforge.core.discovery import get_top_tracks
-
+    """Return the user's top tracks from Spotify (``/me/top/tracks``)."""
+    engine = DiscoveryEngine(spotify)
     try:
-        tracks = await get_top_tracks(
-            user=current_user,
-            time_range=time_range,
-            limit=limit,
-        )
-    except Exception as exc:
+        tracks = await engine.get_user_top_tracks(time_range=time_range, limit=limit)
+    except tk.HTTPError as exc:
         logger.error("Failed to fetch top tracks: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to retrieve top tracks from Spotify.",
         ) from exc
-
-    return tracks
+    return [track_to_dict(t) for t in tracks]
 
 
 @discovery_router.get(
@@ -627,28 +521,19 @@ async def top_artists(
         description="Spotify time range: short_term, medium_term, or long_term",
     ),
     limit: int = Query(default=50, ge=1, le=50, description="Number of results"),
-    current_user: User = Depends(get_current_user),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> list[dict[str, Any]]:
-    """Return the user's top artists from Spotify.
-
-    Powered by the Spotify ``/me/top/artists`` endpoint.
-    """
-    from spotifyforge.core.discovery import get_top_artists
-
+    """Return the user's top artists from Spotify (``/me/top/artists``)."""
+    engine = DiscoveryEngine(spotify)
     try:
-        artists = await get_top_artists(
-            user=current_user,
-            time_range=time_range,
-            limit=limit,
-        )
-    except Exception as exc:
+        artists = await engine.get_user_top_artists(time_range=time_range, limit=limit)
+    except tk.HTTPError as exc:
         logger.error("Failed to fetch top artists: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to retrieve top artists from Spotify.",
         ) from exc
-
-    return artists
+    return [artist_to_dict(a) for a in artists]
 
 
 @discovery_router.get(
@@ -662,31 +547,26 @@ async def deep_cuts(
         default=30,
         ge=0,
         le=100,
-        description="Maximum popularity score to qualify as a deep cut",
+        description="Tracks with popularity strictly below this value qualify",
     ),
-    current_user: User = Depends(get_current_user),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> list[dict[str, Any]]:
     """Discover lesser-known tracks by a given artist.
 
-    Returns tracks whose popularity score falls at or below the provided
-    *threshold*.  Lower thresholds yield deeper cuts.
+    Returns tracks whose popularity is strictly below *threshold*.
+    Walks the artist's full discography, so large catalogues take a
+    while and count against Spotify rate limits.
     """
-    from spotifyforge.core.discovery import get_deep_cuts
-
+    engine = DiscoveryEngine(spotify)
     try:
-        tracks = await get_deep_cuts(
-            user=current_user,
-            artist_id=artist_id,
-            threshold=threshold,
-        )
-    except Exception as exc:
+        tracks = await engine.find_deep_cuts(artist_id=artist_id, popularity_threshold=threshold)
+    except tk.HTTPError as exc:
         logger.error("Failed to fetch deep cuts for artist %s: %s", artist_id, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to retrieve deep cuts from Spotify.",
         ) from exc
-
-    return tracks
+    return [track_to_dict(t) for t in tracks]
 
 
 @discovery_router.post(
@@ -697,34 +577,30 @@ async def deep_cuts(
 )
 async def create_genre_playlist(
     genre: str = Query(..., min_length=1, description="Genre seed (e.g. 'indie-rock')"),
-    limit: int = Query(default=30, ge=1, le=100, description="Number of tracks"),
+    limit: int = Query(default=30, ge=1, le=50, description="Number of tracks (max 50)"),
     playlist_name: str | None = Query(
         default=None, description="Custom playlist name (auto-generated if omitted)"
     ),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> Playlist:
-    """Generate and create a new playlist populated with tracks from a genre.
-
-    Uses Spotify's recommendation engine seeded with the specified genre.
-    """
-    from spotifyforge.core.discovery import create_genre_based_playlist
-
+    """Create a new playlist populated with tracks from a genre search."""
+    engine = DiscoveryEngine(spotify)
+    manager = PlaylistManager(spotify)
     try:
-        playlist = await create_genre_based_playlist(
-            user=current_user,
-            genre=genre,
-            limit=limit,
-            playlist_name=playlist_name,
-            db=db,
+        tracks = await engine.build_genre_playlist(genre=genre, limit=limit)
+        playlist = await manager.create_playlist_with_tracks(
+            name=playlist_name or f"SpotifyForge: {genre.title()}",
+            owner_id=current_user.id,  # type: ignore[arg-type]
+            tracks=tracks,
+            description=f"Genre playlist: {genre}",
         )
-    except Exception as exc:
+    except tk.HTTPError as exc:
         logger.error("Genre playlist creation failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to create genre-based playlist.",
         ) from exc
-
     return playlist
 
 
@@ -735,36 +611,35 @@ async def create_genre_playlist(
     summary="Create a time capsule playlist",
 )
 async def create_time_capsule(
-    year: int | None = Query(default=None, ge=1900, le=2100, description="Target year"),
-    month: int | None = Query(default=None, ge=1, le=12, description="Target month"),
+    time_range: str = Query(
+        default="long_term",
+        pattern="^(short_term|medium_term|long_term)$",
+        description="Listening-history window to snapshot",
+    ),
     playlist_name: str | None = Query(
         default=None, description="Custom playlist name (auto-generated if omitted)"
     ),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
+    spotify: tk.Spotify = Depends(get_spotify),
 ) -> Playlist:
-    """Create a nostalgia playlist based on the user's listening history.
-
-    Optionally filter by a specific year and/or month to revisit music
-    from that period.
-    """
-    from spotifyforge.core.discovery import create_time_capsule_playlist
-
+    """Create a snapshot playlist of the user's top tracks for a time range."""
+    engine = DiscoveryEngine(spotify)
+    manager = PlaylistManager(spotify)
     try:
-        playlist = await create_time_capsule_playlist(
-            user=current_user,
-            year=year,
-            month=month,
-            playlist_name=playlist_name,
-            db=db,
+        tracks = await engine.build_time_capsule(time_range=time_range)
+        playlist = await manager.create_playlist_with_tracks(
+            name=playlist_name or f"SpotifyForge: Time Capsule ({time_range})",
+            owner_id=current_user.id,  # type: ignore[arg-type]
+            tracks=tracks,
+            description=f"Time capsule playlist ({time_range})",
+            public=False,
         )
-    except Exception as exc:
+    except tk.HTTPError as exc:
         logger.error("Time capsule creation failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to create time capsule playlist.",
         ) from exc
-
     return playlist
 
 
@@ -773,6 +648,37 @@ async def create_time_capsule(
 # =========================================================================
 schedule_router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
+# Job types that operate on an existing playlist.
+_PLAYLIST_JOB_TYPES = {JobType.sync, JobType.archive, JobType.deduplicate, JobType.genre_refresh}
+
+
+def _validate_job_spec(body: ScheduledJobCreate) -> None:
+    """Reject job specs that could never execute."""
+    if validate_cron(body.cron_expression) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Invalid cron expression {body.cron_expression!r}. "
+                "Expected 5 fields: 'minute hour day month day_of_week'."
+            ),
+        )
+    if body.job_type in _PLAYLIST_JOB_TYPES and body.playlist_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Job type '{body.job_type}' requires a playlist_id.",
+        )
+    config = body.config or {}
+    if body.job_type is JobType.archive and not config.get("source_playlist_id"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Archive jobs require 'source_playlist_id' in config.",
+        )
+    if body.job_type is JobType.genre_refresh and not config.get("genre"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Genre-refresh jobs require 'genre' in config.",
+        )
+
 
 @schedule_router.get(
     "",
@@ -780,17 +686,18 @@ schedule_router = APIRouter(prefix="/api/schedules", tags=["schedules"])
     summary="List scheduled jobs",
 )
 async def list_schedules(
+    offset: int = Query(default=0, ge=0, description="Pagination offset"),
+    limit: int = Query(default=50, ge=1, le=100, description="Page size"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> list[ScheduledJob]:
-    """Return all scheduled automation jobs for the authenticated user.
-
-    Jobs are sorted by creation date, newest first.
-    """
+    """Return the authenticated user's scheduled jobs, newest first."""
     stmt = (
         select(ScheduledJob)
         .where(ScheduledJob.user_id == current_user.id)
-        .order_by(ScheduledJob.created_at.desc())  # type: ignore[union-attr]
+        .order_by(col(ScheduledJob.created_at).desc())
+        .offset(offset)
+        .limit(limit)
     )
     result = await db.execute(stmt)
     return list(result.scalars().all())
@@ -809,10 +716,11 @@ async def create_schedule(
 ) -> ScheduledJob:
     """Register a new recurring automation job.
 
-    The job is persisted in the database and, if enabled, registered with
-    the background scheduler immediately.
+    The spec is validated up front (cron syntax, required playlist and
+    config for the job type), so a 201 means a job that can really run.
     """
-    # Validate that the referenced playlist exists if provided
+    _validate_job_spec(body)
+
     if body.playlist_id is not None:
         result = await db.execute(
             select(Playlist).where(
@@ -827,7 +735,7 @@ async def create_schedule(
             )
 
     job = ScheduledJob(
-        user_id=current_user.id,  # type: ignore[arg-type]
+        user_id=current_user.id,
         name=body.name,
         job_type=body.job_type,
         playlist_id=body.playlist_id,
@@ -839,14 +747,8 @@ async def create_schedule(
     await db.commit()
     await db.refresh(job)
 
-    # Register with the live scheduler if enabled
     if job.enabled:
-        from spotifyforge.core.scheduler import register_job
-
-        try:
-            register_job(job)
-        except Exception as exc:
-            logger.warning("Failed to register job with scheduler: %s", exc)
+        register_job(job)
 
     return job
 
@@ -861,10 +763,7 @@ async def delete_schedule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> None:
-    """Delete a scheduled job.
-
-    The job is removed from both the database and the live scheduler.
-    """
+    """Delete a scheduled job from the database and the live scheduler."""
     result = await db.execute(
         select(ScheduledJob).where(
             ScheduledJob.id == job_id,
@@ -878,14 +777,7 @@ async def delete_schedule(
             detail=f"Scheduled job {job_id} not found.",
         )
 
-    # Unregister from the live scheduler
-    from spotifyforge.core.scheduler import unregister_job
-
-    try:
-        unregister_job(job)
-    except Exception as exc:
-        logger.warning("Failed to unregister job from scheduler: %s", exc)
-
+    unregister_job(job_id)
     await db.delete(job)
     await db.commit()
 
@@ -900,11 +792,7 @@ async def toggle_schedule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> ScheduledJob:
-    """Enable or disable a scheduled job.
-
-    Flips the ``enabled`` flag and registers or unregisters the job with
-    the background scheduler accordingly.
-    """
+    """Enable or disable a scheduled job, syncing the live scheduler."""
     result = await db.execute(
         select(ScheduledJob).where(
             ScheduledJob.id == job_id,
@@ -924,15 +812,9 @@ async def toggle_schedule(
     await db.commit()
     await db.refresh(job)
 
-    # Sync with live scheduler
-    from spotifyforge.core.scheduler import register_job, unregister_job
-
-    try:
-        if job.enabled:
-            register_job(job)
-        else:
-            unregister_job(job)
-    except Exception as exc:
-        logger.warning("Failed to sync job toggle with scheduler: %s", exc)
+    if job.enabled:
+        register_job(job)
+    else:
+        unregister_job(job_id)
 
     return job

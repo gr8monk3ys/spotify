@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from spotifyforge.models.models import (
     Artist,
@@ -101,7 +101,7 @@ class TrackRepository:
         """Return all tracks whose ``spotify_id`` is in *ids*."""
         if not ids:
             return []
-        statement = select(Track).where(Track.spotify_id.in_(ids))  # type: ignore[union-attr]
+        statement = select(Track).where(col(Track.spotify_id).in_(ids))
         return list(self.session.exec(statement).all())
 
     def get_stale(self, ttl_seconds: int) -> list[Track]:
@@ -113,11 +113,7 @@ class TrackRepository:
     def search(self, query: str, limit: int = 20) -> list[Track]:
         """Case-insensitive name search with a result *limit*."""
         pattern = f"%{query}%"
-        statement = (
-            select(Track)
-            .where(Track.name.ilike(pattern))  # type: ignore[union-attr]
-            .limit(limit)
-        )
+        statement = select(Track).where(col(Track.name).ilike(pattern)).limit(limit)
         return list(self.session.exec(statement).all())
 
 
@@ -188,7 +184,7 @@ class ArtistRepository:
         """Return all artists whose ``spotify_id`` is in *ids*."""
         if not ids:
             return []
-        statement = select(Artist).where(Artist.spotify_id.in_(ids))  # type: ignore[union-attr]
+        statement = select(Artist).where(col(Artist.spotify_id).in_(ids))
         return list(self.session.exec(statement).all())
 
     def get_stale(self, ttl_seconds: int) -> list[Artist]:
@@ -200,11 +196,7 @@ class ArtistRepository:
     def search(self, query: str, limit: int = 20) -> list[Artist]:
         """Case-insensitive name search with a result *limit*."""
         pattern = f"%{query}%"
-        statement = (
-            select(Artist)
-            .where(Artist.name.ilike(pattern))  # type: ignore[union-attr]
-            .limit(limit)
-        )
+        statement = select(Artist).where(col(Artist.name).ilike(pattern)).limit(limit)
         return list(self.session.exec(statement).all())
 
 
@@ -238,9 +230,9 @@ class PlaylistRepository:
         statement = select(Playlist).where(Playlist.spotify_id == spotify_id)
         return self.session.exec(statement).first()
 
-    def get_by_user(self, user_id: str) -> list[Playlist]:
+    def get_by_user(self, user_id: int) -> list[Playlist]:
         """Return all playlists belonging to *user_id*."""
-        statement = select(Playlist).where(Playlist.user_id == user_id)
+        statement = select(Playlist).where(Playlist.owner_id == user_id)
         return list(self.session.exec(statement).all())
 
     def update(self, playlist: Playlist, data: dict) -> Playlist:
@@ -373,9 +365,7 @@ class AudioFeaturesRepository:
         """Return those *track_ids* that have no cached audio features."""
         if not track_ids:
             return []
-        statement = select(AudioFeatures.track_id).where(
-            AudioFeatures.track_id.in_(track_ids)  # type: ignore[union-attr]
-        )
+        statement = select(AudioFeatures.track_id).where(col(AudioFeatures.track_id).in_(track_ids))
         cached_ids = set(self.session.exec(statement).all())
         return [tid for tid in track_ids if tid not in cached_ids]
 
@@ -410,7 +400,7 @@ class ScheduledJobRepository:
         statement = select(ScheduledJob).where(ScheduledJob.enabled == True)  # noqa: E712
         return list(self.session.exec(statement).all())
 
-    def get_by_user(self, user_id: str) -> list[ScheduledJob]:
+    def get_by_user(self, user_id: int) -> list[ScheduledJob]:
         """Return all jobs belonging to *user_id*."""
         statement = select(ScheduledJob).where(ScheduledJob.user_id == user_id)
         return list(self.session.exec(statement).all())

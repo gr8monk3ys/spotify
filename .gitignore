@@ -12,3 +12,4 @@ build/
 .ruff_cache/
 .venv/
 venv/
+.coverage
