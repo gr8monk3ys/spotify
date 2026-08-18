@@ -1,7 +1,7 @@
 """SQLModel database models and Pydantic schemas for SpotifyForge.
 
 Defines all persistent entities (Users, Tracks, Artists, Albums, AudioFeatures,
-Playlists, PlaylistTracks, ScheduledJobs, CurationRules) and the Pydantic
+Playlists, PlaylistTracks, ScheduledJobs) and the Pydantic
 request/response schemas consumed by the CLI and FastAPI web layers.
 """
 
@@ -25,8 +25,6 @@ class AudioFeaturesSource(enum.StrEnum):
     """Origin of audio feature data."""
 
     spotify = "spotify"
-    soundnet = "soundnet"
-    cyanite = "cyanite"
 
 
 class JobType(enum.StrEnum):
@@ -59,18 +57,6 @@ def as_utc(dt: datetime | None) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
-class RuleType(enum.StrEnum):
-    """Categories of automated curation rules."""
-
-    filter = "filter"
-    sort = "sort"
-    deduplicate = "deduplicate"
-    limit = "limit"
-    add_tracks = "add_tracks"
-    remove_tracks = "remove_tracks"
-    replace_tracks = "replace_tracks"
-
-
 # ---------------------------------------------------------------------------
 # Database Models (table=True)
 # ---------------------------------------------------------------------------
@@ -101,7 +87,6 @@ class User(SQLModel, table=True):
     # Relationships
     playlists: list["Playlist"] = Relationship(back_populates="owner")
     scheduled_jobs: list["ScheduledJob"] = Relationship(back_populates="user")
-    curation_rules: list["CurationRule"] = Relationship(back_populates="user")
 
 
 class Track(SQLModel, table=True):
@@ -202,7 +187,6 @@ class Playlist(SQLModel, table=True):
     public: bool = Field(default=True)
     collaborative: bool = Field(default=False)
     snapshot_id: str | None = Field(default=None, max_length=128)
-    follower_count: int = Field(default=0)
     track_count: int = Field(default=0)
     last_synced_at: datetime | None = Field(default=None)
     deleted_at: datetime | None = Field(default=None, index=True)
@@ -214,7 +198,6 @@ class Playlist(SQLModel, table=True):
     owner: User | None = Relationship(back_populates="playlists")
     playlist_tracks: list["PlaylistTrack"] = Relationship(back_populates="playlist")
     scheduled_jobs: list["ScheduledJob"] = Relationship(back_populates="playlist")
-    curation_rules: list["CurationRule"] = Relationship(back_populates="playlist")
 
 
 class PlaylistTrack(SQLModel, table=True):
@@ -272,34 +255,6 @@ class ScheduledJob(SQLModel, table=True):
     playlist: Playlist | None = Relationship(back_populates="scheduled_jobs")
 
 
-class CurationRule(SQLModel, table=True):
-    """A declarative rule that drives automated playlist curation."""
-
-    __tablename__ = "curation_rules"
-
-    id: int | None = Field(default=None, primary_key=True)
-    user_id: int = Field(foreign_key="users.id", index=True)
-    playlist_id: int | None = Field(default=None, foreign_key="playlists.id", index=True)
-    name: str = Field(max_length=256)
-    rule_type: RuleType = Field(
-        sa_column=Column(
-            SAEnum(RuleType, name="rule_type", native_enum=False),
-            nullable=False,
-        )
-    )
-    conditions: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
-    actions: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
-    enabled: bool = Field(default=True)
-    priority: int = Field(default=0)
-
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
-
-    # Relationships
-    user: User | None = Relationship(back_populates="curation_rules")
-    playlist: Playlist | None = Relationship(back_populates="curation_rules")
-
-
 # ---------------------------------------------------------------------------
 # Pydantic Schemas (API request / response)
 # ---------------------------------------------------------------------------
@@ -342,7 +297,6 @@ class PlaylistResponse(BaseModel):
     public: bool
     collaborative: bool
     snapshot_id: str | None = None
-    follower_count: int
     track_count: int
     last_synced_at: datetime | None = None
     created_at: datetime
@@ -418,37 +372,5 @@ class ScheduledJobResponse(BaseModel):
     enabled: bool
     last_run_at: datetime | None = None
     next_run_at: datetime | None = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class CurationRuleCreate(BaseModel):
-    """Schema for creating a new curation rule."""
-
-    model_config = ConfigDict(strict=True)
-
-    name: str = PydanticField(min_length=1, max_length=256)
-    rule_type: RuleType
-    playlist_id: int | None = None
-    conditions: dict[str, Any] | None = None
-    actions: dict[str, Any] | None = None
-    enabled: bool = True
-    priority: int = 0
-
-
-class CurationRuleResponse(BaseModel):
-    """Schema returned when reading curation rule data."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    user_id: int
-    playlist_id: int | None = None
-    name: str
-    rule_type: RuleType
-    conditions: dict[str, Any] | None = None
-    actions: dict[str, Any] | None = None
-    enabled: bool
-    priority: int
     created_at: datetime
     updated_at: datetime
