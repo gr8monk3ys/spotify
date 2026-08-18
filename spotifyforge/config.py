@@ -39,12 +39,6 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    # Cache TTLs (seconds)
-    cache_ttl_audio_features: int = 0  # indefinite
-    cache_ttl_track_metadata: int = 604800  # 7 days
-    cache_ttl_artist_data: int = 86400  # 24 hours
-    cache_ttl_playlist_contents: int = 3600  # 1 hour
-
     @model_validator(mode="after")
     def _validate_config(self) -> "Settings":
         """Validate required settings and normalise paths.

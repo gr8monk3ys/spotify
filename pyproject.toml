@@ -40,9 +40,6 @@ dev = [
     "ruff>=0.3",
     "mypy>=1.8",
 ]
-nicegui = [
-    "nicegui>=1.4",
-]
 
 [project.scripts]
 spotifyforge = "spotifyforge.cli.app:app"

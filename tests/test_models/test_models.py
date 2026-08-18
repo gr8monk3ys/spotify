@@ -20,9 +20,6 @@ from spotifyforge.models.models import (
     AudioFeaturesResponse,
     # Enums
     AudioFeaturesSource,
-    CurationRule,
-    CurationRuleCreate,
-    CurationRuleResponse,
     JobType,
     Playlist,
     PlaylistCreate,
@@ -30,7 +27,6 @@ from spotifyforge.models.models import (
     PlaylistTrack,
     PlaylistTrackLink,
     PlaylistUpdate,
-    RuleType,
     ScheduledJob,
     ScheduledJobCreate,
     ScheduledJobResponse,
@@ -47,26 +43,12 @@ from spotifyforge.models.models import (
 
 
 class TestAudioFeaturesSourceEnum:
-    """AudioFeaturesSource should expose exactly three members."""
+    """Only sources something actually writes belong in the enum."""
 
     def test_members(self) -> None:
-        assert set(AudioFeaturesSource) == {
-            AudioFeaturesSource.spotify,
-            AudioFeaturesSource.soundnet,
-            AudioFeaturesSource.cyanite,
-        }
-
-    @pytest.mark.parametrize(
-        "member,value",
-        [
-            (AudioFeaturesSource.spotify, "spotify"),
-            (AudioFeaturesSource.soundnet, "soundnet"),
-            (AudioFeaturesSource.cyanite, "cyanite"),
-        ],
-    )
-    def test_string_values(self, member, value) -> None:
-        assert member.value == value
-        assert str(member) == value
+        assert set(AudioFeaturesSource) == {AudioFeaturesSource.spotify}
+        assert AudioFeaturesSource.spotify.value == "spotify"
+        assert str(AudioFeaturesSource.spotify) == "spotify"
 
     def test_is_str_enum(self) -> None:
         for member in AudioFeaturesSource:
@@ -160,46 +142,6 @@ class TestTimestampHelpers:
         assert user.updated_at.tzinfo is UTC
         track = Track(spotify_id="tz_track", name="T")
         assert track.cached_at.tzinfo is UTC
-
-
-class TestRuleTypeEnum:
-    """RuleType should expose exactly seven members."""
-
-    EXPECTED = {
-        "filter",
-        "sort",
-        "deduplicate",
-        "limit",
-        "add_tracks",
-        "remove_tracks",
-        "replace_tracks",
-    }
-
-    def test_member_count(self) -> None:
-        assert len(RuleType) == 7
-
-    def test_member_values(self) -> None:
-        assert {m.value for m in RuleType} == self.EXPECTED
-
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "filter",
-            "sort",
-            "deduplicate",
-            "limit",
-            "add_tracks",
-            "remove_tracks",
-            "replace_tracks",
-        ],
-    )
-    def test_lookup_by_value(self, name) -> None:
-        assert RuleType(name) is not None
-
-
-# ============================================================================
-# Table-model instantiation tests
-# ============================================================================
 
 
 class TestUserModel:
@@ -357,7 +299,7 @@ class TestAudioFeaturesModel:
     def test_all_fields(self) -> None:
         af = AudioFeatures(
             track_id=1,
-            source=AudioFeaturesSource.cyanite,
+            source=AudioFeaturesSource.spotify,
             danceability=0.8,
             energy=0.9,
             valence=0.75,
@@ -391,7 +333,6 @@ class TestPlaylistModel:
         assert pl.public is True
         assert pl.collaborative is False
         assert pl.snapshot_id is None
-        assert pl.follower_count == 0
         assert pl.track_count == 0
         assert pl.last_synced_at is None
         assert isinstance(pl.created_at, datetime)
@@ -492,49 +433,6 @@ class TestScheduledJobModel:
             config={"max_tracks": 50, "genre": "electronic"},
         )
         assert job.config == {"max_tracks": 50, "genre": "electronic"}
-
-
-class TestCurationRuleModel:
-    """CurationRule model instantiation and defaults."""
-
-    def test_create_minimal(self) -> None:
-        rule = CurationRule(
-            user_id=1,
-            name="Dedup",
-            rule_type=RuleType.deduplicate,
-        )
-        assert rule.name == "Dedup"
-        assert rule.rule_type == RuleType.deduplicate
-
-    def test_defaults(self) -> None:
-        rule = CurationRule(
-            user_id=1,
-            name="R",
-            rule_type=RuleType.filter,
-        )
-        assert rule.enabled is True
-        assert rule.priority == 0
-        assert rule.playlist_id is None
-        assert rule.conditions is None
-        assert rule.actions is None
-        assert isinstance(rule.created_at, datetime)
-        assert isinstance(rule.updated_at, datetime)
-
-    def test_json_fields(self) -> None:
-        rule = CurationRule(
-            user_id=1,
-            name="Energy filter",
-            rule_type=RuleType.filter,
-            conditions={"energy_gt": 0.8},
-            actions={"add_to": "high_energy"},
-        )
-        assert rule.conditions == {"energy_gt": 0.8}
-        assert rule.actions == {"add_to": "high_energy"}
-
-
-# ============================================================================
-# Pydantic schema validation tests
-# ============================================================================
 
 
 class TestPlaylistCreateSchema:
@@ -686,41 +584,6 @@ class TestScheduledJobCreateSchema:
             )
 
 
-class TestCurationRuleCreateSchema:
-    """CurationRuleCreate request schema."""
-
-    def test_valid(self) -> None:
-        cr = CurationRuleCreate(
-            name="Remove dupes",
-            rule_type=RuleType.deduplicate,
-        )
-        assert cr.name == "Remove dupes"
-        assert cr.rule_type == RuleType.deduplicate
-        assert cr.enabled is True
-        assert cr.priority == 0
-
-    def test_rejects_empty_name(self) -> None:
-        with pytest.raises(ValidationError):
-            CurationRuleCreate(name="", rule_type=RuleType.sort)
-
-    def test_with_conditions_and_actions(self) -> None:
-        cr = CurationRuleCreate(
-            name="Filter low energy",
-            rule_type=RuleType.filter,
-            conditions={"energy_lt": 0.3},
-            actions={"remove": True},
-            priority=10,
-        )
-        assert cr.conditions == {"energy_lt": 0.3}
-        assert cr.actions == {"remove": True}
-        assert cr.priority == 10
-
-
-# ============================================================================
-# Response schema from_attributes (ORM round-trip) tests
-# ============================================================================
-
-
 class TestPlaylistResponseSchema:
     """PlaylistResponse should be constructable from a Playlist ORM object."""
 
@@ -735,7 +598,6 @@ class TestPlaylistResponseSchema:
             public=True,
             collaborative=False,
             snapshot_id="snap1",
-            follower_count=100,
             track_count=25,
             last_synced_at=now,
             created_at=now,
@@ -750,7 +612,6 @@ class TestPlaylistResponseSchema:
         assert resp.public is True
         assert resp.collaborative is False
         assert resp.snapshot_id == "snap1"
-        assert resp.follower_count == 100
         assert resp.track_count == 25
         assert resp.last_synced_at == now
         assert resp.created_at == now
@@ -764,7 +625,6 @@ class TestPlaylistResponseSchema:
             name="Minimal",
             public=False,
             collaborative=False,
-            follower_count=0,
             track_count=0,
             created_at=now,
             updated_at=now,
@@ -870,7 +730,7 @@ class TestAudioFeaturesResponseSchema:
         af = AudioFeatures(
             id=2,
             track_id=20,
-            source=AudioFeaturesSource.soundnet,
+            source=AudioFeaturesSource.spotify,
             cached_at=now,
         )
         resp = AudioFeaturesResponse.model_validate(af)
@@ -924,55 +784,6 @@ class TestScheduledJobResponseSchema:
         assert resp.config is None
         assert resp.last_run_at is None
         assert resp.next_run_at is None
-
-
-class TestCurationRuleResponseSchema:
-    """CurationRuleResponse from_attributes round-trip."""
-
-    def test_from_orm_object(self) -> None:
-        now = datetime(2025, 4, 1)
-        rule = CurationRule(
-            id=3,
-            user_id=1,
-            playlist_id=5,
-            name="Energy boost",
-            rule_type=RuleType.filter,
-            conditions={"energy_gt": 0.7},
-            actions={"boost": True},
-            enabled=True,
-            priority=5,
-            created_at=now,
-            updated_at=now,
-        )
-        resp = CurationRuleResponse.model_validate(rule)
-        assert resp.id == 3
-        assert resp.user_id == 1
-        assert resp.playlist_id == 5
-        assert resp.name == "Energy boost"
-        assert resp.rule_type == RuleType.filter
-        assert resp.conditions == {"energy_gt": 0.7}
-        assert resp.actions == {"boost": True}
-        assert resp.priority == 5
-
-    def test_nullable_fields(self) -> None:
-        now = datetime.now(UTC)
-        rule = CurationRule(
-            id=4,
-            user_id=2,
-            name="Simple",
-            rule_type=RuleType.sort,
-            created_at=now,
-            updated_at=now,
-        )
-        resp = CurationRuleResponse.model_validate(rule)
-        assert resp.playlist_id is None
-        assert resp.conditions is None
-        assert resp.actions is None
-
-
-# ============================================================================
-# Edge-case / parametrised tests
-# ============================================================================
 
 
 class TestAudioFeaturesFieldBounds:
@@ -1067,17 +878,3 @@ class TestJsonFieldSerialization:
         )
         assert job.config["metrics"] == ["plays", "saves"]
         assert job.config["filters"]["genre"] == "jazz"
-
-    def test_curation_rule_complex_conditions(self) -> None:
-        rule = CurationRule(
-            user_id=1,
-            name="Complex",
-            rule_type=RuleType.filter,
-            conditions={
-                "and": [
-                    {"field": "energy", "op": "gt", "value": 0.5},
-                    {"field": "tempo", "op": "between", "value": [100, 140]},
-                ]
-            },
-        )
-        assert len(rule.conditions["and"]) == 2
