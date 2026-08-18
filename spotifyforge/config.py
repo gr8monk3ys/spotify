@@ -1,5 +1,6 @@
 """Application configuration using pydantic-settings."""
 
+import os
 from pathlib import Path
 
 from pydantic import model_validator
@@ -81,3 +82,18 @@ def sidecar_path(name: str) -> Path:
     local config directory rather than nowhere.
     """
     return settings.db_path.parent / name
+
+
+def write_json_atomic(path: Path, data: object) -> None:
+    """Serialize *data* to *path* without a torn-file window.
+
+    A plain ``write_text`` truncates first, so an interrupt lands in
+    exactly the window a checkpoint exists to protect. Write a sibling
+    file and rename — ``os.replace`` is atomic on POSIX and Windows.
+    """
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    os.replace(tmp, path)

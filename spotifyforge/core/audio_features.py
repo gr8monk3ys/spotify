@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,17 +154,11 @@ class FeatureCache:
             sources.append(provider)
 
     def save(self) -> None:
-        """Write the cache out atomically.
+        """Write the cache out atomically — checkpointing means many
+        writes, and an interrupt must not tear one."""
+        from spotifyforge.config import write_json_atomic
 
-        Checkpointing during a long run means many writes; a plain
-        ``write_text`` truncates first, so an interrupt lands in exactly
-        the window it was added to protect. Write a sibling file and
-        rename — ``os.replace`` is atomic on POSIX and Windows.
-        """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(self._data))
-        os.replace(tmp, self.path)
+        write_json_atomic(self.path, self._data)
         logger.debug("Wrote %d cached features to %s", len(self._data), self.path)
 
 

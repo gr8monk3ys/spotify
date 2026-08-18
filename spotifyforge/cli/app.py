@@ -951,6 +951,19 @@ def _features_or_warn(harmonic: bool):
     return features
 
 
+async def _plan(sp, opts, features=None):
+    """Plan the catalogue with the pinned expansions folded in.
+
+    Every curate command plans through here: a command that forgot the
+    pins would hand reflow a plan that strips pinned tracks off live
+    playlists, so the folding is not optional at the call sites.
+    """
+    from spotifyforge.core.curation import plan_catalogue
+    from spotifyforge.core.expansion import load_expansions
+
+    return await plan_catalogue(sp, opts, features, load_expansions())
+
+
 def _curation_options(min_size, max_size, max_tracks, exclusive):
     from spotifyforge.core.curation import CurationOptions
 
@@ -986,14 +999,13 @@ def curate_plan(
     harmonic: bool = _HARMONIC,
 ) -> None:
     """Preview the playlist catalogue your liked songs would produce (no writes)."""
-    from spotifyforge.core.curation import plan_catalogue
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
     plan = _run_spotify(
         "Scanning your liked songs...",
         "Failed to plan curation",
-        lambda sp: plan_catalogue(sp, opts, features),
+        lambda sp: _plan(sp, opts, features),
     )
 
     console.print(
@@ -1036,7 +1048,7 @@ def curate_forge(
     ),
 ) -> None:
     """Create the next batch of planned playlists on Spotify (resumable)."""
-    from spotifyforge.core.curation import forge_next, plan_catalogue
+    from spotifyforge.core.curation import forge_next
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     owner_id = _db_user_id()
@@ -1044,7 +1056,7 @@ def curate_forge(
     features = _features_or_warn(harmonic)
 
     async def _forge(sp):
-        plan = await plan_catalogue(sp, opts, features)
+        plan = await _plan(sp, opts, features)
         created, pending = await forge_next(
             PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
         )
@@ -1167,13 +1179,13 @@ def curate_covers(
     automated. Each cover's colour is derived from the playlist's genre,
     so it is stable across runs and the set reads as one collection.
     """
-    from spotifyforge.core.curation import apply_covers, plan_catalogue
+    from spotifyforge.core.curation import apply_covers
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
 
     async def _covers(sp):
-        plan = await plan_catalogue(sp, opts)
+        plan = await _plan(sp, opts)
         uploaded, failed = await apply_covers(
             PlaylistManager(sp), sp, plan.specs, overwrite=overwrite
         )
@@ -1222,14 +1234,14 @@ def curate_describe(
     without touching tracks, titles, followers, or artwork. Playlists
     already carrying the wanted text are skipped.
     """
-    from spotifyforge.core.curation import apply_descriptions, plan_catalogue
+    from spotifyforge.core.curation import apply_descriptions
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
 
     async def _push(sp):
-        plan = await plan_catalogue(sp, opts, features)
+        plan = await _plan(sp, opts, features)
         updated, failed = await apply_descriptions(PlaylistManager(sp), sp, plan.specs)
         return updated, failed, len(plan.specs)
 
@@ -1257,6 +1269,79 @@ def curate_describe(
             expand=False,
         )
     )
+
+
+@curate_app.command("expand")
+def curate_expand(
+    target: int = typer.Option(
+        12, "--target", min=3, help="Grow playlists below this many tracks."
+    ),
+    limit: int = typer.Option(
+        10, "--limit", "-l", min=1, help="Maximum playlists to expand this run."
+    ),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Grow thin playlists with unheard tracks from the same niche.
+
+    Searches Spotify for more of a playlist's genre — music you have
+    never heard — and pins the picks locally. Nothing is written to
+    Spotify here: run [bold]curate reflow[/bold] afterwards to push the
+    grown playlists (and [bold]curate describe[/bold] to refresh their
+    descriptions). Repeat runs continue where the last one stopped.
+    """
+    from spotifyforge.core.curation import plan_catalogue
+    from spotifyforge.core.expansion import expand_catalogue, expansions_path, load_expansions
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _expand(sp):
+        # Loaded once and shared: the plan folds these pins in, and
+        # expand_catalogue appends this run's picks to the same dict.
+        pins = load_expansions()
+        plan = await plan_catalogue(sp, opts, features, pins)
+        return await expand_catalogue(sp, plan.specs, target=target, limit=limit, expansions=pins)
+
+    added, thin = _run_spotify(
+        "Digging for unheard tracks...", "Failed to expand playlists", _expand
+    )
+
+    if not added:
+        console.print(
+            Panel(
+                f"No playlists below {target} tracks had unheard music to pin "
+                f"({thin} are below the target).",
+                title="Nothing to expand",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("Playlist", style="white", no_wrap=True, max_width=45)
+    table.add_column("Pinned", justify="right")
+    table.add_column("New artists", style="green", max_width=50)
+    for title, tracks in added.items():
+        artists = ", ".join(dict.fromkeys(t.artist_names[0] for t in tracks if t.artist_names))
+        table.add_row(title, str(len(tracks)), artists)
+    console.print(table)
+    console.print(
+        Panel(
+            f"[green]Pinned {sum(len(t) for t in added.values())} track(s) across "
+            f"{len(added)} playlist(s)[/green] of {thin} below the target; "
+            "re-run to continue.\n"
+            "Run [bold]spotifyforge curate reflow[/bold] to push them to Spotify.",
+            title="Expanded",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]Pins: {expansions_path()}[/dim]")
 
 
 @curate_app.command("stats")
@@ -1370,14 +1455,14 @@ def curate_reflow(
     harmonic: bool = _HARMONIC,
 ) -> None:
     """Re-sequence playlists you already forged, keeping their URLs and followers."""
-    from spotifyforge.core.curation import plan_catalogue, reflow
+    from spotifyforge.core.curation import reflow
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
 
     async def _reflow(sp):
-        plan = await plan_catalogue(sp, opts, features)
+        plan = await _plan(sp, opts, features)
         rewritten, failed = await reflow(PlaylistManager(sp), sp, plan.specs)
         return rewritten, failed, len(plan.specs)
 

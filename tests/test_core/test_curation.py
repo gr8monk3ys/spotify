@@ -360,7 +360,9 @@ def test_flow_preserves_track_set_and_handles_tiny_lists():
 # ---------------------------------------------------------------------------
 
 
-async def test_forged_playlist_lands_on_spotify_and_in_db(fake_spotify, client_for, isolated_db):
+async def test_forged_playlist_lands_on_spotify_and_in_db(
+    fake_spotify, client_for, isolated_db, db_user
+):
     from spotifyforge.core.playlist_manager import PlaylistManager
     from spotifyforge.db.engine import get_engine
     from spotifyforge.models.models import User
@@ -427,18 +429,6 @@ def _seed_library(fake, *, users=("user1",), genres=("coldwave", "minimal wave")
         fake.set_artist_genres(f"art{i}", [genres[i % len(genres)]])
 
 
-def _db_user(spotify_id="user1") -> int:
-    from spotifyforge.db.engine import get_engine
-    from spotifyforge.models.models import User
-
-    with Session(get_engine()) as session:
-        user = User(spotify_id=spotify_id)
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-        return user.id
-
-
 async def test_plan_catalogue_reports_collapse_and_placement(fake_spotify, client_for):
     _seed_library(fake_spotify, count=40)
     # One extra remaster of Song 0 that must be collapsed away.
@@ -469,11 +459,13 @@ async def test_plan_splits_a_large_genre_by_decade(fake_spotify, client_for):
     assert all(len(s.tracks) <= 30 for s in plan.specs if s.decade)
 
 
-async def test_forge_next_is_resumable_and_skips_existing(fake_spotify, client_for, isolated_db):
+async def test_forge_next_is_resumable_and_skips_existing(
+    fake_spotify, client_for, isolated_db, db_user
+):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
@@ -494,12 +486,12 @@ async def test_forge_next_is_resumable_and_skips_existing(fake_spotify, client_f
 
 
 async def test_forge_next_reports_nothing_pending_when_drained(
-    fake_spotify, client_for, isolated_db
+    fake_spotify, client_for, isolated_db, db_user
 ):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
@@ -511,11 +503,13 @@ async def test_forge_next_reports_nothing_pending_when_drained(
     assert pending == 0
 
 
-async def test_reflow_rewrites_a_scrambled_playlist_in_place(fake_spotify, client_for, isolated_db):
+async def test_reflow_rewrites_a_scrambled_playlist_in_place(
+    fake_spotify, client_for, isolated_db, db_user
+):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
@@ -535,11 +529,13 @@ async def test_reflow_rewrites_a_scrambled_playlist_in_place(fake_spotify, clien
     assert playlist.spotify_id in fake_spotify.playlists
 
 
-async def test_reflow_is_a_no_op_when_order_already_matches(fake_spotify, client_for, isolated_db):
+async def test_reflow_is_a_no_op_when_order_already_matches(
+    fake_spotify, client_for, isolated_db, db_user
+):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
@@ -549,13 +545,13 @@ async def test_reflow_is_a_no_op_when_order_already_matches(fake_spotify, client
 
 
 async def test_reflow_handles_playlists_longer_than_one_request(
-    fake_spotify, client_for, isolated_db
+    fake_spotify, client_for, isolated_db, db_user
 ):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     # 150 tracks in one genre exceeds the 100-URI replace limit.
     _seed_library(fake_spotify, genres=("coldwave",), count=150)
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10, max_size=200))
@@ -569,14 +565,16 @@ async def test_reflow_handles_playlists_longer_than_one_request(
     assert fake_spotify.playlist_tracks[playlist.spotify_id] == [t.id for t in spec.tracks]
 
 
-async def test_reflow_keeps_going_when_one_playlist_fails(fake_spotify, client_for, isolated_db):
+async def test_reflow_keeps_going_when_one_playlist_fails(
+    fake_spotify, client_for, isolated_db, db_user
+):
     """A timeout on one playlist must not discard hundreds of others."""
     import httpx
 
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
@@ -816,12 +814,12 @@ def test_description_stays_within_spotify_limit():
 
 
 async def test_apply_descriptions_updates_stale_text_and_skips_current(
-    fake_spotify, client_for, isolated_db
+    fake_spotify, client_for, isolated_db, db_user
 ):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
