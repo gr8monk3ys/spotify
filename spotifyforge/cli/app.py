@@ -1259,6 +1259,59 @@ def curate_describe(
     )
 
 
+@curate_app.command("stats")
+def curate_stats(
+    movers: int = typer.Option(
+        10, "--movers", min=0, help="How many biggest follower changes to list."
+    ),
+) -> None:
+    """Snapshot follower counts and show growth since the last run.
+
+    Spotify keeps no follower history, so growth is only measurable if
+    each run records what it saw. Snapshots accumulate locally; run this
+    on any cadence and it reports the change since the previous run.
+    """
+    from spotifyforge.core.stats import (
+        append_snapshot,
+        growth_since,
+        load_previous,
+        take_snapshot,
+    )
+
+    previous = load_previous()
+    snapshot = _run_spotify(
+        "Counting followers...", "Failed to read follower counts", take_snapshot
+    )
+    path = append_snapshot(snapshot)
+
+    lines = [
+        f"Account followers:   [bold]{snapshot.account_followers}[/bold]",
+        f"Owned playlists:     [bold]{len(snapshot.playlists)}[/bold]",
+        f"Playlist followers:  [bold]{snapshot.playlist_followers}[/bold] "
+        f"across {snapshot.followed_playlists} playlist(s)",
+    ]
+    growth = growth_since(previous, snapshot) if previous else None
+    if growth:
+        lines.append(
+            f"Since {growth.since.split('T')[0]}:  "
+            f"account [bold]{growth.account_delta:+d}[/bold], "
+            f"playlist followers [bold]{growth.playlist_delta:+d}[/bold]"
+        )
+    else:
+        lines.append("First snapshot — the next run will show growth.")
+    console.print(Panel("\n".join(lines), title="Growth", border_style="cyan", expand=False))
+
+    if growth and growth.movers and movers:
+        table = Table(box=box.SIMPLE, header_style="bold cyan")
+        table.add_column("Playlist", style="white", no_wrap=True, max_width=45)
+        table.add_column("Followers", justify="right")
+        for name, delta in growth.movers[:movers]:
+            table.add_row(name, f"{delta:+d}")
+        console.print(table)
+
+    console.print(f"[dim]History: {path}[/dim]")
+
+
 @curate_app.command("features")
 def curate_features(
     deep: bool = typer.Option(

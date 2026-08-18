@@ -677,6 +677,29 @@ class TestScheduleListRemove:
 
 
 # ---------------------------------------------------------------------------
+# Curate
+# ---------------------------------------------------------------------------
+
+
+class TestCurateStats:
+    def test_first_run_snapshots_then_second_run_reports_growth(self, cli_env):
+        fake = cli_env
+        fake.add_playlist("pl1", name="Quiet Corner", followers=2)
+        _login(fake)
+
+        first = runner.invoke(app, ["curate", "stats"])
+        assert first.exit_code == 0, first.stderr
+        assert "First snapshot" in first.output
+
+        fake.playlists["pl1"]["followers"] = 6
+
+        second = runner.invoke(app, ["curate", "stats"])
+        assert second.exit_code == 0, second.stderr
+        assert "+4" in second.output
+        assert "Quiet Corner" in second.output
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
