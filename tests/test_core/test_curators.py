@@ -126,3 +126,66 @@ def test_top_genres_skips_catch_all_labels():
     tracks += [T(("dungeon synth",)) for _ in range(3)]
 
     assert top_genres(tracks, count=5) == ["zeuhl", "coldwave", "dungeon synth"]
+
+
+async def test_a_playlist_surfacing_in_two_genres_is_read_once(fake_spotify, client_for):
+    """Neighbouring genres return overlapping playlists; re-reading one
+    costs a round trip and changes no answer."""
+    liked = _library(fake_spotify)
+    fake_spotify.add_user("curator")
+    # Its name matches both search terms.
+    fake_spotify.add_playlist(
+        "pl", owner="curator", name="Zeuhl Krautrock hybrid", track_ids=["t1", "t2"]
+    )
+
+    found = await find_curators(client_for("user1"), ["Zeuhl", "Krautrock"], liked, me="user1")
+
+    reads = [r for r in fake_spotify.requests if r == ("GET", "/v1/playlists/pl/tracks")]
+    assert len(reads) == 1
+    assert found[0].shared_tracks == 2
+    assert found[0].playlists_seen == 1
+
+
+async def test_an_unreadable_playlist_does_not_sink_the_report(fake_spotify, client_for):
+    """Strangers' playlists routinely 404 or are region-locked."""
+    import httpx
+
+    liked = _library(fake_spotify)
+    fake_spotify.add_user("good")
+    fake_spotify.add_playlist("ok", owner="good", name="Zeuhl fine", track_ids=["t1", "t2"])
+    fake_spotify.add_playlist("gone", owner="good", name="Zeuhl missing", track_ids=["t3"])
+
+    sp = client_for("user1")
+    original = sp.playlist_items
+
+    async def flaky(playlist_id, *a, **kw):
+        if playlist_id == "gone":
+            raise httpx.ReadTimeout("")
+        return await original(playlist_id, *a, **kw)
+
+    sp.playlist_items = flaky
+    found = await find_curators(sp, ["Zeuhl"], liked, me="user1")
+
+    assert [c.user_id for c in found] == ["good"]
+    assert found[0].shared_tracks == 2  # the readable one still counted
+
+
+async def test_only_track_ids_are_requested(fake_spotify, client_for):
+    """The default payload carries every field of 100 hydrated tracks to
+    read one id from each."""
+    liked = _library(fake_spotify)
+    fake_spotify.add_user("curator")
+    fake_spotify.add_playlist("pl", owner="curator", name="Zeuhl x", track_ids=["t1"])
+
+    seen = {}
+    original = fake_spotify.handler
+
+    def spy(request):
+        if request.url.path == "/v1/playlists/pl/tracks":
+            seen.update(dict(request.url.params))
+        return original(request)
+
+    fake_spotify.handler = spy
+    await find_curators(client_for("user1"), ["Zeuhl"], liked, me="user1")
+
+    assert seen.get("fields") == "items(track(id))"
