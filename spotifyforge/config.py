@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
+    # Pexels (photo cover art); free key from pexels.com/api.
+    pexels_api_key: str = ""
+
     @model_validator(mode="after")
     def _validate_config(self) -> "Settings":
         """Validate required settings and normalise paths.
