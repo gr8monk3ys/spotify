@@ -1172,13 +1172,26 @@ def curate_covers(
     overwrite: bool = typer.Option(
         False, "--overwrite", help="Replace covers that are already set."
     ),
+    photos: bool = typer.Option(
+        False,
+        "--photos",
+        help="Use licensed photos (Pexels) matched to each playlist's vibe, "
+        "covering personal playlists too. Needs SPOTIFYFORGE_PEXELS_API_KEY.",
+    ),
 ) -> None:
-    """Give your forged playlists generated cover art.
+    """Give your playlists cover art.
 
-    Spotify's default four-track mosaic makes a large catalogue look
-    automated. Each cover's colour is derived from the playlist's genre,
-    so it is stable across runs and the set reads as one collection.
+    By default each forged playlist gets generated art whose colour is
+    derived from its genre — stable across runs, one collection. With
+    [bold]--photos[/bold], every owned playlist instead gets a licensed
+    photograph matched to its vibe; picks are pinned locally so re-runs
+    are stable, and a Pexels rate limit pauses the run resumably rather
+    than failing it.
     """
+    if photos:
+        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite)
+        return
+
     from spotifyforge.core.curation import apply_covers
     from spotifyforge.core.playlist_manager import PlaylistManager
 
@@ -1216,6 +1229,57 @@ def curate_covers(
             expand=False,
         )
     )
+
+
+def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
+    """The --photos path of ``curate covers``: every owned playlist."""
+    from spotifyforge.core.photo_covers import PexelsSource, apply_photo_covers, picks_path
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    if not settings.pexels_api_key:
+        _error_panel(
+            "Photo covers need a Pexels key.\n"
+            "Get a free one at pexels.com/api and set "
+            "[bold]SPOTIFYFORGE_PEXELS_API_KEY[/bold].",
+            title="Pexels key missing",
+        )
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+
+    async def _photo(sp):
+        plan = await _plan(sp, opts)
+        vibe_by_title = {s.title: s.genre_label for s in plan.specs}
+        me = await sp.current_user()
+        owned = [
+            p for p in await PlaylistManager(sp).get_user_playlists() if p["owner_id"] == me.id
+        ]
+        # Forged playlists search by genre; personal ones by their name.
+        targets = [(p["name"], p["id"], vibe_by_title.get(p["name"], p["name"])) for p in owned]
+        source = PexelsSource(settings.pexels_api_key)
+        try:
+            covered, failed, limited = await apply_photo_covers(
+                sp, targets, source, overwrite=overwrite
+            )
+        finally:
+            await source.close()
+        return covered, failed, limited, len(targets)
+
+    covered, failed, limited, total = _run_spotify(
+        "Matching photographs to playlists...", "Failed to set photo covers", _photo
+    )
+
+    body = f"[green]Photo-covered {len(covered)} playlist(s)[/green] of {total}."
+    if failed:
+        body += f"\n[yellow]{len(failed)} had no usable photo[/yellow] (kept their current art)."
+    if limited:
+        body += (
+            "\n[yellow]Pexels' hourly limit reached[/yellow] — progress is saved; "
+            "re-run in an hour to continue."
+        )
+    if not covered and not failed and not limited:
+        body = f"All {total} playlists already have pinned photos (use [bold]--overwrite[/bold])."
+    console.print(Panel(body, title="Photo covers", border_style="green", expand=False))
+    console.print(f"[dim]Picks + attribution: {picks_path()}[/dim]")
 
 
 @curate_app.command("describe")

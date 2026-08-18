@@ -402,6 +402,18 @@ class FakeSpotify:
                     return httpx.Response(200)
                 return httpx.Response(200, json=self._playlist_payload(playlist_id))
 
+            if parts[4] == "images":
+                meta = self.playlists[playlist_id]
+                if request.method == "PUT":  # cover upload (base64 body)
+                    meta["cover_image"] = request.content
+                    return httpx.Response(202)
+                url = (
+                    f"https://image-cdn.spotifycdn.com/image/{playlist_id}"
+                    if meta.get("cover_image")
+                    else f"https://mosaic.scdn.co/640/{playlist_id}"
+                )
+                return httpx.Response(200, json=[{"url": url, "height": 640, "width": 640}])
+
             if parts[4] == "tracks":
                 track_ids = self.playlist_tracks[playlist_id]
                 if request.method == "GET":

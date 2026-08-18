@@ -146,10 +146,10 @@ def render_cover(title: str, subject: str) -> bytes:
     caption = title if draw.textlength(title, font=caption_font) <= max_width else subject
     draw.text((margin, y + 34), caption, font=caption_font, fill=(*ink, 190))
 
-    return _encode(image)
+    return encode_jpeg(image)
 
 
-def _encode(image: Image.Image) -> bytes:
+def encode_jpeg(image: Image.Image) -> bytes:
     """JPEG-encode, stepping quality down until Spotify's limit is met."""
     quality = _JPEG_QUALITY
     while True:
