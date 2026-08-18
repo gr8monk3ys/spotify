@@ -264,13 +264,13 @@ def _ordered_unique(values: Iterable[str]) -> tuple[str, ...]:
 
 def _saved_page_to_tracks(paging: Any) -> list[CurationTrack]:
     return [
-        _to_curation_track(item.track)
+        to_curation_track(item.track)
         for item in paging.items or []
         if item.track is not None and item.track.id is not None
     ]
 
 
-def _to_curation_track(track: Any) -> CurationTrack:
+def to_curation_track(track: Any) -> CurationTrack:
     release_year: int | None = None
     if track.album is not None and track.album.release_date:
         try:
@@ -688,16 +688,54 @@ def _make_spec(
 # ---------------------------------------------------------------------------
 
 
+def merge_expansions(
+    specs: list[PlaylistSpec],
+    extras: dict[str, list[CurationTrack]] | None,
+    features: dict[str, AudioFeature] | None = None,
+) -> list[PlaylistSpec]:
+    """Fold pinned expansion tracks into their playlists' specs.
+
+    Expansions are unheard tracks ``curate expand`` recorded for a
+    playlist; merging them at plan time is what keeps ``reflow`` from
+    stripping them back out. The combined list is de-duplicated (a
+    pinned track the user later likes must not appear twice) and
+    re-sequenced, and the description is rebuilt so it can name the new
+    artists.
+    """
+    if not extras:
+        return specs
+    merged = []
+    for spec in specs:
+        additions = extras.get(spec.title)
+        if not additions:
+            merged.append(spec)
+            continue
+        combined = dedupe_versions(spec.tracks + additions)
+        ordered, ordering = order_with_mode(combined, features)
+        merged.append(
+            replace(
+                spec,
+                tracks=ordered,
+                ordering=ordering,
+                description=_describe(spec.genre, spec.decade, ordered, ordering),
+            )
+        )
+    return merged
+
+
 async def plan_catalogue(
     spotify: Spotify,
     opts: CurationOptions,
     features: dict[str, AudioFeature] | None = None,
+    expansions: dict[str, list[CurationTrack]] | None = None,
 ) -> CurationPlan:
     """Read the library and return the catalogue it would produce.
 
     Pure read — nothing is created. ``curate plan`` shows this and
     ``curate forge`` acts on it, so both see the same clusters. Pass
-    *features* (from :func:`load_features`) to sequence harmonically.
+    *features* (from :func:`load_features`) to sequence harmonically and
+    *expansions* (from :func:`spotifyforge.core.expansion.load_expansions`)
+    so playlists keep the unheard tracks pinned to them.
     """
     engine = CurationEngine(spotify)
     liked = await engine.enrich_genres(await engine.fetch_liked(max_tracks=opts.max_tracks))
@@ -709,6 +747,7 @@ async def plan_catalogue(
         exclusive=opts.exclusive,
         features=features,
     )
+    specs = merge_expansions(specs, expansions, features)
     return CurationPlan(liked_count=len(liked), unique_count=len(unique), specs=specs)
 
 

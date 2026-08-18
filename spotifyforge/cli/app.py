@@ -951,6 +951,13 @@ def _features_or_warn(harmonic: bool):
     return features
 
 
+def _load_expansions():
+    """The unheard tracks `curate expand` pinned to playlists, by title."""
+    from spotifyforge.core.expansion import load_expansions
+
+    return load_expansions()
+
+
 def _curation_options(min_size, max_size, max_tracks, exclusive):
     from spotifyforge.core.curation import CurationOptions
 
@@ -993,7 +1000,7 @@ def curate_plan(
     plan = _run_spotify(
         "Scanning your liked songs...",
         "Failed to plan curation",
-        lambda sp: plan_catalogue(sp, opts, features),
+        lambda sp: plan_catalogue(sp, opts, features, _load_expansions()),
     )
 
     console.print(
@@ -1044,7 +1051,7 @@ def curate_forge(
     features = _features_or_warn(harmonic)
 
     async def _forge(sp):
-        plan = await plan_catalogue(sp, opts, features)
+        plan = await plan_catalogue(sp, opts, features, _load_expansions())
         created, pending = await forge_next(
             PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
         )
@@ -1173,7 +1180,7 @@ def curate_covers(
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
 
     async def _covers(sp):
-        plan = await plan_catalogue(sp, opts)
+        plan = await plan_catalogue(sp, opts, expansions=_load_expansions())
         uploaded, failed = await apply_covers(
             PlaylistManager(sp), sp, plan.specs, overwrite=overwrite
         )
@@ -1229,7 +1236,7 @@ def curate_describe(
     features = _features_or_warn(harmonic)
 
     async def _push(sp):
-        plan = await plan_catalogue(sp, opts, features)
+        plan = await plan_catalogue(sp, opts, features, _load_expansions())
         updated, failed = await apply_descriptions(PlaylistManager(sp), sp, plan.specs)
         return updated, failed, len(plan.specs)
 
@@ -1257,6 +1264,78 @@ def curate_describe(
             expand=False,
         )
     )
+
+
+@curate_app.command("expand")
+def curate_expand(
+    target: int = typer.Option(
+        12, "--target", min=3, help="Grow playlists below this many tracks."
+    ),
+    limit: int = typer.Option(
+        10, "--limit", "-l", min=1, help="Maximum playlists to expand this run."
+    ),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Grow thin playlists with unheard tracks from the same niche.
+
+    Searches Spotify for more of a playlist's genre — music you have
+    never heard — and pins the picks locally. Nothing is written to
+    Spotify here: run [bold]curate reflow[/bold] afterwards to push the
+    grown playlists (and [bold]curate describe[/bold] to refresh their
+    descriptions). Repeat runs continue where the last one stopped.
+    """
+    from spotifyforge.core.curation import plan_catalogue
+    from spotifyforge.core.expansion import expand_catalogue
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _expand(sp):
+        plan = await plan_catalogue(sp, opts, features, _load_expansions())
+        thin = sum(1 for s in plan.specs if s.genre is not None and len(s.tracks) < target)
+        added, path = await expand_catalogue(sp, plan.specs, target=target, limit=limit)
+        return added, path, thin
+
+    added, path, thin = _run_spotify(
+        "Digging for unheard tracks...", "Failed to expand playlists", _expand
+    )
+
+    if not added:
+        console.print(
+            Panel(
+                f"No playlists below {target} tracks had unheard music to pin "
+                f"({thin} are below the target).",
+                title="Nothing to expand",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("Playlist", style="white", no_wrap=True, max_width=45)
+    table.add_column("Pinned", justify="right")
+    table.add_column("New artists", style="green", max_width=50)
+    for title, tracks in added.items():
+        artists = ", ".join(dict.fromkeys(t.artist_names[0] for t in tracks if t.artist_names))
+        table.add_row(title, str(len(tracks)), artists)
+    console.print(table)
+    console.print(
+        Panel(
+            f"[green]Pinned {sum(len(t) for t in added.values())} track(s) across "
+            f"{len(added)} playlist(s)[/green] ({thin - len(added)} thin playlists remain; "
+            "re-run to continue).\n"
+            "Run [bold]spotifyforge curate reflow[/bold] to push them to Spotify.",
+            title="Expanded",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]Pins: {path}[/dim]")
 
 
 @curate_app.command("stats")
@@ -1377,7 +1456,7 @@ def curate_reflow(
     features = _features_or_warn(harmonic)
 
     async def _reflow(sp):
-        plan = await plan_catalogue(sp, opts, features)
+        plan = await plan_catalogue(sp, opts, features, _load_expansions())
         rewritten, failed = await reflow(PlaylistManager(sp), sp, plan.specs)
         return rewritten, failed, len(plan.specs)
 
