@@ -248,7 +248,7 @@ class TestGetUserPlaylists:
 
         assert len(playlists) == 2
         by_id = {p["id"]: p for p in playlists}
-        assert set(by_id["pl1"]) == {"id", "name", "track_count", "public"}
+        assert set(by_id["pl1"]) == {"id", "name", "description", "track_count", "public"}
         assert by_id["pl1"]["name"] == "First"
         assert by_id["pl1"]["track_count"] == 1
         assert by_id["pl1"]["public"] is True

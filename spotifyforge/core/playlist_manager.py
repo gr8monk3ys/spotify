@@ -9,6 +9,7 @@ limits or page sizes.
 
 from __future__ import annotations
 
+import html
 import logging
 from collections.abc import Sequence
 from datetime import datetime
@@ -51,8 +52,9 @@ class PlaylistManager:
         """Fetch the current user's playlists from Spotify.
 
         Returns a list of dicts with keys: ``id``, ``name``,
-        ``track_count``, ``public``. (Spotify's list endpoint does not
-        include follower counts; use :meth:`get_playlist_details`.)
+        ``description``, ``track_count``, ``public``. (Spotify's list
+        endpoint does not include follower counts; use
+        :meth:`get_playlist_details`.)
         """
         try:
             user = await self._sp.current_user()
@@ -70,6 +72,9 @@ class PlaylistManager:
                         {
                             "id": pl.id,
                             "name": pl.name,
+                            # Spotify serves descriptions back HTML-escaped;
+                            # unescape here so callers compare plain text.
+                            "description": html.unescape(pl.description or ""),
                             "track_count": pl.tracks.total if pl.tracks else 0,
                             "public": pl.public,
                         }

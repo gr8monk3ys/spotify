@@ -1206,6 +1206,59 @@ def curate_covers(
     )
 
 
+@curate_app.command("describe")
+def curate_describe(
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Refresh forged playlists' descriptions from the current templates.
+
+    Descriptions are the only text besides the name that Spotify's
+    search indexes. This rewrites each forged playlist's description to
+    the current template — leading with the playlist's own artists —
+    without touching tracks, titles, followers, or artwork. Playlists
+    already carrying the wanted text are skipped.
+    """
+    from spotifyforge.core.curation import apply_descriptions, plan_catalogue
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _push(sp):
+        plan = await plan_catalogue(sp, opts, features)
+        updated, failed = await apply_descriptions(PlaylistManager(sp), sp, plan.specs)
+        return updated, failed, len(plan.specs)
+
+    updated, failed, total = _run_spotify(
+        "Rewriting playlist descriptions...", "Failed to update descriptions", _push
+    )
+
+    if not updated and not failed:
+        console.print(
+            Panel(
+                f"All {total} playlists already carry the current descriptions.",
+                title="Nothing to rewrite",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    console.print(
+        Panel(
+            f"[green]Updated {len(updated)} description(s)[/green] of {total}."
+            + (f"\n[yellow]{len(failed)} failed[/yellow]" if failed else ""),
+            title="Descriptions",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+
 @curate_app.command("features")
 def curate_features(
     deep: bool = typer.Option(

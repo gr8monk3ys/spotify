@@ -7,6 +7,7 @@ functions tested directly.
 
 from __future__ import annotations
 
+import html
 from dataclasses import replace
 
 import pytest
@@ -18,6 +19,7 @@ from spotifyforge.core.curation import (
     CurationEngine,
     CurationOptions,
     CurationTrack,
+    apply_descriptions,
     cluster_library,
     dedupe_versions,
     forge_next,
@@ -764,3 +766,94 @@ async def test_library_read_raises_rather_than_returning_a_partial_library(
     sp.saved_tracks = always_fails
     with pytest.raises(httpx.ReadTimeout):
         await CurationEngine(sp).fetch_liked()
+
+
+# ---------------------------------------------------------------------------
+# Descriptions
+# ---------------------------------------------------------------------------
+
+
+def test_description_reads_human_and_names_the_biggest_artists():
+    tracks = [
+        _ct(f"t{i}", genres=("zeuhl",), popularity=90 - i, artist=f"Band {i}") for i in range(12)
+    ]
+    (spec,) = cluster_library(tracks, min_size=10)
+
+    # Leads with the most popular artists — the terms searchers type.
+    assert "Band 0" in spec.description
+    assert "Band 1" in spec.description
+    assert "zeuhl" in spec.description
+    # No bot signature, no stale-able track count.
+    assert "SpotifyForge" not in spec.description
+    assert "liked songs" not in spec.description
+    assert "12 " not in spec.description
+    # Deterministic: the same library always yields the same text.
+    (again,) = cluster_library(list(reversed(tracks)), min_size=10)
+    assert again.description == spec.description
+
+
+def test_description_mentions_the_era_on_decade_splits():
+    tracks = [
+        _ct(f"n{i}", genres=("dungeon synth",), year=1994, artist=f"N{i}") for i in range(12)
+    ] + [_ct(f"m{i}", genres=("dungeon synth",), year=2004, artist=f"M{i}") for i in range(12)]
+
+    specs = cluster_library(tracks, min_size=10, max_size=12)
+    nineties = next(s for s in specs if s.decade == 1990)
+
+    assert "all from the 1990s." in nineties.description
+
+
+def test_description_notes_harmonic_sequencing():
+    pairs = [
+        _keyed("h1", key=9, mode=0, tempo=120, popularity=99, artist="w"),
+        _keyed("h2", key=0, mode=1, tempo=121, popularity=50, artist="x"),
+        _keyed("h3", key=4, mode=0, tempo=122, popularity=40, artist="y"),
+        _keyed("h4", key=6, mode=1, tempo=120, popularity=60, artist="z"),
+    ]
+    tracks = [replace(t, isrc=t.id) for t, _ in pairs]
+    features = {t.id: f for t, (_, f) in zip(tracks, pairs, strict=True)}
+
+    (spec,) = cluster_library(tracks, min_size=3, features=features)
+
+    assert spec.ordering == "harmonic"
+    assert spec.description.endswith("mixed by key, like a dj set.")
+
+
+def test_description_stays_within_spotify_limit():
+    verbose = "The Extraordinarily Long Ensemble Of The Northern Archipelago Revival "
+    tracks = [
+        _ct(f"t{i}", genres=("hyperniche revival",), artist=verbose * 3 + str(i)) for i in range(12)
+    ]
+
+    (spec,) = cluster_library(tracks, min_size=10)
+
+    assert len(spec.description) <= 300
+
+
+async def test_apply_descriptions_updates_stale_text_and_skips_current(
+    fake_spotify, client_for, isolated_db
+):
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    _seed_library(fake_spotify, count=40)
+    owner_id = _db_user()
+    sp = client_for("user1")
+    manager = PlaylistManager(sp)
+    plan = await plan_catalogue(sp, CurationOptions(min_size=10))
+    created, _ = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+
+    # Freshly forged playlists already carry the wanted text — even once
+    # Spotify hands it back HTML-escaped, as it does live.
+    spec, playlist = created[0]
+    fake_spotify.playlists[playlist.spotify_id]["description"] = html.escape(spec.description)
+    assert await apply_descriptions(manager, sp, plan.specs, delay=0) == ([], [])
+
+    # An out-of-date description is rewritten in place, nothing else.
+    tracks_before = list(fake_spotify.playlist_tracks[playlist.spotify_id])
+    fake_spotify.playlists[playlist.spotify_id]["description"] = "42 tracks, sequenced for flow."
+    updated, failed = await apply_descriptions(manager, sp, plan.specs, delay=0)
+
+    assert failed == []
+    assert spec.title in updated
+    assert fake_spotify.playlists[playlist.spotify_id]["description"] == spec.description
+    assert fake_spotify.playlist_tracks[playlist.spotify_id] == tracks_before
