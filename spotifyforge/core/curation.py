@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import html
 import logging
 import re
 from collections import Counter
@@ -606,22 +605,20 @@ _DESCRIPTION_TEMPLATES = [
     "{artists}. {genre}, end to end.",
 ]
 _UNCLASSIFIED_DESCRIPTION = "songs spotify never tagged with a genre. {artists}, other strays."
+# When even one artist name would overflow the limit (or no track carries
+# a name at all), fall back to genre-only phrasing.
+_FALLBACK_DESCRIPTION = "{genre}, start to finish."
+_UNCLASSIFIED_FALLBACK = "songs spotify never tagged with a genre."
 _DESCRIPTION_MAX = 300  # Spotify's documented limit for playlist descriptions
 
 
-def _lead_artists(tracks: list[CurationTrack], count: int) -> list[str]:
+def _lead_artists(tracks: list[CurationTrack], count: int = 3) -> tuple[str, ...]:
     """The playlist's most recognisable artist names, most popular first."""
-    names: list[str] = []
-    for track in sorted(tracks, key=lambda t: -t.popularity):
-        name = track.artist_names[0] if track.artist_names else ""
-        if name and name not in names:
-            names.append(name)
-        if len(names) == count:
-            break
-    return names
+    ranked = sorted(tracks, key=lambda t: (-t.popularity, t.id))
+    return _ordered_unique(t.artist_names[0] for t in ranked if t.artist_names)[:count]
 
 
-def _join_names(names: list[str]) -> str:
+def _join_names(names: tuple[str, ...]) -> str:
     if len(names) > 1:
         return ", ".join(names[:-1]) + " and " + names[-1]
     return names[0] if names else ""
@@ -632,31 +629,32 @@ def _describe(
 ) -> str:
     """A human-sounding description, deterministic per genre.
 
-    Phrasing is chosen by hashing the genre (like cover palettes), so a
-    genre keeps its voice across runs and neighbouring playlists don't
-    all read alike. Tries three artist names, then fewer if the result
-    would overrun Spotify's length limit.
+    Phrasing is chosen by hashing the genre (as cover palettes do, but
+    salted so template and hue stay independent), so a genre keeps its
+    voice across runs and neighbouring playlists don't all read alike.
+    Tries three artist names, then fewer if the result would overrun
+    Spotify's length limit.
     """
-    for count in (3, 2, 1, 0):
-        artists = _join_names(_lead_artists(tracks, count))
-        if not artists:
-            text = (
-                "songs spotify never tagged with a genre."
-                if genre is None
-                else f"{genre}, start to finish."
-            )
-        elif genre is None:
-            text = _UNCLASSIFIED_DESCRIPTION.format(artists=artists)
-        else:
-            index = hashlib.sha256(genre.encode()).digest()[0] % len(_DESCRIPTION_TEMPLATES)
-            text = _DESCRIPTION_TEMPLATES[index].format(genre=genre, artists=artists)
-        if decade:
-            text += f" all from the {decade}s."
-        if ordering == "harmonic":
-            text += " mixed by key, like a dj set."
+    if genre is None:
+        base, fallback = _UNCLASSIFIED_DESCRIPTION, _UNCLASSIFIED_FALLBACK
+    else:
+        digest = hashlib.sha256(("description " + genre).encode()).digest()
+        base = _DESCRIPTION_TEMPLATES[digest[0] % len(_DESCRIPTION_TEMPLATES)]
+        fallback = _FALLBACK_DESCRIPTION
+
+    suffix = ""
+    if decade:
+        suffix += f" all from the {decade}s."
+    if ordering == "harmonic":
+        suffix += " mixed by key, like a dj set."
+
+    names = _lead_artists(tracks)
+    for count in range(len(names), 0, -1):
+        text = base.format(genre=genre, artists=_join_names(names[:count])) + suffix
         if len(text) <= _DESCRIPTION_MAX:
             return text
-    return text[:_DESCRIPTION_MAX]
+    text = fallback.format(genre=genre) + suffix
+    return text if len(text) <= _DESCRIPTION_MAX else text[:_DESCRIPTION_MAX]
 
 
 def _make_spec(
@@ -847,9 +845,8 @@ async def apply_descriptions(
 
     Descriptions are written once at forge time and drift as the library
     (and the description templates) evolve; this pushes the current text
-    without touching tracks, titles, or followers. Spotify serves
-    descriptions back HTML-escaped, so comparison happens on the
-    unescaped text and an already-correct playlist costs nothing.
+    without touching tracks, titles, or followers. Playlists already
+    carrying the wanted text are skipped, so a re-run costs nothing.
     Returns ``(updated, failed)`` titles; one failure never discards the
     rest of the run.
     """
@@ -861,7 +858,7 @@ async def apply_descriptions(
         entry = by_title.get(spec.title)
         if entry is None:
             continue
-        if html.unescape(entry.get("description") or "") == spec.description:
+        if entry["description"] == spec.description:
             continue
         try:
             await spotify.playlist_change_details(entry["id"], description=spec.description)

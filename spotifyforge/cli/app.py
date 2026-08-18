@@ -1228,13 +1228,13 @@ def curate_describe(
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
 
-    async def _describe(sp):
+    async def _push(sp):
         plan = await plan_catalogue(sp, opts, features)
         updated, failed = await apply_descriptions(PlaylistManager(sp), sp, plan.specs)
         return updated, failed, len(plan.specs)
 
     updated, failed, total = _run_spotify(
-        "Rewriting playlist descriptions...", "Failed to update descriptions", _describe
+        "Rewriting playlist descriptions...", "Failed to update descriptions", _push
     )
 
     if not updated and not failed:

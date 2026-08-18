@@ -9,6 +9,7 @@ limits or page sizes.
 
 from __future__ import annotations
 
+import html
 import logging
 from collections.abc import Sequence
 from datetime import datetime
@@ -71,7 +72,9 @@ class PlaylistManager:
                         {
                             "id": pl.id,
                             "name": pl.name,
-                            "description": pl.description or "",
+                            # Spotify serves descriptions back HTML-escaped;
+                            # unescape here so callers compare plain text.
+                            "description": html.unescape(pl.description or ""),
                             "track_count": pl.tracks.total if pl.tracks else 0,
                             "public": pl.public,
                         }
