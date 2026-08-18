@@ -70,3 +70,14 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def sidecar_path(name: str) -> Path:
+    """Where a local data file lives: beside the SQLite database.
+
+    Sidecars (the tempo/key cache, the stats history) deliberately follow
+    ``db_path`` even when ``database_url`` points the application at
+    another database entirely, so under Postgres they still land in the
+    local config directory rather than nowhere.
+    """
+    return settings.db_path.parent / name

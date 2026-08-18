@@ -49,21 +49,6 @@ def _requests_for(fake, method: str, path: str) -> list[tuple[str, str]]:
 
 
 @pytest.fixture()
-async def client_for(fake_spotify):
-    """Factory building real async tekore clients wired to the fake backend."""
-    clients: list[tk.Spotify] = []
-
-    def make(user_id: str = "user1") -> tk.Spotify:
-        client = fake_spotify.async_client(user_id)
-        clients.append(client)
-        return client
-
-    yield make
-    for client in clients:
-        await client.close()
-
-
-@pytest.fixture()
 def mock_spotify():
     """AsyncMock stand-in, for narrow unit tests (error propagation etc.)."""
     return AsyncMock()
@@ -248,7 +233,15 @@ class TestGetUserPlaylists:
 
         assert len(playlists) == 2
         by_id = {p["id"]: p for p in playlists}
-        assert set(by_id["pl1"]) == {"id", "name", "description", "track_count", "public"}
+        assert set(by_id["pl1"]) == {
+            "id",
+            "name",
+            "description",
+            "owner_id",
+            "track_count",
+            "public",
+        }
+        assert by_id["pl1"]["owner_id"] == "user1"
         assert by_id["pl1"]["name"] == "First"
         assert by_id["pl1"]["track_count"] == 1
         assert by_id["pl1"]["public"] is True

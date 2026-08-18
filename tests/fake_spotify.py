@@ -157,6 +157,7 @@ class FakeSpotify:
         name: str | None = None,
         track_ids: list[str] | None = None,
         public: bool = True,
+        followers: int = 7,
     ) -> str:
         self.playlists[playlist_id] = {
             "id": playlist_id,
@@ -165,6 +166,7 @@ class FakeSpotify:
             "public": public,
             "collaborative": False,
             "owner": owner,
+            "followers": followers,
             "snapshot_id": f"snap_{playlist_id}_0",
         }
         self.playlist_tracks[playlist_id] = list(track_ids or [])
@@ -263,7 +265,7 @@ class FakeSpotify:
             "collaborative": meta["collaborative"],
             "description": meta["description"],
             "external_urls": {"spotify": f"https://open.spotify.com/playlist/{playlist_id}"},
-            "followers": {"href": None, "total": 7},
+            "followers": {"href": None, "total": meta["followers"]},
             "href": f"{API}/playlists/{playlist_id}",
             "id": playlist_id,
             "images": [],
