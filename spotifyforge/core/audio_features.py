@@ -408,13 +408,12 @@ def feature_cache_path() -> Path:
     reads the whole liked library without ever creating local ``Track``
     rows to hang a foreign key on.
 
-    Note it follows ``db_path`` even when ``database_url`` points the
-    application at another database entirely, so under Postgres it still
-    lands in the local config directory.
+    Follows ``db_path`` even under Postgres — see
+    :func:`spotifyforge.config.sidecar_path`.
     """
-    from spotifyforge.config import settings
+    from spotifyforge.config import sidecar_path
 
-    return settings.db_path.parent / "audio_features.json"
+    return sidecar_path("audio_features.json")
 
 
 async def gather_features(

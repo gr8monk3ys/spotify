@@ -52,8 +52,10 @@ class PlaylistManager:
         """Fetch the current user's playlists from Spotify.
 
         Returns a list of dicts with keys: ``id``, ``name``,
-        ``description``, ``track_count``, ``public``. (Spotify's list
-        endpoint does not include follower counts; use
+        ``description``, ``owner_id``, ``track_count``, ``public``.
+        The listing includes playlists the user merely follows —
+        ``owner_id`` is what tells them apart. (Spotify's list endpoint
+        does not include follower counts; use
         :meth:`get_playlist_details`.)
         """
         try:
@@ -75,6 +77,7 @@ class PlaylistManager:
                             # Spotify serves descriptions back HTML-escaped;
                             # unescape here so callers compare plain text.
                             "description": html.unescape(pl.description or ""),
+                            "owner_id": pl.owner.id if pl.owner else None,
                             "track_count": pl.tracks.total if pl.tracks else 0,
                             "public": pl.public,
                         }

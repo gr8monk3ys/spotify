@@ -7,24 +7,7 @@ exercised as they would be against Spotify.
 
 from __future__ import annotations
 
-import pytest
-import tekore as tk
-
 from spotifyforge.core.curators import find_curators, top_genres
-
-
-@pytest.fixture()
-async def client_for(fake_spotify):
-    clients: list[tk.Spotify] = []
-
-    def make(user_id: str = "user1") -> tk.Spotify:
-        client = fake_spotify.async_client(user_id)
-        clients.append(client)
-        return client
-
-    yield make
-    for client in clients:
-        await client.close()
 
 
 def _library(fake, count: int = 10) -> set[str]:

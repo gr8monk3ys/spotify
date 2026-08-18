@@ -265,7 +265,7 @@ class FakeSpotify:
             "collaborative": meta["collaborative"],
             "description": meta["description"],
             "external_urls": {"spotify": f"https://open.spotify.com/playlist/{playlist_id}"},
-            "followers": {"href": None, "total": meta.get("followers", 7)},
+            "followers": {"href": None, "total": meta["followers"]},
             "href": f"{API}/playlists/{playlist_id}",
             "id": playlist_id,
             "images": [],

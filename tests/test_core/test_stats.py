@@ -7,9 +7,6 @@ directly.
 
 from __future__ import annotations
 
-import pytest
-import tekore as tk
-
 from spotifyforge.core.stats import (
     PlaylistStat,
     Snapshot,
@@ -18,20 +15,6 @@ from spotifyforge.core.stats import (
     load_previous,
     take_snapshot,
 )
-
-
-@pytest.fixture()
-async def client_for(fake_spotify):
-    clients: list[tk.Spotify] = []
-
-    def make(user_id: str = "user1") -> tk.Spotify:
-        client = fake_spotify.async_client(user_id)
-        clients.append(client)
-        return client
-
-    yield make
-    for client in clients:
-        await client.close()
 
 
 def _snap(taken_at: str, account: int, playlists: list[tuple[str, str, int]]) -> Snapshot:

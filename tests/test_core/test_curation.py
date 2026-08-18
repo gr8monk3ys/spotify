@@ -11,7 +11,6 @@ import html
 from dataclasses import replace
 
 import pytest
-import tekore as tk
 from sqlmodel import Session, select
 
 from spotifyforge.core.audio_features import AudioFeature
@@ -49,20 +48,6 @@ def _ct(
         popularity=popularity,
         genres=genres,
     )
-
-
-@pytest.fixture()
-async def client_for(fake_spotify):
-    clients: list[tk.Spotify] = []
-
-    def make(user_id: str = "user1") -> tk.Spotify:
-        client = fake_spotify.async_client(user_id)
-        clients.append(client)
-        return client
-
-    yield make
-    for client in clients:
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
