@@ -327,7 +327,7 @@ def song_key(name: str, artist_name: str) -> tuple[str, str]:
     return (normalised or name.lower(), _NON_WORD.sub("", artist_name.lower()))
 
 
-def _track_song_key(track: CurationTrack) -> tuple[str, str]:
+def track_song_key(track: CurationTrack) -> tuple[str, str]:
     return song_key(track.name, track.artist_names[0] if track.artist_names else "")
 
 
@@ -341,7 +341,7 @@ def dedupe_versions(tracks: list[CurationTrack]) -> list[CurationTrack]:
     """
     best: dict[tuple[str, str], int] = {}
     for index, track in enumerate(tracks):
-        key = _track_song_key(track)
+        key = track_song_key(track)
         if key not in best or track.popularity > tracks[best[key]].popularity:
             best[key] = index
     if len(best) < len(tracks):
@@ -543,7 +543,7 @@ def _popularity_arc(tracks: list[CurationTrack]) -> list[CurationTrack]:
     return descent + ascent
 
 
-def _primary_artist(track: CurationTrack) -> str:
+def primary_artist(track: CurationTrack) -> str:
     return track.artist_ids[0] if track.artist_ids else ""
 
 
@@ -558,7 +558,7 @@ def _space_artists(tracks: list[CurationTrack]) -> list[CurationTrack]:
     zero repeats whenever an arrangement without them exists.
     """
     remaining = list(tracks)
-    left: Counter[str] = Counter(_primary_artist(t) for t in remaining)
+    left: Counter[str] = Counter(primary_artist(t) for t in remaining)
     out: list[CurationTrack] = []
 
     while remaining:
@@ -566,9 +566,9 @@ def _space_artists(tracks: list[CurationTrack]) -> list[CurationTrack]:
         if out:
             candidates = [i for i, t in enumerate(remaining) if not _shares_artist(t, out[-1])]
             if candidates:
-                index = max(candidates, key=lambda i: (left[_primary_artist(remaining[i])], -i))
+                index = max(candidates, key=lambda i: (left[primary_artist(remaining[i])], -i))
         chosen = remaining.pop(index)
-        left[_primary_artist(chosen)] -= 1
+        left[primary_artist(chosen)] -= 1
         out.append(chosen)
     return out
 
@@ -690,44 +690,35 @@ def _make_spec(
 
 def merge_expansions(
     specs: list[PlaylistSpec],
-    extras: dict[str, list[CurationTrack]] | None,
+    extras: dict[tuple[str, int | None], list[CurationTrack]] | None,
     features: dict[str, AudioFeature] | None = None,
 ) -> list[PlaylistSpec]:
     """Fold pinned expansion tracks into their playlists' specs.
 
     Expansions are unheard tracks ``curate expand`` recorded for a
     playlist; merging them at plan time is what keeps ``reflow`` from
-    stripping them back out. The combined list is de-duplicated (a
-    pinned track the user later likes must not appear twice) and
-    re-sequenced, and the description is rebuilt so it can name the new
-    artists.
+    stripping them back out. *extras* is keyed by ``(genre, decade)`` —
+    the stable inputs a title is derived from — never by the title
+    itself, which changes whenever the templates do or a genre starts
+    splitting by decade. Rebuilding the spec from the combined tracks
+    de-duplicates (a pinned track the user later likes must not appear
+    twice), re-sequences, and lets the description name the new artists.
     """
     if not extras:
         return specs
-    merged = []
-    for spec in specs:
-        additions = extras.get(spec.title)
-        if not additions:
-            merged.append(spec)
-            continue
-        combined = dedupe_versions(spec.tracks + additions)
-        ordered, ordering = order_with_mode(combined, features)
-        merged.append(
-            replace(
-                spec,
-                tracks=ordered,
-                ordering=ordering,
-                description=_describe(spec.genre, spec.decade, ordered, ordering),
-            )
-        )
-    return merged
+    return [
+        _make_spec(spec.genre, spec.decade, dedupe_versions(spec.tracks + additions), features)
+        if (additions := extras.get((spec.genre or "", spec.decade)))
+        else spec
+        for spec in specs
+    ]
 
 
 async def plan_catalogue(
     spotify: Spotify,
     opts: CurationOptions,
     features: dict[str, AudioFeature] | None = None,
-    expansions: dict[str, list[CurationTrack]] | None = None,
+    expansions: dict[tuple[str, int | None], list[CurationTrack]] | None = None,
 ) -> CurationPlan:
     """Read the library and return the catalogue it would produce.
 

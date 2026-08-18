@@ -8,8 +8,6 @@ named to contain their genre.
 
 from __future__ import annotations
 
-from sqlmodel import Session
-
 from spotifyforge.core.curation import (
     CurationOptions,
     CurationTrack,
@@ -74,18 +72,6 @@ def _seed_candidates(fake):
     )
 
 
-def _db_user(spotify_id="user1") -> int:
-    from spotifyforge.db.engine import get_engine
-    from spotifyforge.models.models import User
-
-    with Session(get_engine()) as session:
-        user = User(spotify_id=spotify_id)
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-        return user.id
-
-
 def _spec(genre="coldwave", decade=None, tracks=()) -> PlaylistSpec:
     return PlaylistSpec(
         title="strictly coldwave", description="", genre=genre, decade=decade, tracks=list(tracks)
@@ -115,9 +101,9 @@ def test_sidecar_roundtrip(tmp_path):
         isrc="ISRCC1",
         genres=("coldwave",),
     )
-    save_expansions({"strictly coldwave": [track]}, path)
+    save_expansions({("coldwave", None): [track]}, path)
 
-    assert load_expansions(path) == {"strictly coldwave": [track]}
+    assert load_expansions(path) == {("coldwave", None): [track]}
     assert load_expansions(tmp_path / "missing.json") == {}
 
 
@@ -141,18 +127,19 @@ async def test_expand_picks_unheard_and_rejects_known_hot_and_flooding(
     sp = client_for("user1")
 
     plan = await plan_catalogue(sp, CurationOptions(min_size=6))
-    added, saved_to = await expand_catalogue(sp, plan.specs, target=12, path=path)
+    added, thin = await expand_catalogue(sp, plan.specs, target=12, path=path)
 
+    assert thin == 1
     (title,) = added
     picked = {t.id for t in added[title]}
     # Four slots (8 -> 12): the two capped Xylo Void tracks plus the two
     # other niche finds. The library's own search hits, the third
     # same-artist track, the chart track, and the remaster are rejected.
     assert picked == {"c1", "c2", "c4", "c5"}
-    assert saved_to == path
-    assert {t.id for t in load_expansions(path)[title]} == picked
+    # Pins are keyed by (genre, decade) — the stable identity — not title.
+    assert {t.id for t in load_expansions(path)[("coldwave", None)]} == picked
     # Pins carry what ordering and dedupe need later.
-    pinned = {t.id: t for t in load_expansions(path)[title]}
+    pinned = {t.id: t for t in load_expansions(path)[("coldwave", None)]}
     assert pinned["c1"].genres == ("coldwave",)
     assert pinned["c1"].isrc == "ISRCC1"
 
@@ -171,8 +158,9 @@ async def test_expand_stops_once_pins_reach_target(fake_spotify, client_for, tmp
     (spec,) = [s for s in grown.specs if s.genre == "coldwave"]
     assert len(spec.tracks) == 12
 
-    added, _ = await expand_catalogue(sp, grown.specs, target=12, path=path)
+    added, thin = await expand_catalogue(sp, grown.specs, target=12, path=path)
     assert added == {}
+    assert thin == 0
 
 
 # ---------------------------------------------------------------------------
@@ -180,13 +168,15 @@ async def test_expand_stops_once_pins_reach_target(fake_spotify, client_for, tmp
 # ---------------------------------------------------------------------------
 
 
-async def test_reflow_pushes_pins_and_keeps_them(fake_spotify, client_for, isolated_db, tmp_path):
+async def test_reflow_pushes_pins_and_keeps_them(
+    fake_spotify, client_for, isolated_db, db_user, tmp_path
+):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_coldwave(fake_spotify)
     _seed_candidates(fake_spotify)
     path = tmp_path / "expansions.json"
-    owner_id = _db_user()
+    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
 

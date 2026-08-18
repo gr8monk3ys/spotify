@@ -23,3 +23,22 @@ async def client_for(fake_spotify):
     yield make
     for client in clients:
         await client.close()
+
+
+@pytest.fixture()
+def db_user():
+    """A factory that creates a ``User`` row and returns its id."""
+    from sqlmodel import Session
+
+    from spotifyforge.db.engine import get_engine
+    from spotifyforge.models.models import User
+
+    def make(spotify_id: str = "user1") -> int:
+        with Session(get_engine()) as session:
+            user = User(spotify_id=spotify_id)
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+            return user.id
+
+    return make

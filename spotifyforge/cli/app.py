@@ -951,11 +951,17 @@ def _features_or_warn(harmonic: bool):
     return features
 
 
-def _load_expansions():
-    """The unheard tracks `curate expand` pinned to playlists, by title."""
+async def _plan(sp, opts, features=None):
+    """Plan the catalogue with the pinned expansions folded in.
+
+    Every curate command plans through here: a command that forgot the
+    pins would hand reflow a plan that strips pinned tracks off live
+    playlists, so the folding is not optional at the call sites.
+    """
+    from spotifyforge.core.curation import plan_catalogue
     from spotifyforge.core.expansion import load_expansions
 
-    return load_expansions()
+    return await plan_catalogue(sp, opts, features, load_expansions())
 
 
 def _curation_options(min_size, max_size, max_tracks, exclusive):
@@ -993,14 +999,13 @@ def curate_plan(
     harmonic: bool = _HARMONIC,
 ) -> None:
     """Preview the playlist catalogue your liked songs would produce (no writes)."""
-    from spotifyforge.core.curation import plan_catalogue
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
     plan = _run_spotify(
         "Scanning your liked songs...",
         "Failed to plan curation",
-        lambda sp: plan_catalogue(sp, opts, features, _load_expansions()),
+        lambda sp: _plan(sp, opts, features),
     )
 
     console.print(
@@ -1043,7 +1048,7 @@ def curate_forge(
     ),
 ) -> None:
     """Create the next batch of planned playlists on Spotify (resumable)."""
-    from spotifyforge.core.curation import forge_next, plan_catalogue
+    from spotifyforge.core.curation import forge_next
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     owner_id = _db_user_id()
@@ -1051,7 +1056,7 @@ def curate_forge(
     features = _features_or_warn(harmonic)
 
     async def _forge(sp):
-        plan = await plan_catalogue(sp, opts, features, _load_expansions())
+        plan = await _plan(sp, opts, features)
         created, pending = await forge_next(
             PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
         )
@@ -1174,13 +1179,13 @@ def curate_covers(
     automated. Each cover's colour is derived from the playlist's genre,
     so it is stable across runs and the set reads as one collection.
     """
-    from spotifyforge.core.curation import apply_covers, plan_catalogue
+    from spotifyforge.core.curation import apply_covers
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
 
     async def _covers(sp):
-        plan = await plan_catalogue(sp, opts, expansions=_load_expansions())
+        plan = await _plan(sp, opts)
         uploaded, failed = await apply_covers(
             PlaylistManager(sp), sp, plan.specs, overwrite=overwrite
         )
@@ -1229,14 +1234,14 @@ def curate_describe(
     without touching tracks, titles, followers, or artwork. Playlists
     already carrying the wanted text are skipped.
     """
-    from spotifyforge.core.curation import apply_descriptions, plan_catalogue
+    from spotifyforge.core.curation import apply_descriptions
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
 
     async def _push(sp):
-        plan = await plan_catalogue(sp, opts, features, _load_expansions())
+        plan = await _plan(sp, opts, features)
         updated, failed = await apply_descriptions(PlaylistManager(sp), sp, plan.specs)
         return updated, failed, len(plan.specs)
 
@@ -1289,18 +1294,19 @@ def curate_expand(
     descriptions). Repeat runs continue where the last one stopped.
     """
     from spotifyforge.core.curation import plan_catalogue
-    from spotifyforge.core.expansion import expand_catalogue
+    from spotifyforge.core.expansion import expand_catalogue, expansions_path, load_expansions
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
 
     async def _expand(sp):
-        plan = await plan_catalogue(sp, opts, features, _load_expansions())
-        thin = sum(1 for s in plan.specs if s.genre is not None and len(s.tracks) < target)
-        added, path = await expand_catalogue(sp, plan.specs, target=target, limit=limit)
-        return added, path, thin
+        # Loaded once and shared: the plan folds these pins in, and
+        # expand_catalogue appends this run's picks to the same dict.
+        pins = load_expansions()
+        plan = await plan_catalogue(sp, opts, features, pins)
+        return await expand_catalogue(sp, plan.specs, target=target, limit=limit, expansions=pins)
 
-    added, path, thin = _run_spotify(
+    added, thin = _run_spotify(
         "Digging for unheard tracks...", "Failed to expand playlists", _expand
     )
 
@@ -1327,15 +1333,15 @@ def curate_expand(
     console.print(
         Panel(
             f"[green]Pinned {sum(len(t) for t in added.values())} track(s) across "
-            f"{len(added)} playlist(s)[/green] ({thin - len(added)} thin playlists remain; "
-            "re-run to continue).\n"
+            f"{len(added)} playlist(s)[/green] of {thin} below the target; "
+            "re-run to continue.\n"
             "Run [bold]spotifyforge curate reflow[/bold] to push them to Spotify.",
             title="Expanded",
             border_style="green",
             expand=False,
         )
     )
-    console.print(f"[dim]Pins: {path}[/dim]")
+    console.print(f"[dim]Pins: {expansions_path()}[/dim]")
 
 
 @curate_app.command("stats")
@@ -1449,14 +1455,14 @@ def curate_reflow(
     harmonic: bool = _HARMONIC,
 ) -> None:
     """Re-sequence playlists you already forged, keeping their URLs and followers."""
-    from spotifyforge.core.curation import plan_catalogue, reflow
+    from spotifyforge.core.curation import reflow
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
 
     async def _reflow(sp):
-        plan = await plan_catalogue(sp, opts, features, _load_expansions())
+        plan = await _plan(sp, opts, features)
         rewritten, failed = await reflow(PlaylistManager(sp), sp, plan.specs)
         return rewritten, failed, len(plan.specs)
 
