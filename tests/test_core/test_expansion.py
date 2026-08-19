@@ -18,7 +18,7 @@ from spotifyforge.core.curation import (
     reflow,
 )
 from spotifyforge.core.expansion import (
-    _load_refresh_cursor,
+    _load_cursor,
     _search_query,
     expand_catalogue,
     load_expansions,
@@ -184,6 +184,28 @@ async def test_expand_prefers_candidates_with_known_keys(fake_spotify, client_fo
     assert {t.id for t in added[title]} == {"c4", "c5"}
 
 
+async def test_expand_walks_past_barren_genres(fake_spotify, client_for, tmp_path):
+    """A niche with no candidates must not block the queue: limit counts
+    playlists that gained pins, and the cursor moves past barren tries."""
+    _seed_coldwave(fake_spotify)  # thin, but no candidates seeded — barren
+    _seed_darkjazz(fake_spotify)
+    fake_spotify.add_track(
+        "djc1", name="Darkjazz Nugget", popularity=20, artist_id="y1", artist_name="Mist Quartet"
+    )
+    path = tmp_path / "expansions.json"
+    sp = client_for("user1")
+
+    plan = await plan_catalogue(sp, CurationOptions(min_size=6))
+    # coldwave sorts first; under attempt-counted limits this run would
+    # burn its one slot on the barren genre and pin nothing.
+    added, thin = await expand_catalogue(sp, plan.specs, target=12, limit=1, path=path)
+
+    assert thin == 2
+    (title,) = added
+    assert {t.id for t in added[title]} == {"djc1"}
+    assert list(load_expansions(path)) == [("darkjazz", None)]
+
+
 # ---------------------------------------------------------------------------
 # Refreshing (rotating pins)
 # ---------------------------------------------------------------------------
@@ -227,7 +249,7 @@ async def test_refresh_swaps_oldest_pin_for_a_fresh_find(fake_spotify, client_fo
     assert (out.id, incoming.id) == ("c1", "c3")
     # The sidecar rotated in place: same size, c1 gone, c3 appended last.
     assert [t.id for t in load_expansions(path)[("coldwave", None)]] == ["c2", "c4", "c5", "c3"]
-    assert _load_refresh_cursor(cursor) == "coldwave|"
+    assert _load_cursor(cursor) == "coldwave|"
 
 
 async def test_refresh_respects_the_playlist_wide_artist_cap(fake_spotify, client_for, tmp_path):
@@ -311,8 +333,8 @@ async def test_refresh_walks_pinned_playlists_round_robin(fake_spotify, client_f
 def test_refresh_cursor_tolerates_corruption(tmp_path):
     cursor = tmp_path / "cursor.json"
     cursor.write_text("{not json", encoding="utf-8")
-    assert _load_refresh_cursor(cursor) == ""
-    assert _load_refresh_cursor(tmp_path / "missing.json") == ""
+    assert _load_cursor(cursor) == ""
+    assert _load_cursor(tmp_path / "missing.json") == ""
 
 
 # ---------------------------------------------------------------------------

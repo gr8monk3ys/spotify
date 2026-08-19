@@ -24,7 +24,7 @@ import json
 import logging
 from collections import Counter
 from dataclasses import asdict, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
 import tekore as tk
@@ -37,6 +37,7 @@ from spotifyforge.core.curation import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from tekore import Spotify
@@ -209,6 +210,7 @@ async def expand_catalogue(
     path: Path | None = None,
     expansions: Pins | None = None,
     keyed_isrcs: set[str] | None = None,
+    cursor_path: Path | None = None,
 ) -> tuple[dict[str, list[CurationTrack]], int]:
     """Pick unheard same-niche tracks for playlists below *target* tracks.
 
@@ -217,6 +219,12 @@ async def expand_catalogue(
     pins have brought it up to size — repeat runs continue the catalogue
     instead of piling more onto the same playlists. Pass *expansions*
     when the caller already loaded them; otherwise the sidecar is read.
+
+    *limit* counts playlists that actually gained pins, and the walk is
+    round-robin from a cursor sidecar: a niche too barren to ever yield
+    candidates gets its search and is moved past, instead of permanently
+    occupying a head-of-queue slot every run (with a stable order and
+    attempt-counted limits, the same barren genres blocked every run).
 
     Returns what was newly pinned this run (keyed by title, for
     display) and how many playlists were below the target.
@@ -227,53 +235,73 @@ async def expand_catalogue(
     taken_ids = {t.id for s in specs for t in s.tracks}
     taken_keys = {track_song_key(t) for s in specs for t in s.tracks}
 
-    added: dict[str, list[CurationTrack]] = {}
+    def spec_key(spec: PlaylistSpec) -> str:
+        return _format_key((spec.genre or "", spec.decade))
+
+    cpath = _cursor_path("expand_cursor.json", cursor_path, path)
     thin = [s for s in specs if s.genre is not None and len(s.tracks) < target]
-    for spec in thin[:limit]:
+    order = _rotate_after(sorted(thin, key=spec_key), _load_cursor(cpath), spec_key)
+
+    added: dict[str, list[CurationTrack]] = {}
+    for spec in order:
+        if len(added) == limit:
+            break
         picked = await _find_candidates(
             spotify, spec, taken_ids, taken_keys, target - len(spec.tracks), keyed_isrcs
         )
-        if not picked:
-            continue
-        taken_ids.update(t.id for t in picked)
-        taken_keys.update(track_song_key(t) for t in picked)
-        key = (spec.genre or "", spec.decade)
-        pins[key] = pins.get(key, []) + picked
-        added[spec.title] = picked
+        if picked:
+            taken_ids.update(t.id for t in picked)
+            taken_keys.update(track_song_key(t) for t in picked)
+            key = (spec.genre or "", spec.decade)
+            pins[key] = pins.get(key, []) + picked
+            added[spec.title] = picked
+            save_expansions(pins, path)
+        _save_cursor(spec_key(spec), cpath)
 
-    if added:
-        save_expansions(pins, path)
     logger.info(
         "Pinned %d track(s) across %d playlist(s)", sum(map(len, added.values())), len(added)
     )
     return added, len(thin)
 
 
-def _refresh_cursor_path() -> Path:
+def _cursor_path(name: str, cursor_path: Path | None, pins_path: Path | None) -> Path:
+    """A walk cursor lives beside the pins file it paces through."""
+    if cursor_path is not None:
+        return cursor_path
+    if pins_path is not None:
+        return pins_path.with_name(name)
     from spotifyforge.config import sidecar_path
 
-    return sidecar_path("refresh_cursor.json")
+    return sidecar_path(name)
 
 
-def _load_refresh_cursor(path: Path | None = None) -> str:
-    """The last pin key a refresh run rotated, or "" to start over.
+def _load_cursor(path: Path) -> str:
+    """The last key a round-robin walk handled, or "" to start over.
 
     Unlike the pins file, a corrupt cursor is harmless — it only decides
     *which* playlists get attention next, never what is on them — so it
     degrades to "start from the top" instead of failing.
     """
-    target = path or _refresh_cursor_path()
     try:
-        last = json.loads(target.read_text(encoding="utf-8")).get("last", "")
+        last = json.loads(path.read_text(encoding="utf-8")).get("last", "")
         return last if isinstance(last, str) else ""
     except (OSError, ValueError):
         return ""
 
 
-def _save_refresh_cursor(last: str, path: Path | None = None) -> None:
+def _save_cursor(last: str, path: Path) -> None:
     from spotifyforge.config import write_json_atomic
 
-    write_json_atomic(path or _refresh_cursor_path(), {"last": last})
+    write_json_atomic(path, {"last": last})
+
+
+_T = TypeVar("_T")
+
+
+def _rotate_after(ordered: list[_T], cursor: str, key: Callable[[_T], str]) -> list[_T]:
+    """*ordered* re-started just past *cursor*, wrapping to the top."""
+    start = next((i for i, item in enumerate(ordered) if key(item) > cursor), 0)
+    return ordered[start:] + ordered[:start]
 
 
 async def refresh_pins(
@@ -311,9 +339,8 @@ async def refresh_pins(
     if not eligible:
         return {}, 0
 
-    cursor = _load_refresh_cursor(cursor_path)
-    start = next((i for i, key in enumerate(eligible) if _format_key(key) > cursor), 0)
-    order = eligible[start:] + eligible[:start]
+    cpath = _cursor_path("refresh_cursor.json", cursor_path, path)
+    order = _rotate_after(eligible, _load_cursor(cpath), _format_key)
 
     taken_ids = {t.id for s in specs for t in s.tracks}
     taken_keys = {track_song_key(t) for s in specs for t in s.tracks}
@@ -326,19 +353,18 @@ async def refresh_pins(
         found = await _find_candidates(
             spotify, spec, taken_ids, taken_keys, 1, keyed_isrcs, freed_track_id=outgoing.id
         )
-        if not found:
-            continue
-        incoming = found[0]
-        pins[key].pop(0)
-        pins[key].append(incoming)
-        taken_ids.add(incoming.id)
-        taken_keys.add(track_song_key(incoming))
-        swapped[spec.title] = (outgoing, incoming)
-        # Checkpoint pins and cursor together after each swap: saving
-        # one without the other would let a crash advance the walk past
-        # rotations that were never persisted.
-        save_expansions(pins, path)
-        _save_refresh_cursor(_format_key(key), cursor_path)
+        if found:
+            incoming = found[0]
+            pins[key].pop(0)
+            pins[key].append(incoming)
+            taken_ids.add(incoming.id)
+            taken_keys.add(track_song_key(incoming))
+            swapped[spec.title] = (outgoing, incoming)
+            # Checkpoint pins before the cursor: saving the cursor first
+            # would let a crash advance the walk past rotations that were
+            # never persisted.
+            save_expansions(pins, path)
+        _save_cursor(_format_key(key), cpath)
 
     logger.info("Rotated pins on %d playlist(s) of %d pinned", len(swapped), len(eligible))
     return swapped, len(eligible)
