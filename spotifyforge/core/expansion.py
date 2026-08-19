@@ -113,6 +113,19 @@ def _track_from_dict(entry: dict[str, Any]) -> CurationTrack:
     )
 
 
+def _cached_keyed_isrcs() -> set[str]:
+    """ISRCs with a cached musical key — the tracks we can sequence.
+
+    This is the default preference for every candidate search, resolved
+    here rather than by callers: a caller that forgot to pass it would
+    silently reintroduce the key-coverage dilution expansion measurably
+    caused before the preference existed.
+    """
+    from spotifyforge.core.audio_features import load_cached_features
+
+    return {isrc for isrc, feature in load_cached_features().items() if feature.has_key}
+
+
 def _search_query(spec: PlaylistSpec) -> str:
     """The genre-filtered search for *spec*, era-bounded on decade splits.
 
@@ -131,13 +144,25 @@ async def _find_candidates(
     taken_ids: set[str],
     taken_keys: set[tuple[str, str]],
     count: int,
+    keyed_isrcs: set[str] | None = None,
+    freed_track_id: str | None = None,
 ) -> list[CurationTrack]:
     """Up to *count* unheard tracks in *spec*'s niche.
 
     Skips anything in *taken_ids*/*taken_keys* (read-only here — the
     caller owns the run-level uniqueness invariant), chart-level tracks,
     remasters of songs the catalogue already holds, and more than a
-    couple of tracks per artist.
+    couple of tracks per artist. The cap is seeded from the playlist's
+    own composition here, not by callers — a counter starting empty
+    each call would let a weekly refresh stack one artist a track at a
+    time. *freed_track_id* is a track about to leave the playlist (a
+    rotated-out pin), whose artist slot is free again.
+
+    *keyed_isrcs* — ISRCs with a cached musical key — is a preference,
+    not a filter: candidates we can harmonically sequence claim the
+    per-artist and count budget first, so growing a playlist stops
+    costing it its key coverage, but a niche too obscure for the
+    analysis databases still fills.
     """
     try:
         (page,) = await spotify.search(_search_query(spec), types=("track",), limit=_SEARCH_LIMIT)
@@ -145,15 +170,22 @@ async def _find_candidates(
         logger.warning("Search failed for %r: %s", spec.genre_label, exc)
         return []
 
+    candidates = []
+    for track in page.items or []:
+        if track is None or track.id is None or track.id in taken_ids:
+            continue
+        candidate = replace(to_curation_track(track), genres=(spec.genre,) if spec.genre else ())
+        if candidate.popularity <= _MAX_POPULARITY:
+            candidates.append(candidate)
+    if keyed_isrcs:
+        candidates.sort(key=lambda c: c.isrc not in keyed_isrcs)  # stable: keyed first
+
     picked: list[CurationTrack] = []
     new_ids: set[str] = set()
     new_keys: set[tuple[str, str]] = set()
-    per_artist: Counter[str] = Counter()
-    for track in page.items or []:
-        if track is None or track.id is None or track.id in taken_ids or track.id in new_ids:
-            continue
-        candidate = replace(to_curation_track(track), genres=(spec.genre,) if spec.genre else ())
-        if candidate.popularity > _MAX_POPULARITY:
+    per_artist = Counter(primary_artist(t) for t in spec.tracks if t.id != freed_track_id)
+    for candidate in candidates:
+        if candidate.id in new_ids:
             continue
         key = track_song_key(candidate)
         if key in taken_keys or key in new_keys:
@@ -176,6 +208,7 @@ async def expand_catalogue(
     limit: int = 10,
     path: Path | None = None,
     expansions: Pins | None = None,
+    keyed_isrcs: set[str] | None = None,
 ) -> tuple[dict[str, list[CurationTrack]], int]:
     """Pick unheard same-niche tracks for playlists below *target* tracks.
 
@@ -189,6 +222,8 @@ async def expand_catalogue(
     display) and how many playlists were below the target.
     """
     pins = load_expansions(path) if expansions is None else expansions
+    if keyed_isrcs is None:
+        keyed_isrcs = _cached_keyed_isrcs()
     taken_ids = {t.id for s in specs for t in s.tracks}
     taken_keys = {track_song_key(t) for s in specs for t in s.tracks}
 
@@ -196,7 +231,7 @@ async def expand_catalogue(
     thin = [s for s in specs if s.genre is not None and len(s.tracks) < target]
     for spec in thin[:limit]:
         picked = await _find_candidates(
-            spotify, spec, taken_ids, taken_keys, target - len(spec.tracks)
+            spotify, spec, taken_ids, taken_keys, target - len(spec.tracks), keyed_isrcs
         )
         if not picked:
             continue
@@ -212,3 +247,98 @@ async def expand_catalogue(
         "Pinned %d track(s) across %d playlist(s)", sum(map(len, added.values())), len(added)
     )
     return added, len(thin)
+
+
+def _refresh_cursor_path() -> Path:
+    from spotifyforge.config import sidecar_path
+
+    return sidecar_path("refresh_cursor.json")
+
+
+def _load_refresh_cursor(path: Path | None = None) -> str:
+    """The last pin key a refresh run rotated, or "" to start over.
+
+    Unlike the pins file, a corrupt cursor is harmless — it only decides
+    *which* playlists get attention next, never what is on them — so it
+    degrades to "start from the top" instead of failing.
+    """
+    target = path or _refresh_cursor_path()
+    try:
+        last = json.loads(target.read_text(encoding="utf-8")).get("last", "")
+        return last if isinstance(last, str) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _save_refresh_cursor(last: str, path: Path | None = None) -> None:
+    from spotifyforge.config import write_json_atomic
+
+    write_json_atomic(path or _refresh_cursor_path(), {"last": last})
+
+
+async def refresh_pins(
+    spotify: Spotify,
+    specs: list[PlaylistSpec],
+    limit: int = 10,
+    path: Path | None = None,
+    cursor_path: Path | None = None,
+    keyed_isrcs: set[str] | None = None,
+    expansions: Pins | None = None,
+) -> tuple[dict[str, tuple[CurationTrack, CurationTrack]], int]:
+    """Rotate one pinned track per playlist: oldest pin out, a new find in.
+
+    A catalogue that never changes reads as abandoned — to listeners and
+    to Spotify's surfacing alike. This swaps the oldest pin of up to
+    *limit* pinned playlists for a fresh unheard track from the same
+    niche, keeping each playlist's size steady. Nothing is written to
+    Spotify: like ``expand``, the pins change locally and ``reflow``
+    stays the single write path.
+
+    Runs walk the pinned playlists round-robin — a cursor sidecar
+    remembers where the last run stopped, so a weekly refresh visits
+    every playlist over time instead of churning the same few. Returns
+    ``{title: (out, in)}`` and how many playlists hold pins. Pass
+    *expansions* when the caller already loaded them (the plan does).
+    """
+    pins = load_expansions(path) if expansions is None else expansions
+    if keyed_isrcs is None:
+        keyed_isrcs = _cached_keyed_isrcs()
+    spec_by_key = {(s.genre or "", s.decade): s for s in specs if s.genre is not None}
+    eligible = sorted(
+        (key for key, tracks in pins.items() if tracks and key in spec_by_key),
+        key=_format_key,
+    )
+    if not eligible:
+        return {}, 0
+
+    cursor = _load_refresh_cursor(cursor_path)
+    start = next((i for i, key in enumerate(eligible) if _format_key(key) > cursor), 0)
+    order = eligible[start:] + eligible[:start]
+
+    taken_ids = {t.id for s in specs for t in s.tracks}
+    taken_keys = {track_song_key(t) for s in specs for t in s.tracks}
+    swapped: dict[str, tuple[CurationTrack, CurationTrack]] = {}
+    for key in order:
+        if len(swapped) == limit:
+            break
+        spec = spec_by_key[key]
+        outgoing = pins[key][0]
+        found = await _find_candidates(
+            spotify, spec, taken_ids, taken_keys, 1, keyed_isrcs, freed_track_id=outgoing.id
+        )
+        if not found:
+            continue
+        incoming = found[0]
+        pins[key].pop(0)
+        pins[key].append(incoming)
+        taken_ids.add(incoming.id)
+        taken_keys.add(track_song_key(incoming))
+        swapped[spec.title] = (outgoing, incoming)
+        # Checkpoint pins and cursor together after each swap: saving
+        # one without the other would let a crash advance the walk past
+        # rotations that were never persisted.
+        save_expansions(pins, path)
+        _save_refresh_cursor(_format_key(key), cursor_path)
+
+    logger.info("Rotated pins on %d playlist(s) of %d pinned", len(swapped), len(eligible))
+    return swapped, len(eligible)

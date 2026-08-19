@@ -166,6 +166,26 @@ async def test_apply_uploads_skips_pinned_and_records_attribution(
         await source.close()
 
 
+async def test_overwrite_rerolls_to_a_different_photo(fake_spotify, client_for, tmp_path):
+    """The CLI's --only re-roll promises a different image; the promise
+    holds because the outgoing pick still occupies the account-wide
+    ``used`` set when its replacement is chosen."""
+    fake_spotify.add_user("user1")
+    fake_spotify.add_playlist("pl1", name="strictly coldwave")
+    path = tmp_path / "photo_covers.json"
+    sp = client_for("user1")
+    source, _ = _pexels({"coldwave abstract": [_photo_payload(1), _photo_payload(2)]})
+    targets = [("strictly coldwave", "pl1", "coldwave")]
+    try:
+        await apply_photo_covers(sp, targets, source, path=path, delay=0)
+        first = load_picks(path)["strictly coldwave"]["photo_id"]
+        await apply_photo_covers(sp, targets, source, overwrite=True, path=path, delay=0)
+        second = load_picks(path)["strictly coldwave"]["photo_id"]
+    finally:
+        await source.close()
+    assert {first, second} == {1, 2}
+
+
 async def test_apply_pauses_on_rate_limit_and_resumes(fake_spotify, client_for, tmp_path):
     fake_spotify.add_user("user1")
     fake_spotify.add_playlist("pl1", name="a")
