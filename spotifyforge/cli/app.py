@@ -87,19 +87,28 @@ def _make_auth():
         _error_panel(str(exc), title="Configuration Error")
 
 
+# A run must start with at least this much token life left. Sized to
+# the longest command (a full-catalogue covers or reflow pass), not to
+# tekore's is_expiring (<60s) — a bulk run that starts with eight
+# minutes remaining dies 401 halfway through with its work unsaved.
+_TOKEN_HEADROOM_SECONDS = 45 * 60
+
+
 def _load_token(auth: Any, spotify_user_id: str) -> tekore.Token:
-    """Load (and refresh if expiring) the stored token for a user.
+    """Load the stored token, refreshed unless it can outlast a bulk run.
 
     A refreshed token is persisted to both the keyring and the local DB
     row — scheduled jobs authenticate from the DB, so it must not go stale.
     """
     token = auth.token_store.load_token(spotify_user_id)
-    if token.is_expiring:
-        if not token.refresh_token:
-            raise RuntimeError("Stored token expired with no refresh token; log in again.")
+    if token.expires_in >= _TOKEN_HEADROOM_SECONDS:
+        return token
+    if token.refresh_token:
         token = auth.credentials.refresh_user_token(token.refresh_token)
         auth.token_store.save_token(spotify_user_id, token)
         _persist_tokens_to_db(spotify_user_id, token)
+    elif token.is_expiring:
+        raise RuntimeError("Stored token expired with no refresh token; log in again.")
     return token
 
 
@@ -951,6 +960,18 @@ def _features_or_warn(harmonic: bool):
     return features
 
 
+def _keyed_isrcs(features) -> set[str] | None:
+    """Keyed ISRCs from features ``--harmonic`` already loaded.
+
+    Returns ``None`` when there are none in hand — the core candidate
+    search then resolves its own default from the cache, so the
+    preference for sequenceable tracks never depends on this caller.
+    """
+    if features is None:
+        return None
+    return {isrc for isrc, feature in features.items() if feature.has_key}
+
+
 async def _plan(sp, opts, features=None):
     """Plan the catalogue with the pinned expansions folded in.
 
@@ -1178,6 +1199,18 @@ def curate_covers(
         help="Use licensed photos (Pexels) matched to each playlist's vibe, "
         "covering personal playlists too. Needs SPOTIFYFORGE_PEXELS_API_KEY.",
     ),
+    only: list[str] = typer.Option(
+        None,
+        "--only",
+        help="Re-roll just these playlists (by exact title; implies --overwrite "
+        "for them). Photos only.",
+    ),
+    restyle: bool = typer.Option(
+        False,
+        "--restyle",
+        help="Re-render already-pinned photos under the current styling "
+        "(same images, no Pexels quota). Photos only.",
+    ),
 ) -> None:
     """Give your playlists cover art.
 
@@ -1186,10 +1219,14 @@ def curate_covers(
     [bold]--photos[/bold], every owned playlist instead gets a licensed
     photograph matched to its vibe; picks are pinned locally so re-runs
     are stable, and a Pexels rate limit pauses the run resumably rather
-    than failing it.
+    than failing it. A pick that misses can be re-rolled one playlist at
+    a time with [bold]--only[/bold] — the old photo stays excluded, so
+    the re-roll is guaranteed to land on a different image.
     """
+    if (only or restyle) and not photos:
+        _error_panel("--only and --restyle work on photo picks; pass --photos.", title="Usage")
     if photos:
-        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite)
+        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, only, restyle)
         return
 
     from spotifyforge.core.curation import apply_covers
@@ -1231,7 +1268,9 @@ def curate_covers(
     )
 
 
-def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
+def _photo_covers(
+    min_size, max_size, max_tracks, exclusive, overwrite, only=None, restyle=False
+) -> None:
     """The --photos path of ``curate covers``: every owned playlist."""
     from spotifyforge.core.photo_covers import PexelsSource, apply_photo_covers, picks_path
     from spotifyforge.core.playlist_manager import PlaylistManager
@@ -1255,10 +1294,19 @@ def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
         ]
         # Forged playlists search by genre; personal ones by their name.
         targets = [(p["name"], p["id"], vibe_by_title.get(p["name"], p["name"])) for p in owned]
+        if only:
+            wanted = set(only)
+            targets = [t for t in targets if t[0] in wanted]
+            if missing := wanted - {t[0] for t in targets}:
+                raise ValueError(f"No owned playlist named: {', '.join(sorted(missing))}")
         source = PexelsSource(settings.pexels_api_key)
         try:
             covered, failed, limited = await apply_photo_covers(
-                sp, targets, source, overwrite=overwrite
+                sp,
+                targets,
+                source,
+                overwrite=overwrite or (bool(only) and not restyle),
+                restyle=restyle,
             )
         finally:
             await source.close()
@@ -1368,7 +1416,14 @@ def curate_expand(
         # expand_catalogue appends this run's picks to the same dict.
         pins = load_expansions()
         plan = await plan_catalogue(sp, opts, features, pins)
-        return await expand_catalogue(sp, plan.specs, target=target, limit=limit, expansions=pins)
+        return await expand_catalogue(
+            sp,
+            plan.specs,
+            target=target,
+            limit=limit,
+            expansions=pins,
+            keyed_isrcs=_keyed_isrcs(features),
+        )
 
     added, thin = _run_spotify(
         "Digging for unheard tracks...", "Failed to expand playlists", _expand
@@ -1406,6 +1461,155 @@ def curate_expand(
         )
     )
     console.print(f"[dim]Pins: {expansions_path()}[/dim]")
+
+
+@curate_app.command("explore")
+def curate_explore(
+    genres: list[str] = typer.Argument(
+        ..., help='Genres to forge from nothing, e.g. "dungeon synth" "italo disco".'
+    ),
+    size: int = typer.Option(12, "--size", min=4, help="Tracks to pin per new niche."),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Forge playlists for niches you have never heard of.
+
+    Every playlist so far grew from liked songs; this one starts from
+    nothing but a genre name. Usable niche tracks are searched and
+    pinned, and from the next plan onward the niche is a full playlist
+    — run [bold]curate forge[/bold] to create it, then covers and
+    describe as usual. Genres the catalogue already covers are skipped
+    (grow those with [bold]expand[/bold]).
+    """
+    from spotifyforge.core.curation import plan_catalogue
+    from spotifyforge.core.expansion import expansions_path, explore_niches, load_expansions
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _explore(sp):
+        pins = load_expansions()
+        plan = await plan_catalogue(sp, opts, features, pins)
+        return await explore_niches(
+            sp,
+            plan.specs,
+            genres,
+            size=size,
+            expansions=pins,
+            keyed_isrcs=_keyed_isrcs(features),
+        )
+
+    added, skipped = _run_spotify(
+        "Digging into unheard niches...", "Failed to explore niches", _explore
+    )
+
+    if not added:
+        console.print(
+            Panel(
+                "Nothing new to pin — every genre was already covered or too "
+                f"barren to stand up ({', '.join(skipped) or 'none given'}).",
+                title="Nothing explored",
+                border_style="yellow",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("Niche", style="white", no_wrap=True, max_width=30)
+    table.add_column("Pinned", justify="right")
+    table.add_column("Artists", style="green", max_width=55)
+    for genre, tracks in added.items():
+        artists = ", ".join(dict.fromkeys(t.artist_names[0] for t in tracks if t.artist_names))
+        table.add_row(genre, str(len(tracks)), artists)
+    console.print(table)
+    console.print(
+        Panel(
+            f"[green]Pinned {sum(len(t) for t in added.values())} track(s) across "
+            f"{len(added)} new niche(s)[/green]"
+            + (f"; skipped: {', '.join(skipped)}" if skipped else "")
+            + ".\nRun [bold]spotifyforge curate forge[/bold] to create the playlists, "
+            "then [bold]covers --photos[/bold] and [bold]describe[/bold].",
+            title="Explored",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]Pins: {expansions_path()}[/dim]")
+
+
+@curate_app.command("refresh")
+def curate_refresh(
+    limit: int = typer.Option(
+        10, "--limit", "-l", min=1, help="Maximum playlists to rotate this run."
+    ),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Keep the catalogue looking alive: rotate one pinned track per playlist.
+
+    Swaps the oldest unheard pin of a few playlists for a fresh find
+    from the same niche, so the catalogue reads as maintained rather
+    than abandoned. Sizes stay steady; liked songs are never touched.
+    Nothing is written to Spotify here — run [bold]curate reflow[/bold]
+    afterwards to push the rotations. Repeat runs walk the pinned
+    playlists round-robin.
+    """
+    from spotifyforge.core.curation import plan_catalogue
+    from spotifyforge.core.expansion import load_expansions, refresh_pins
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _refresh(sp):
+        pins = load_expansions()
+        plan = await plan_catalogue(sp, opts, features, pins)
+        return await refresh_pins(
+            sp, plan.specs, limit=limit, keyed_isrcs=_keyed_isrcs(features), expansions=pins
+        )
+
+    swapped, pinned = _run_spotify(
+        "Rotating in fresh tracks...", "Failed to refresh playlists", _refresh
+    )
+
+    if not swapped:
+        console.print(
+            Panel(
+                f"No rotations this run ({pinned} playlist(s) hold pins; "
+                "run [bold]curate expand[/bold] first if that is zero).",
+                title="Nothing to refresh",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("Playlist", style="white", no_wrap=True, max_width=40)
+    table.add_column("Out", style="dim", max_width=40)
+    table.add_column("In", style="green", max_width=40)
+
+    def _credit(track) -> str:
+        return f"{track.name} — {track.artist_names[0] if track.artist_names else '?'}"
+
+    for title, (out, incoming) in swapped.items():
+        table.add_row(title, _credit(out), _credit(incoming))
+    console.print(table)
+    console.print(
+        Panel(
+            f"[green]Rotated {len(swapped)} playlist(s)[/green] of {pinned} pinned.\n"
+            "Run [bold]spotifyforge curate reflow[/bold] to push the changes.",
+            title="Refreshed",
+            border_style="green",
+            expand=False,
+        )
+    )
 
 
 @curate_app.command("stats")

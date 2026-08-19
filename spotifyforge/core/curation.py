@@ -703,15 +703,27 @@ def merge_expansions(
     splitting by decade. Rebuilding the spec from the combined tracks
     de-duplicates (a pinned track the user later likes must not appear
     twice), re-sequences, and lets the description name the new artists.
+
+    Pin keys with no matching spec become playlists of their own: that
+    is how ``curate explore`` forges niches the library has no seed for
+    — the pins *are* the playlist, and dropping them here would make an
+    explored niche invisible to forge, reflow, covers, and describe.
     """
     if not extras:
         return specs
-    return [
+    merged = [
         _make_spec(spec.genre, spec.decade, dedupe_versions(spec.tracks + additions), features)
         if (additions := extras.get((spec.genre or "", spec.decade)))
         else spec
         for spec in specs
     ]
+    known = {(spec.genre or "", spec.decade) for spec in specs}
+    merged += [
+        _make_spec(genre or None, decade, dedupe_versions(additions), features)
+        for (genre, decade), additions in sorted(extras.items())
+        if (genre, decade) not in known and additions
+    ]
+    return merged
 
 
 async def plan_catalogue(
