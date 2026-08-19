@@ -132,10 +132,18 @@ class RateLimitedError(Exception):
     """Pexels said stop for now; progress so far is saved."""
 
 
+# Transient-failure backoff. A bulk run without this lost 250 covers to
+# one bad network stretch: tekore retries the Spotify side, but every
+# Pexels ReadError was failing its playlist outright.
+_RETRY_DELAYS = (1.0, 4.0)
+
+
 class PexelsSource:
     """Minimal Pexels client. Searches count against the hourly quota
     (and are cached per query for the life of this source); image
-    downloads are CDN fetches and do not."""
+    downloads are CDN fetches and do not. Transport errors and 5xx
+    responses are retried with backoff; 429 always raises
+    :class:`RateLimitedError` so runs pause instead of burning quota."""
 
     def __init__(self, api_key: str, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(timeout=30.0)
@@ -145,25 +153,40 @@ class PexelsSource:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def _get(self, url: str, **kwargs: Any) -> httpx.Response:
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            try:
+                response = await self._client.get(url, **kwargs)
+            except httpx.HTTPError as exc:
+                if delay is None:
+                    raise
+                logger.info("Pexels transport error (%r); retrying in %ss", exc, delay)
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code == 429:
+                raise RateLimitedError
+            if response.status_code >= 500 and delay is not None:
+                logger.info("Pexels %s; retrying in %ss", response.status_code, delay)
+                await asyncio.sleep(delay)
+                continue
+            response.raise_for_status()
+            return response
+        raise AssertionError("unreachable")  # pragma: no cover
+
     async def search(self, query: str) -> list[dict[str, Any]]:
         if query in self._cache:
             return self._cache[query]
-        response = await self._client.get(
+        response = await self._get(
             _API,
             params={"query": query, "per_page": _PER_PAGE, "orientation": "square"},
             headers={"Authorization": self._key},
         )
-        if response.status_code == 429:
-            raise RateLimitedError
-        response.raise_for_status()
         photos = list(response.json().get("photos") or [])
         self._cache[query] = photos
         return photos
 
     async def fetch(self, url: str) -> bytes:
-        response = await self._client.get(url)
-        response.raise_for_status()
-        return response.content
+        return (await self._get(url)).content
 
 
 def _eligible(photo: dict[str, Any], used: set[Any]) -> bool:

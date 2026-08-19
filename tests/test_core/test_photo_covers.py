@@ -315,6 +315,45 @@ async def test_restyle_recaptions_pinned_covers_without_searches(
     assert covered == [] and calls2["n"] == 0
 
 
+async def test_source_retries_transient_failures(monkeypatch):
+    import spotifyforge.core.photo_covers as pc
+
+    monkeypatch.setattr(pc, "_RETRY_DELAYS", (0, 0))
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadError("", request=request)
+        if calls["n"] == 2:
+            return httpx.Response(522)
+        return httpx.Response(200, json={"photos": [_photo_payload(1)]})
+
+    source = PexelsSource("key", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        photos = await source.search("anything")
+    finally:
+        await source.close()
+    assert [p["id"] for p in photos] == [1]
+    assert calls["n"] == 3
+
+
+async def test_source_gives_up_after_retries(monkeypatch):
+    import spotifyforge.core.photo_covers as pc
+
+    monkeypatch.setattr(pc, "_RETRY_DELAYS", (0, 0))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("", request=request)
+
+    source = PexelsSource("key", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        with pytest.raises(httpx.ReadError):
+            await source.search("anything")
+    finally:
+        await source.close()
+
+
 async def test_source_raises_rate_limited():
     source, _ = _pexels({}, limit_after=0)
     try:
