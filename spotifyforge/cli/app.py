@@ -1205,6 +1205,12 @@ def curate_covers(
         help="Re-roll just these playlists (by exact title; implies --overwrite "
         "for them). Photos only.",
     ),
+    restyle: bool = typer.Option(
+        False,
+        "--restyle",
+        help="Re-render already-pinned photos under the current styling "
+        "(same images, no Pexels quota). Photos only.",
+    ),
 ) -> None:
     """Give your playlists cover art.
 
@@ -1217,10 +1223,10 @@ def curate_covers(
     a time with [bold]--only[/bold] — the old photo stays excluded, so
     the re-roll is guaranteed to land on a different image.
     """
-    if only and not photos:
-        _error_panel("--only re-rolls photo picks; pass it with --photos.", title="Usage")
+    if (only or restyle) and not photos:
+        _error_panel("--only and --restyle work on photo picks; pass --photos.", title="Usage")
     if photos:
-        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, only)
+        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, only, restyle)
         return
 
     from spotifyforge.core.curation import apply_covers
@@ -1262,7 +1268,9 @@ def curate_covers(
     )
 
 
-def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, only=None) -> None:
+def _photo_covers(
+    min_size, max_size, max_tracks, exclusive, overwrite, only=None, restyle=False
+) -> None:
     """The --photos path of ``curate covers``: every owned playlist."""
     from spotifyforge.core.photo_covers import PexelsSource, apply_photo_covers, picks_path
     from spotifyforge.core.playlist_manager import PlaylistManager
@@ -1294,7 +1302,11 @@ def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, only=Non
         source = PexelsSource(settings.pexels_api_key)
         try:
             covered, failed, limited = await apply_photo_covers(
-                sp, targets, source, overwrite=overwrite or bool(only)
+                sp,
+                targets,
+                source,
+                overwrite=overwrite or (bool(only) and not restyle),
+                restyle=restyle,
             )
         finally:
             await source.close()
@@ -1444,6 +1456,84 @@ def curate_expand(
             "re-run to continue.\n"
             "Run [bold]spotifyforge curate reflow[/bold] to push them to Spotify.",
             title="Expanded",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]Pins: {expansions_path()}[/dim]")
+
+
+@curate_app.command("explore")
+def curate_explore(
+    genres: list[str] = typer.Argument(
+        ..., help='Genres to forge from nothing, e.g. "dungeon synth" "italo disco".'
+    ),
+    size: int = typer.Option(12, "--size", min=4, help="Tracks to pin per new niche."),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Forge playlists for niches you have never heard of.
+
+    Every playlist so far grew from liked songs; this one starts from
+    nothing but a genre name. Usable niche tracks are searched and
+    pinned, and from the next plan onward the niche is a full playlist
+    — run [bold]curate forge[/bold] to create it, then covers and
+    describe as usual. Genres the catalogue already covers are skipped
+    (grow those with [bold]expand[/bold]).
+    """
+    from spotifyforge.core.curation import plan_catalogue
+    from spotifyforge.core.expansion import expansions_path, explore_niches, load_expansions
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _explore(sp):
+        pins = load_expansions()
+        plan = await plan_catalogue(sp, opts, features, pins)
+        return await explore_niches(
+            sp,
+            plan.specs,
+            genres,
+            size=size,
+            expansions=pins,
+            keyed_isrcs=_keyed_isrcs(features),
+        )
+
+    added, skipped = _run_spotify(
+        "Digging into unheard niches...", "Failed to explore niches", _explore
+    )
+
+    if not added:
+        console.print(
+            Panel(
+                "Nothing new to pin — every genre was already covered or too "
+                f"barren to stand up ({', '.join(skipped) or 'none given'}).",
+                title="Nothing explored",
+                border_style="yellow",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("Niche", style="white", no_wrap=True, max_width=30)
+    table.add_column("Pinned", justify="right")
+    table.add_column("Artists", style="green", max_width=55)
+    for genre, tracks in added.items():
+        artists = ", ".join(dict.fromkeys(t.artist_names[0] for t in tracks if t.artist_names))
+        table.add_row(genre, str(len(tracks)), artists)
+    console.print(table)
+    console.print(
+        Panel(
+            f"[green]Pinned {sum(len(t) for t in added.values())} track(s) across "
+            f"{len(added)} new niche(s)[/green]"
+            + (f"; skipped: {', '.join(skipped)}" if skipped else "")
+            + ".\nRun [bold]spotifyforge curate forge[/bold] to create the playlists, "
+            "then [bold]covers --photos[/bold] and [bold]describe[/bold].",
+            title="Explored",
             border_style="green",
             expand=False,
         )

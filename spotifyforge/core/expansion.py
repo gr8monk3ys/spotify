@@ -24,6 +24,7 @@ import json
 import logging
 from collections import Counter
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
@@ -147,6 +148,7 @@ async def _find_candidates(
     count: int,
     keyed_isrcs: set[str] | None = None,
     freed_track_id: str | None = None,
+    prefer_recent: bool = False,
 ) -> list[CurationTrack]:
     """Up to *count* unheard tracks in *spec*'s niche.
 
@@ -163,7 +165,11 @@ async def _find_candidates(
     not a filter: candidates we can harmonically sequence claim the
     per-artist and count budget first, so growing a playlist stops
     costing it its key coverage, but a niche too obscure for the
-    analysis databases still fills.
+    analysis databases still fills. *prefer_recent* adds a secondary
+    preference for tracks released in the last two years — rotation
+    uses it so the catalogue visibly carries new music — subordinate to
+    the key preference: freshness reads in the tracklist, but a broken
+    mix reads in the ears.
     """
     try:
         (page,) = await spotify.search(_search_query(spec), types=("track",), limit=_SEARCH_LIMIT)
@@ -178,8 +184,15 @@ async def _find_candidates(
         candidate = replace(to_curation_track(track), genres=(spec.genre,) if spec.genre else ())
         if candidate.popularity <= _MAX_POPULARITY:
             candidates.append(candidate)
-    if keyed_isrcs:
-        candidates.sort(key=lambda c: c.isrc not in keyed_isrcs)  # stable: keyed first
+    keyed = keyed_isrcs or set()
+    recent_floor = datetime.now(UTC).year - 1 if prefer_recent else None
+    if keyed or recent_floor:
+        candidates.sort(  # stable: keyed first, then fresh releases
+            key=lambda c: (
+                bool(keyed) and c.isrc not in keyed,
+                recent_floor is not None and (c.release_year or 0) < recent_floor,
+            )
+        )
 
     picked: list[CurationTrack] = []
     new_ids: set[str] = set()
@@ -262,6 +275,63 @@ async def expand_catalogue(
         "Pinned %d track(s) across %d playlist(s)", sum(map(len, added.values())), len(added)
     )
     return added, len(thin)
+
+
+# An explored niche below this many tracks isn't a playlist, it's a stub.
+_EXPLORE_FLOOR = 4
+
+
+async def explore_niches(
+    spotify: Spotify,
+    specs: list[PlaylistSpec],
+    genres: list[str],
+    size: int = 12,
+    path: Path | None = None,
+    expansions: Pins | None = None,
+    keyed_isrcs: set[str] | None = None,
+) -> tuple[dict[str, list[CurationTrack]], list[str]]:
+    """Forge playlists for niches the library has no seed for.
+
+    The goal explicitly welcomes genres the user has never heard, but
+    until now every playlist grew from at least four liked songs. This
+    searches a genre from nothing, pins what it finds under
+    ``(genre, None)``, and lets :func:`curation.merge_expansions` turn
+    orphan pin keys into full specs — after which forge, reflow,
+    covers, describe, and refresh treat the niche like any other.
+
+    Genres the catalogue already covers are skipped (grow those with
+    ``expand``), as are niches yielding fewer than four usable tracks —
+    a two-track playlist reads as a stub, not a crate. Returns what was
+    pinned (keyed by genre) and the list of skipped genres.
+    """
+    from spotifyforge.core.curation import PlaylistSpec
+
+    pins = load_expansions(path) if expansions is None else expansions
+    if keyed_isrcs is None:
+        keyed_isrcs = _cached_keyed_isrcs()
+    known = {spec.genre for spec in specs if spec.genre} | {genre for genre, _ in pins}
+    taken_ids = {t.id for s in specs for t in s.tracks}
+    taken_keys = {track_song_key(t) for s in specs for t in s.tracks}
+
+    added: dict[str, list[CurationTrack]] = {}
+    skipped: list[str] = []
+    for genre in dict.fromkeys(g.strip().lower() for g in genres):
+        if not genre or genre in known:
+            skipped.append(genre)
+            continue
+        probe = PlaylistSpec(title=genre, description="", genre=genre, decade=None, tracks=[])
+        picked = await _find_candidates(spotify, probe, taken_ids, taken_keys, size, keyed_isrcs)
+        if len(picked) < _EXPLORE_FLOOR:
+            skipped.append(genre)
+            continue
+        taken_ids.update(t.id for t in picked)
+        taken_keys.update(track_song_key(t) for t in picked)
+        pins[(genre, None)] = picked
+        added[genre] = picked
+        save_expansions(pins, path)
+
+    logger.info("Explored %d new niche(s), skipped %d", len(added), len(skipped))
+    return added, skipped
 
 
 def _cursor_path(name: str, cursor_path: Path | None, pins_path: Path | None) -> Path:
@@ -351,7 +421,14 @@ async def refresh_pins(
         spec = spec_by_key[key]
         outgoing = pins[key][0]
         found = await _find_candidates(
-            spotify, spec, taken_ids, taken_keys, 1, keyed_isrcs, freed_track_id=outgoing.id
+            spotify,
+            spec,
+            taken_ids,
+            taken_keys,
+            1,
+            keyed_isrcs,
+            freed_track_id=outgoing.id,
+            prefer_recent=True,
         )
         if found:
             incoming = found[0]

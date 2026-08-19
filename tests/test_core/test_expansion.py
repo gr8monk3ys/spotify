@@ -21,6 +21,7 @@ from spotifyforge.core.expansion import (
     _load_cursor,
     _search_query,
     expand_catalogue,
+    explore_niches,
     load_expansions,
     refresh_pins,
     save_expansions,
@@ -330,11 +331,135 @@ async def test_refresh_walks_pinned_playlists_round_robin(fake_spotify, client_f
     assert await one_rotation() != await one_rotation()
 
 
+async def test_refresh_prefers_new_releases(fake_spotify, client_for, tmp_path):
+    """Rotation exists to keep playlists current, so incoming picks lean
+    toward fresh releases (subordinate to the key preference)."""
+    fake_spotify.add_user("user1")
+    # The older track comes first in search order; recency must win.
+    fake_spotify.add_track(
+        "c_old",
+        name="Coldwave Relic",
+        popularity=10,
+        artist_id="x1",
+        artist_name="Xylo Void",
+        album_id="a_old",
+        release_date="1999-05-01",
+    )
+    fake_spotify.add_track(
+        "c_new",
+        name="Coldwave Current",
+        popularity=12,
+        artist_id="x5",
+        artist_name="Veil Static",
+        album_id="a_new",
+        release_date="2026-02-01",
+    )
+    pin = CurationTrack(
+        id="p1",
+        uri="spotify:track:p1",
+        name="Pinned p1",
+        artist_ids=("x3",),
+        artist_names=("Mira Frost",),
+        release_year=1984,
+        popularity=30,
+        isrc="ISRCP1",
+        genres=("coldwave",),
+    )
+    path = tmp_path / "expansions.json"
+    save_expansions({("coldwave", None): [pin]}, path)
+
+    swapped, _ = await refresh_pins(
+        client_for("user1"),
+        [_spec(tracks=[pin])],
+        limit=1,
+        path=path,
+        cursor_path=tmp_path / "cursor.json",
+        keyed_isrcs=set(),
+    )
+
+    ((out, incoming),) = swapped.values()
+    assert (out.id, incoming.id) == ("p1", "c_new")
+
+
 def test_refresh_cursor_tolerates_corruption(tmp_path):
     cursor = tmp_path / "cursor.json"
     cursor.write_text("{not json", encoding="utf-8")
     assert _load_cursor(cursor) == ""
     assert _load_cursor(tmp_path / "missing.json") == ""
+
+
+# ---------------------------------------------------------------------------
+# Exploring (niches with no library seed)
+# ---------------------------------------------------------------------------
+
+
+def _seed_zeuhl_candidates(fake, count=5):
+    for i in range(count):
+        fake.add_track(
+            f"z{i}",
+            name=f"Zeuhl Kobaian {i}",
+            popularity=10 + i,
+            artist_id=f"za{i}",
+            artist_name=f"Zeuhl Act {i}",
+        )
+
+
+async def test_explore_pins_a_new_niche_and_merge_makes_it_a_playlist(
+    fake_spotify, client_for, tmp_path
+):
+    _seed_coldwave(fake_spotify)
+    _seed_zeuhl_candidates(fake_spotify)
+    path = tmp_path / "expansions.json"
+    sp = client_for("user1")
+
+    plan = await plan_catalogue(sp, CurationOptions(min_size=6))
+    added, skipped = await explore_niches(sp, plan.specs, ["Zeuhl"], size=12, path=path)
+
+    assert skipped == []
+    assert {t.id for t in added["zeuhl"]} == {"z0", "z1", "z2", "z3", "z4"}
+    assert ("zeuhl", None) in load_expansions(path)
+
+    # The next plan turns the orphan pin key into a full playlist spec.
+    grown = await plan_catalogue(sp, CurationOptions(min_size=6), expansions=load_expansions(path))
+    (spec,) = [s for s in grown.specs if s.genre == "zeuhl"]
+    assert len(spec.tracks) == 5
+    assert spec.title  # template-derived, like any forged playlist
+
+
+async def test_explore_skips_known_and_barren_genres(fake_spotify, client_for, tmp_path):
+    _seed_coldwave(fake_spotify)
+    _seed_zeuhl_candidates(fake_spotify, count=2)  # below the 4-track floor
+    sp = client_for("user1")
+
+    plan = await plan_catalogue(sp, CurationOptions(min_size=6))
+    added, skipped = await explore_niches(
+        sp, plan.specs, ["coldwave", "zeuhl", "gagaku"], path=tmp_path / "e.json"
+    )
+
+    assert added == {}
+    # Known genre, too-thin find, and no-results niche are all skipped.
+    assert skipped == ["coldwave", "zeuhl", "gagaku"]
+
+
+async def test_explored_niche_gets_forged(fake_spotify, client_for, isolated_db, db_user, tmp_path):
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    _seed_coldwave(fake_spotify)
+    _seed_zeuhl_candidates(fake_spotify)
+    path = tmp_path / "expansions.json"
+    owner_id = db_user()
+    sp = client_for("user1")
+
+    plan = await plan_catalogue(sp, CurationOptions(min_size=6))
+    await explore_niches(sp, plan.specs, ["zeuhl"], path=path)
+    grown = await plan_catalogue(sp, CurationOptions(min_size=6), expansions=load_expansions(path))
+
+    created, _ = await forge_next(PlaylistManager(sp), owner_id, grown.specs, limit=99, delay=0)
+    titles = {spec.title for spec, _ in created}
+    (zeuhl_spec,) = [s for s in grown.specs if s.genre == "zeuhl"]
+    assert zeuhl_spec.title in titles
+    (playlist,) = [p for s, p in created if s.title == zeuhl_spec.title]
+    assert set(fake_spotify.playlist_tracks[playlist.spotify_id]) == {"z0", "z1", "z2", "z3", "z4"}
 
 
 # ---------------------------------------------------------------------------
