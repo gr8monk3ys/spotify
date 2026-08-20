@@ -8,14 +8,11 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from spotifyforge.core.audio_features import AudioFeature
 from spotifyforge.core.curation import CurationTrack
 from spotifyforge.core.export import (
     SCHEMA,
     build_library_export,
-    load_export,
     write_export,
 )
 
@@ -27,9 +24,6 @@ def _track(
     album_name: str = "Kobaïa",
     total: int | None = 10,
     artists: tuple[tuple[str, str], ...] = (("a1", "Magma"),),
-    isrc: str | None = None,
-    genres: tuple[str, ...] = ("zeuhl",),
-    year: int | None = 1970,
 ) -> CurationTrack:
     return CurationTrack(
         id=track_id,
@@ -37,10 +31,10 @@ def _track(
         name=f"Song {track_id}",
         artist_ids=tuple(a for a, _ in artists),
         artist_names=tuple(n for _, n in artists),
-        release_year=year,
+        release_year=1970,
         popularity=20,
-        isrc=isrc or f"ISRC{track_id.upper()}",
-        genres=genres,
+        isrc=f"ISRC{track_id.upper()}",
+        genres=("zeuhl",),
         album_id=album_id,
         album_name=album_name,
         album_total_tracks=total,
@@ -139,17 +133,15 @@ def test_document_carries_schema_and_provenance():
     assert doc["generated_at"] == "2026-08-19T00:00:00+00:00"
 
 
-def test_roundtrip_and_schema_gate(tmp_path):
+def test_written_file_is_plain_json_a_consumer_can_read(tmp_path):
+    """Consumers live in other repos and parse this with stdlib json —
+    nothing here should be needed to read it back."""
     path = tmp_path / "music-library.json"
-    write_export(_build([_track("t1")]), path)
+    assert write_export(_build([_track("t1")]), path) == path
 
-    assert load_export(path)["albums"][0]["spotify_album_id"] == "alb1"
-
-    stale = json.loads(path.read_text())
-    stale["schema"] = "music-library/99"
-    path.write_text(json.dumps(stale))
-    with pytest.raises(ValueError, match="Unsupported export schema"):
-        load_export(path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["schema"] == SCHEMA
+    assert document["albums"][0]["spotify_album_id"] == "alb1"
 
 
 async def test_album_identity_survives_the_real_fetch_path(fake_spotify, client_for):

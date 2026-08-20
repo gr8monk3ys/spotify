@@ -83,7 +83,13 @@ _UNKNOWN_TEMPO_GAP = 4
 
 @dataclass
 class CurationTrack:
-    """A liked track reduced to the fields curation decisions need."""
+    """A liked track: what curation decides on, plus album identity.
+
+    Album fields are carried for :mod:`spotifyforge.core.export` rather
+    than for any curation decision — clustering never groups by album.
+    They ride along because the saved-tracks payload already contains
+    them; recovering them later would cost a second library walk.
+    """
 
     id: str
     uri: str
@@ -277,10 +283,11 @@ def _saved_page_to_tracks(paging: Any) -> list[CurationTrack]:
 
 
 def to_curation_track(track: Any) -> CurationTrack:
+    album = track.album
     release_year: int | None = None
-    if track.album is not None and track.album.release_date:
+    if album is not None and album.release_date:
         try:
-            release_year = int(str(track.album.release_date)[:4])
+            release_year = int(str(album.release_date)[:4])
         except ValueError:
             release_year = None
     return CurationTrack(
@@ -292,11 +299,13 @@ def to_curation_track(track: Any) -> CurationTrack:
         release_year=release_year,
         popularity=track.popularity if track.popularity is not None else 0,
         isrc=extract_isrc(track),
-        album_id=getattr(track.album, "id", None) if track.album is not None else None,
-        album_name=(getattr(track.album, "name", "") or "") if track.album is not None else "",
-        album_total_tracks=(
-            getattr(track.album, "total_tracks", None) if track.album is not None else None
-        ),
+        album_id=album.id if album else None,
+        album_name=(album.name or "") if album else "",
+        # Only ``total_tracks`` is genuinely optional: a LocalAlbum has no
+        # such attribute. Hedging the other two the same way would turn a
+        # model change into 1700 albums silently exported with a null
+        # affinity — the very field consumers are told to rank by.
+        album_total_tracks=getattr(album, "total_tracks", None),
     )
 
 
