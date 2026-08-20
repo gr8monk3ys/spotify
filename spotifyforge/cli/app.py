@@ -159,6 +159,17 @@ def _run_spotify(status_msg: str, error_msg: str, coro_fn):
             # Some exceptions (httpx.ReadTimeout among them) stringify to
             # "", which produced an error panel that named no error.
             detail = str(exc) or type(exc).__name__
+            if "insufficient client scope" in detail.lower():
+                # A saved token carries the scopes it was granted, so
+                # adding one to REQUIRED_SCOPES leaves every existing
+                # token short of it. Spotify answers with the offending
+                # URL and nothing actionable; the fix is always the same.
+                _error_panel(
+                    "Your saved token was granted before this command's "
+                    "permissions existed.\nRun [bold]spotifyforge auth login[/bold] "
+                    "to re-authorise, then try again.",
+                    title="Re-authorisation needed",
+                )
             _error_panel(f"{error_msg}: {detail}")
 
 
