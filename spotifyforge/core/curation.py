@@ -28,7 +28,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -40,7 +40,7 @@ from spotifyforge.core.audio_features import AudioFeature, key_distance
 from spotifyforge.core.playlist_manager import extract_isrc
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Collection, Iterable
 
     from tekore import Spotify
 
@@ -145,6 +145,12 @@ class CurationPlan:
     liked_count: int
     unique_count: int
     specs: list[PlaylistSpec]
+    # Liked songs that reached a playlist. Kept as a field rather than
+    # derived from the specs because those also carry pinned tracks the
+    # user has never heard: counting rows in the catalogue and calling
+    # them placed liked songs reported more songs placed than exist,
+    # and "-4 unplaced".
+    placed_liked_count: int = 0
 
     @property
     def collapsed_count(self) -> int:
@@ -152,8 +158,13 @@ class CurationPlan:
         return self.liked_count - self.unique_count
 
     @property
+    def unplaced_count(self) -> int:
+        """Liked songs in genres too small to fill a playlist."""
+        return self.unique_count - self.placed_liked_count
+
+    @property
     def placed_count(self) -> int:
-        """Distinct songs that landed in at least one playlist."""
+        """Distinct songs in the catalogue, pinned discoveries included."""
         return len({t.id for s in self.specs for t in s.tracks})
 
     @property
@@ -209,7 +220,26 @@ class CurationEngine:
         return out
 
     async def enrich_genres(self, tracks: list[CurationTrack]) -> list[CurationTrack]:
-        """Fill each track's ``genres`` from its artists (batched, 50/call)."""
+        """Fill each track's ``genres`` from its **primary** artist.
+
+        Spotify tags genres on artists, never on tracks, so a track's
+        genres can only be inherited. Inheriting them from *every*
+        credited artist looked more generous and was the single largest
+        source of wrong placements: a feature drags its own genres onto
+        a song it guests on. Rico Nasty's "Vvgina" landed on an acid
+        techno playlist because Locked Club guests on it; Riot Shift's
+        hardstyle "666" landed on hard techno because its feature
+        carries that tag. Measured over this library, 251 tracks carried
+        a genre their primary artist does not have, and the worst
+        offenders — all multi-artist collaborations — reached nine
+        playlists each.
+
+        A track whose primary artist Spotify has not tagged gets no
+        genres at all rather than borrowing its features'. That is what
+        the unclassified playlists are for, and "we do not know" beats a
+        confident wrong answer on a catalogue whose whole claim is that
+        the genres mean something.
+        """
         artist_ids = sorted({aid for t in tracks for aid in t.artist_ids})
         batches = [
             artist_ids[offset : offset + _ARTIST_BATCH]
@@ -222,12 +252,7 @@ class CurationEngine:
                 genres_by_artist[artist.id] = tuple(artist.genres or ())
 
         enriched = [
-            replace(
-                t,
-                genres=_ordered_unique(
-                    g for aid in t.artist_ids for g in genres_by_artist.get(aid, ())
-                ),
-            )
+            replace(t, genres=genres_by_artist.get(t.artist_ids[0], ()) if t.artist_ids else ())
             for t in tracks
         ]
         logger.info(
@@ -374,6 +399,55 @@ def dedupe_versions(tracks: list[CurationTrack]) -> list[CurationTrack]:
 # ---------------------------------------------------------------------------
 
 
+def _genre_affinity(tracks: list[CurationTrack], viable: set[str]) -> dict[tuple[str, str], int]:
+    """How often each pair of viable genres sits on the same track."""
+    affinity: dict[tuple[str, str], int] = defaultdict(int)
+    for t in tracks:
+        carried = [g for g in t.genres if g in viable]
+        for a in carried:
+            for b in carried:
+                if a != b:
+                    affinity[(a, b)] += 1
+    return affinity
+
+
+def _core_genre(
+    candidates: list[str],
+    counts: Counter[str],
+    affinity: dict[tuple[str, str], int],
+) -> str:
+    """The one genre that best describes a track carrying *candidates*.
+
+    Scores each candidate by how much of *its own* membership sits
+    inside the track's other genres. A specific subgenre is almost
+    always co-tagged with its parents, so nearly all of it falls inside
+    the cluster and it scores high; an umbrella like "rock" has most of
+    its tracks outside and scores low. The winner is therefore the
+    tightest genre that still genuinely describes the track — which is
+    also the nichest one that is actually true.
+
+    Normalising by the *sibling's* size instead inverts this and elects
+    the umbrella every time: 15 of 15 slowcore tracks being rock says
+    slowcore is contained in rock, and reads as evidence for "rock".
+
+    Picking the plain *rarest* candidate — the obvious reading of "most
+    niche" — is a different failure. Rarity says how few artists carry a
+    tag, not how well it fits: it filed five Raxeller hard techno tracks
+    under "industrial" (8 tracks library-wide, and their rarest tag) and
+    dissolved the techno playlists altogether. Rarity survives only as
+    the tie-break, where two genres describe the track equally well and
+    the nicher one is the better calling card.
+    """
+
+    def score(genre: str) -> tuple[float, int, str]:
+        containment = sum(
+            affinity[(genre, other)] / counts[genre] for other in candidates if other != genre
+        )
+        return (-containment, counts[genre], genre)
+
+    return min(candidates, key=score)
+
+
 def cluster_library(
     tracks: list[CurationTrack],
     min_size: int = 12,
@@ -381,6 +455,7 @@ def cluster_library(
     exclusive: bool = False,
     include_unclassified: bool = True,
     features: dict[str, AudioFeature] | None = None,
+    discovery_keys: Collection[tuple[str, int | None]] = (),
 ) -> list[PlaylistSpec]:
     """Group tracks into niche playlist specs.
 
@@ -390,8 +465,17 @@ def cluster_library(
     By default a track joins **every** viable genre it carries: a song
     really is both psychedelic rock and neo-psychedelic, and that overlap
     is what turns a few dozen playlists into a few hundred. With
-    *exclusive* it joins only its rarest viable genre, which yields
-    fewer but sharper-edged playlists.
+    *exclusive* it joins only the one genre that best describes it (see
+    :func:`_core_genre`), so no song is ever in two playlists — which
+    also dissolves the near-identical playlists that heavy overlap
+    produces, where four techno lists shared the same five tracks.
+
+    *discovery_keys* names ``(genre, decade)`` pairs to keep as specs
+    even when too few tracks land in them — the playlists that exclusive
+    assignment empties out. They come back with no liked songs at all,
+    for :func:`merge_expansions` to fill with pinned unheard music;
+    :func:`plan_catalogue` drops any that stay under *min_size*, so a
+    live playlist is never reflowed down to nothing.
 
     With *include_unclassified*, tracks that no viable genre claims —
     Spotify tags no genre at all on plenty of small artists — are
@@ -404,13 +488,15 @@ def cluster_library(
     genre_counts: Counter[str] = Counter(g for t in tracks for g in t.genres)
     viable = {g for g, count in genre_counts.items() if count >= min_size}
 
+    affinity = _genre_affinity(tracks, viable) if exclusive else {}
+
     by_genre: dict[str, list[CurationTrack]] = {}
     for t in tracks:
         candidates = [g for g in t.genres if g in viable]
         if not candidates:
             continue
         if exclusive:
-            candidates = [min(candidates, key=lambda g: (genre_counts[g], g))]
+            candidates = [_core_genre(candidates, genre_counts, affinity)]
         for genre in candidates:
             by_genre.setdefault(genre, []).append(t)
 
@@ -424,6 +510,11 @@ def cluster_library(
         for decade, decade_members in _split_by_decade(members):
             if len(decade_members) >= min_size:
                 specs.append(_make_spec(genre, decade, decade_members, features))
+
+    built = {(s.genre or "", s.decade) for s in specs}
+    for genre, decade in sorted(discovery_keys):
+        if genre and (genre, decade) not in built:
+            specs.append(_make_spec(genre, decade, [], features))
 
     if include_unclassified:
         placed = {t.id for s in specs for t in s.tracks}
@@ -1051,9 +1142,21 @@ async def plan_catalogue(
         max_size=opts.max_size,
         exclusive=opts.exclusive,
         features=features,
+        discovery_keys=tuple(expansions or ()),
     )
     specs = merge_expansions(specs, expansions, features)
-    return CurationPlan(liked_count=len(liked), unique_count=len(unique), specs=specs)
+    # A discovery spec starts empty and is only worth a playlist once its
+    # pinned tracks fill it. Dropping the thin ones here — after the
+    # merge, never before — is what keeps reflow from writing an empty
+    # tracklist over a live playlist that still has songs on it.
+    specs = [s for s in specs if len(s.tracks) >= opts.min_size]
+    in_catalogue = {t.id for s in specs for t in s.tracks}
+    return CurationPlan(
+        liked_count=len(liked),
+        unique_count=len(unique),
+        specs=specs,
+        placed_liked_count=len({t.id for t in unique} & in_catalogue),
+    )
 
 
 async def forge_next(
