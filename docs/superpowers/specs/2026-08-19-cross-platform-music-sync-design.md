@@ -77,20 +77,28 @@ only `playlists` is persisted. There is no album-level dataset today.
 The hard problem is identity: one album is a Spotify album id, a Discogs
 release id, and an RYM slug, with no shared key.
 
-MusicBrainz is the bridge, and **the Spotify repo already owns the
-expensive half of it.** `audio_features.json` was built by resolving
-ISRC → MusicBrainz recording id for 3,490 recordings. MusicBrainz stores
-Discogs URLs as native `url` relationships on releases and release-groups.
+MusicBrainz is the bridge, keyed by something this repo has already
+collected for the whole library: the ISRC. MusicBrainz stores Discogs
+URLs as native `url` relationships on releases and release-groups.
 
 So the join is:
 
 ```
 Spotify track → ISRC → MB recording → MB release-group → Discogs release id
-                (cached)              (1 req/sec, free)   (url relationship)
+              (exported)   (25 per call, free)  (1 req/sec)  (url relationship)
 ```
 
-This is an *exact* match, costs zero Discogs API budget, and reuses work
-already paid for. Fuzzy artist+title+year search against Discogs becomes
+**Correction, found while implementing Phase 0.** An earlier draft claimed
+the MusicBrainz ids were already cached and could simply be exported.
+They are not. `FeatureCache` entries hold `{sources, tempo, key, mode}`
+only — `AcousticBrainzProvider._resolve()` looks the ids up, takes the
+readings, and discards the mapping. What is banked is the ISRC set and
+the tempo/key data. Consumers therefore re-resolve, which MusicBrainz
+answers 25 ISRCs per search call and each consumer caches on its own
+side: a real cost, but small and paid once per repo.
+
+This is still an *exact* match and still costs zero Discogs API budget.
+Fuzzy artist+title+year search against Discogs becomes
 the fallback for release-groups with no Discogs relationship — not the
 primary path.
 
@@ -141,7 +149,6 @@ rolls up per album.
       "total_tracks": 12,
       "affinity": 0.58,
       "isrcs": ["..."],
-      "musicbrainz_recording_ids": ["..."],
       "genres": ["..."],
       "tempo_known": 5,
       "key_known": 3
@@ -157,8 +164,9 @@ rolls up per album.
 album with 9 of 10 tracks liked is a record you want; one with a single
 liked track is a playlist add.
 
-`musicbrainz_recording_ids` is exported from the existing feature cache —
-this is what makes the consumers' matching cheap.
+`isrcs` is what makes the consumers' matching possible: it is the key
+MusicBrainz accepts, and the only cross-platform identifier this library
+actually owns.
 
 `discoveries` carries the 801 pinned unheard tracks so consumers can
 distinguish *listened* from *found-but-unheard*, which matters: an unheard
