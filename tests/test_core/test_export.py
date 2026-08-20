@@ -174,3 +174,25 @@ def test_export_is_json_serialisable_and_stable():
     consumer can tell a real change from a re-run."""
     tracks = [_track("t1"), _track("t2", album_id="alb2", album_name="Other")]
     assert json.dumps(_build(tracks)) == json.dumps(_build(tracks))
+
+
+def test_discoveries_survive_a_mix_of_dated_and_undated_pins():
+    """Pin keys carry a decade or None, and sorting them together
+    compared None against an int — the whole export died before it
+    returned. Real pins only started mixing once expand ran on
+    decade-split genres."""
+    from spotifyforge.core.export import build_library_export
+
+    pins = {
+        ("gabber", 1990): [_track("p1")],
+        ("gabber", None): [_track("p2")],
+        ("zeuhl", 1970): [_track("p3")],
+    }
+
+    payload = build_library_export([], {}, pins, "gr8monk3ys", "2026-08-19T00:00:00Z")
+
+    assert [(d["genre"], d["decade"]) for d in payload["discoveries"]] == [
+        ("gabber", None),
+        ("gabber", 1990),
+        ("zeuhl", 1970),
+    ]
