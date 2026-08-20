@@ -159,6 +159,17 @@ def _run_spotify(status_msg: str, error_msg: str, coro_fn):
             # Some exceptions (httpx.ReadTimeout among them) stringify to
             # "", which produced an error panel that named no error.
             detail = str(exc) or type(exc).__name__
+            if "insufficient client scope" in detail.lower():
+                # A saved token carries the scopes it was granted, so
+                # adding one to REQUIRED_SCOPES leaves every existing
+                # token short of it. Spotify answers with the offending
+                # URL and nothing actionable; the fix is always the same.
+                _error_panel(
+                    "Your saved token was granted before this command's "
+                    "permissions existed.\nRun [bold]spotifyforge auth login[/bold] "
+                    "to re-authorise, then try again.",
+                    title="Re-authorisation needed",
+                )
             _error_panel(f"{error_msg}: {detail}")
 
 
@@ -1014,10 +1025,11 @@ def curate_plan(
             f"Unique songs:          [bold]{plan.unique_count}[/bold] "
             f"({plan.collapsed_count} duplicate versions collapsed)\n"
             f"Playlists planned:     [bold]{len(plan.specs)}[/bold]\n"
-            f"Songs placed:          [bold]{plan.placed_count}[/bold] of {plan.unique_count} "
-            f"({plan.unique_count - plan.placed_count} in genres too small to fill a playlist)\n"
-            f"Playlist entries:      [bold]{plan.entry_count}[/bold] "
-            "(a song can belong to more than one genre)\n"
+            f"Songs placed:          [bold]{plan.placed_liked_count}[/bold] of "
+            f"{plan.unique_count} "
+            f"({plan.unplaced_count} in genres too small to fill a playlist)\n"
+            f"Playlist entries:      [bold]{plan.entry_count}[/bold] across "
+            f"{plan.placed_count} distinct songs (pinned discoveries included)\n"
             f"Sequenced by key+BPM:  [bold]{plan.harmonic_count}[/bold] of {len(plan.specs)} "
             "(the rest had too little key data)",
             title="Curation Plan",
@@ -1048,7 +1060,7 @@ def curate_forge(
     ),
 ) -> None:
     """Create the next batch of planned playlists on Spotify (resumable)."""
-    from spotifyforge.core.curation import forge_next
+    from spotifyforge.core.curation import forge_next, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     owner_id = _db_user_id()
@@ -1057,10 +1069,11 @@ def curate_forge(
 
     async def _forge(sp):
         plan = await _plan(sp, opts, features)
+        specs = writable_specs(plan.specs, min_size)
         created, pending = await forge_next(
-            PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
+            PlaylistManager(sp), owner_id, specs, limit, public=not private
         )
-        return created, pending, len(plan.specs)
+        return created, pending, len(specs)
 
     created, pending, total = _run_spotify(
         "Forging playlists from your liked songs...",
@@ -1090,6 +1103,81 @@ def curate_forge(
         )
     )
     console.print(_specs_table([spec for spec, _ in created]))
+
+
+@curate_app.command("follow-artists")
+def curate_follow_artists(
+    limit: int = typer.Option(
+        50, "--limit", "-l", min=1, help="Maximum artists to follow this run."
+    ),
+    min_liked: int = typer.Option(
+        2, "--min-liked", min=1, help="Only artists with at least this many liked songs."
+    ),
+    max_tracks: int | None = _MAX_TRACKS,
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually follow them (default is a dry run)."
+    ),
+) -> None:
+    """Follow the artists behind your liked songs.
+
+    Ranks every artist credited on your saved tracks by how many of them
+    are theirs and follows the top ones, skipping any you already
+    follow. Dry run by default: it prints exactly who the next
+    [bold]--apply[/bold] would follow.
+
+    This follows artists only. Bulk-following listeners to collect
+    follow-backs is what Spotify's rules prohibit — use
+    [bold]curate curators[/bold] for a shortlist of people worth
+    following, and choose among them yourself.
+    """
+    from spotifyforge.core.curation import CurationEngine
+    from spotifyforge.core.following import follow_artists, rank_candidates, unfollowed
+
+    async def _follow(sp):
+        tracks = await CurationEngine(sp).fetch_liked(max_tracks=max_tracks)
+        ranked = rank_candidates(tracks, min_liked=min_liked)
+        pending_ids = set(await unfollowed(sp, [c.id for c in ranked]))
+        pending = [c for c in ranked if c.id in pending_ids][:limit]
+        if not apply:
+            return pending, [], len(ranked), len(tracks)
+        followed, failed = await follow_artists(sp, pending)
+        return pending, failed, len(ranked), len(tracks)
+
+    pending, failed, ranked_count, scanned = _run_spotify(
+        "Ranking the artists behind your liked songs...",
+        "Failed to follow artists",
+        _follow,
+    )
+
+    if not pending:
+        console.print(
+            Panel(
+                f"You already follow every artist with {min_liked}+ liked songs "
+                f"({ranked_count} of them, from {scanned} saved tracks).",
+                title="Nothing to follow",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold")
+    table.add_column("Artist")
+    table.add_column("Liked songs", justify="right")
+    for candidate in pending:
+        table.add_row(candidate.name, str(candidate.liked_tracks))
+    console.print(table)
+
+    verb = "Followed" if apply else "Would follow"
+    body = (
+        f"[bold]{verb} {len(pending)}[/bold] artist(s), from {ranked_count} with "
+        f"{min_liked}+ liked songs across {scanned} saved tracks."
+    )
+    if failed:
+        body += f"\n[yellow]{len(failed)} could not be followed.[/yellow]"
+    if not apply:
+        body += "\n\nRe-run with [bold]--apply[/bold] to follow them."
+    console.print(Panel(body, title="Follow artists", border_style="green", expand=False))
 
 
 @curate_app.command("curators")
@@ -1178,6 +1266,11 @@ def curate_covers(
         help="Use licensed photos (Pexels) matched to each playlist's vibe, "
         "covering personal playlists too. Needs SPOTIFYFORGE_PEXELS_API_KEY.",
     ),
+    repick_people: bool = typer.Option(
+        False,
+        "--repick-people",
+        help="With --photos: re-roll only the covers whose photo shows a person.",
+    ),
 ) -> None:
     """Give your playlists cover art.
 
@@ -1189,20 +1282,19 @@ def curate_covers(
     than failing it.
     """
     if photos:
-        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite)
+        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, repick_people)
         return
 
-    from spotifyforge.core.curation import apply_covers
+    from spotifyforge.core.curation import apply_covers, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
 
     async def _covers(sp):
         plan = await _plan(sp, opts)
-        uploaded, failed = await apply_covers(
-            PlaylistManager(sp), sp, plan.specs, overwrite=overwrite
-        )
-        return uploaded, failed, len(plan.specs)
+        specs = writable_specs(plan.specs, min_size)
+        uploaded, failed = await apply_covers(PlaylistManager(sp), sp, specs, overwrite=overwrite)
+        return uploaded, failed, len(specs)
 
     uploaded, failed, total = _run_spotify(
         "Painting playlist covers...", "Failed to set covers", _covers
@@ -1231,9 +1323,17 @@ def curate_covers(
     )
 
 
-def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
+def _photo_covers(
+    min_size, max_size, max_tracks, exclusive, overwrite, repick_people=False
+) -> None:
     """The --photos path of ``curate covers``: every owned playlist."""
-    from spotifyforge.core.photo_covers import PexelsSource, apply_photo_covers, picks_path
+    from spotifyforge.core.curation import writable_specs
+    from spotifyforge.core.photo_covers import (
+        PexelsSource,
+        apply_photo_covers,
+        drop_person_picks,
+        picks_path,
+    )
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     if not settings.pexels_api_key:
@@ -1246,15 +1346,35 @@ def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
 
+    # Forgetting the pick is what re-rolls it, so this runs before the
+    # plan: the covers run that follows sees those playlists as unpinned
+    # and picks again, this time past the photo the filter now rejects.
+    reroll = drop_person_picks() if repick_people else None
+    if reroll is not None:
+        if not reroll:
+            console.print(
+                Panel(
+                    "No pinned cover shows a person.",
+                    title="Nothing to re-roll",
+                    border_style="green",
+                    expand=False,
+                )
+            )
+            return
+        console.print(f"[dim]Re-rolling {len(reroll)} cover(s): {', '.join(sorted(reroll))}[/dim]")
+        overwrite = True
+
     async def _photo(sp):
         plan = await _plan(sp, opts)
-        vibe_by_title = {s.title: s.genre_label for s in plan.specs}
+        vibe_by_title = {s.title: s.genre_label for s in writable_specs(plan.specs, min_size)}
         me = await sp.current_user()
         owned = [
             p for p in await PlaylistManager(sp).get_user_playlists() if p["owner_id"] == me.id
         ]
         # Forged playlists search by genre; personal ones by their name.
         targets = [(p["name"], p["id"], vibe_by_title.get(p["name"], p["name"])) for p in owned]
+        if reroll is not None:
+            targets = [t for t in targets if t[0] in set(reroll)]
         source = PexelsSource(settings.pexels_api_key)
         try:
             covered, failed, limited = await apply_photo_covers(
@@ -1298,7 +1418,7 @@ def curate_describe(
     without touching tracks, titles, followers, or artwork. Playlists
     already carrying the wanted text are skipped.
     """
-    from spotifyforge.core.curation import apply_descriptions
+    from spotifyforge.core.curation import apply_descriptions, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
@@ -1306,8 +1426,9 @@ def curate_describe(
 
     async def _push(sp):
         plan = await _plan(sp, opts, features)
-        updated, failed = await apply_descriptions(PlaylistManager(sp), sp, plan.specs)
-        return updated, failed, len(plan.specs)
+        specs = writable_specs(plan.specs, min_size)
+        updated, failed = await apply_descriptions(PlaylistManager(sp), sp, specs)
+        return updated, failed, len(specs)
 
     updated, failed, total = _run_spotify(
         "Rewriting playlist descriptions...", "Failed to update descriptions", _push
@@ -1524,7 +1645,7 @@ def curate_reflow(
     harmonic: bool = _HARMONIC,
 ) -> None:
     """Re-sequence playlists you already forged, keeping their URLs and followers."""
-    from spotifyforge.core.curation import reflow
+    from spotifyforge.core.curation import reflow, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
@@ -1532,8 +1653,9 @@ def curate_reflow(
 
     async def _reflow(sp):
         plan = await _plan(sp, opts, features)
-        rewritten, failed = await reflow(PlaylistManager(sp), sp, plan.specs)
-        return rewritten, failed, len(plan.specs)
+        specs = writable_specs(plan.specs, min_size)
+        rewritten, failed = await reflow(PlaylistManager(sp), sp, specs)
+        return rewritten, failed, len(specs)
 
     rewritten, failed, total = _run_spotify(
         "Re-sequencing your forged playlists...", "Failed to reflow playlists", _reflow
@@ -1567,6 +1689,342 @@ def curate_reflow(
         )
     )
     console.print(table)
+
+
+@curate_app.command("retire")
+def curate_retire(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually retire them (default: list them and stop)."
+    ),
+    limit: int | None = typer.Option(None, "--limit", "-l", help="Retire at most this many."),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Retire forged playlists the catalogue no longer plans.
+
+    A better genre assignment leaves playlists behind holding songs that
+    now belong elsewhere — the duplication the assignment fix was for.
+    This unfollows them; Spotify has no delete, and keeps them
+    recoverable from the web client for about ninety days.
+
+    A playlist is only ever a candidate if its description is one this
+    tool generated. Anything you wrote yourself is listed as kept and is
+    never touched, whatever its name or size.
+
+    Lists them and stops unless [bold]--apply[/bold] is passed.
+    """
+    from spotifyforge.core.curation import writable_specs
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.retiring import plan_retirements, retire_playlists
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _retire(sp):
+        plan = await _plan(sp, opts, features)
+        me = await sp.current_user()
+        owned = [
+            p for p in await PlaylistManager(sp).get_user_playlists() if p["owner_id"] == me.id
+        ]
+        live = {p["name"]: p.get("description") or "" for p in owned}
+        ids_by_name = {p["name"]: p["id"] for p in owned}
+
+        planned = {s.title for s in writable_specs(plan.specs, min_size)}
+        retirable, kept = plan_retirements(live, planned)
+        retirable = retirable[: limit or None]
+        if not apply:
+            return retirable, kept, [], False
+        retired, failed = await retire_playlists(sp, ids_by_name, retirable)
+        return retired, kept, failed, True
+
+    retirable, kept, failed, applied = _run_spotify(
+        "Retiring playlists..." if apply else "Working out what is no longer planned...",
+        "Failed to retire playlists",
+        _retire,
+    )
+
+    if not retirable:
+        console.print(
+            Panel(
+                f"Nothing to retire. {len(kept)} unplanned playlist(s) are yours, not forged.",
+                title="Nothing to retire",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold")
+    table.add_column("Retiring" if applied else "Would retire")
+    for name in retirable[:40]:
+        table.add_row(name)
+    console.print(table)
+    if len(retirable) > 40:
+        console.print(f"[dim]…and {len(retirable) - 40} more[/dim]")
+
+    verb = "Retired" if applied else "Would retire"
+    body = f"[bold]{verb} {len(retirable)}[/bold] forged playlist(s) the catalogue no longer plans."
+    body += (
+        f"\n[bold]{len(kept)}[/bold] unplanned playlist(s) kept — you wrote those, not this tool."
+    )
+    if failed:
+        body += f"\n[yellow]{len(failed)} could not be retired.[/yellow]"
+    if applied:
+        body += "\nSpotify keeps them recoverable from the web client for about 90 days."
+    else:
+        body += "\nNothing has changed — re-run with [bold]--apply[/bold] to do it."
+    console.print(Panel(body, title="Retire", border_style="green", expand=False))
+
+
+@curate_app.command("migrate")
+def curate_migrate(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually rename (default: show the mapping and stop)."
+    ),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Move live playlists onto a re-clustered catalogue, by their songs.
+
+    Use this after the clustering itself changes — a different genre
+    assignment renames most of the catalogue, because titles are derived
+    from the genres. [bold]rename[/bold] cannot follow that: it re-derives
+    the old title from the genre, and the genre is what moved.
+
+    This matches each planned playlist to the live one that already
+    holds its songs and renames that one in place, so followers,
+    artwork, descriptions and search ranking survive. Playlists with no
+    live counterpart are reported as new — run [bold]forge[/bold] for
+    those, then [bold]reflow[/bold] to fix every tracklist.
+
+    Shows the mapping and stops unless [bold]--apply[/bold] is passed.
+    """
+    from functools import partial
+
+    from spotifyforge.core.curation import gather_bounded, writable_specs
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.renaming import apply_renames, match_by_contents
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _migrate(sp):
+        plan = await _plan(sp, opts, features)
+        manager = PlaylistManager(sp)
+        me = await sp.current_user()
+        owned = [p for p in await manager.get_user_playlists() if p["owner_id"] == me.id]
+
+        async def _contents(playlist):
+            # playlist_items yields PlaylistTrack wrappers, not tracks;
+            # reading .id off the wrapper silently gives None for every
+            # row, which matches nothing and reports a confident zero.
+            items = await manager.get_playlist_tracks(playlist["id"])
+            held = {i.track.id for i in items if i.track is not None and i.track.id is not None}
+            return playlist["name"], held
+
+        live = dict(await gather_bounded([partial(_contents, p) for p in owned]))
+        if owned and not any(live.values()):
+            # Every match is decided by these sets. Reading them all as
+            # empty is a bug, and it fails as "nothing to rename" —
+            # indistinguishable from a clean catalogue.
+            raise RuntimeError(
+                f"Read no tracks from any of {len(owned)} owned playlists; "
+                "refusing to report a migration based on that."
+            )
+        renames, unmatched = match_by_contents(writable_specs(plan.specs, min_size), live)
+        if not apply:
+            return renames, unmatched, [], [], False
+        renamed, already, failed = await apply_renames(manager, sp, renames)
+        return renamed, unmatched, already, failed, True
+
+    renames, unmatched, already, failed, applied = _run_spotify(
+        "Renaming playlists..." if apply else "Matching playlists to their songs...",
+        "Failed to migrate playlists",
+        _migrate,
+    )
+
+    if renames:
+        table = Table(box=box.SIMPLE, header_style="bold cyan")
+        table.add_column("Was", style="dim", max_width=42)
+        table.add_column("Now", style="green", max_width=42)
+        for rename in renames[:40]:
+            table.add_row(rename.old, rename.new)
+        console.print(table)
+        if len(renames) > 40:
+            console.print(f"[dim]…and {len(renames) - 40} more[/dim]")
+
+    verb = "Renamed" if applied else "Would rename"
+    body = f"[bold]{verb} {len(renames)}[/bold] playlist(s) in place."
+    if already:
+        body += f"\n{len(already)} already carried the new name."
+    if failed:
+        body += f"\n[yellow]{len(failed)} could not be renamed.[/yellow]"
+    body += f"\n[bold]{len(unmatched)}[/bold] planned playlist(s) have no live counterpart."
+    if applied:
+        body += (
+            "\nFollowers, artwork and descriptions are unchanged.\n"
+            "Next: [bold]curate forge[/bold] for the new ones, then "
+            "[bold]curate reflow[/bold]."
+        )
+    else:
+        body += "\nNothing has changed — re-run with [bold]--apply[/bold] to do it."
+    console.print(Panel(body, title="Migrate", border_style="green", expand=False))
+
+
+@curate_app.command("rename")
+def curate_rename(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually rename (default: show the mapping and stop)."
+    ),
+    limit: int | None = typer.Option(None, "--limit", "-l", help="Rename at most this many."),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Move forged playlists onto the current naming scheme.
+
+    Playlist identity here is the title, so changing the naming scheme
+    without renaming the live playlists would make the next
+    [bold]forge[/bold] create duplicates and strand the originals —
+    followers, artwork and all. This renames them in place instead, and
+    carries their cover picks across.
+
+    Shows the mapping and stops unless [bold]--apply[/bold] is passed.
+    Playlists already carrying their new name are skipped, so an
+    interrupted run can simply be re-run.
+    """
+    from spotifyforge.core.curation import writable_specs
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.renaming import apply_renames, plan_renames
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _rename(sp):
+        plan = await _plan(sp, opts, features)
+        renames = plan_renames(writable_specs(plan.specs, min_size))[: limit or None]
+        if not apply:
+            return renames, [], [], False
+        renamed, already, failed = await apply_renames(PlaylistManager(sp), sp, renames)
+        return renamed, already, failed, True
+
+    renames, already, failed, applied = _run_spotify(
+        "Renaming playlists..." if apply else "Working out the new names...",
+        "Failed to rename playlists",
+        _rename,
+    )
+
+    if not renames and not already:
+        console.print(
+            Panel(
+                "Every playlist already carries its current name.",
+                title="Nothing to rename",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    if renames:
+        table = Table(box=box.SIMPLE, header_style="bold cyan")
+        table.add_column("Was", style="dim", max_width=44)
+        table.add_column("Now", style="green", max_width=44)
+        for rename in renames[:40]:
+            table.add_row(rename.old, rename.new)
+        console.print(table)
+        if len(renames) > 40:
+            console.print(f"[dim]…and {len(renames) - 40} more[/dim]")
+
+    if applied:
+        body = f"[green]Renamed {len(renames)} playlist(s)[/green] in place."
+        if already:
+            body += f"\n{len(already)} already carried the new name."
+        if failed:
+            body += f"\n[yellow]{len(failed)} could not be renamed[/yellow] (not found on Spotify)."
+        body += "\nFollowers, artwork and descriptions are unchanged."
+    else:
+        body = (
+            f"[bold]{len(renames)} playlist(s)[/bold] would be renamed.\n"
+            "Nothing has changed — re-run with [bold]--apply[/bold] to do it."
+        )
+    console.print(Panel(body, title="Rename", border_style="green", expand=False))
+
+
+# ╔═════════════════════════════════════════════════════════════════════════╗
+# ║  EXPORT                                                                ║
+# ╚═════════════════════════════════════════════════════════════════════════╝
+export_app = typer.Typer(
+    name="export",
+    help="Hand this library's knowledge to other music platforms.",
+    no_args_is_help=True,
+)
+app.add_typer(export_app)
+
+
+@export_app.command("library")
+def export_library(
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        "-o",
+        help="Where to write (default: music-library.json beside the database).",
+    ),
+    max_tracks: int | None = _MAX_TRACKS,
+) -> None:
+    """Write the liked library as a file other platform repos can read.
+
+    Rolls your liked songs up to album level — the unit Discogs and
+    RateYourMusic are keyed by — with ISRCs, genres, and how much of
+    each album you actually like. Unheard tracks pinned by
+    [bold]curate expand[/bold] are kept in a separate section so no
+    consumer mistakes them for music you have heard.
+    """
+    from spotifyforge.core.audio_features import load_cached_features
+    from spotifyforge.core.curation import CurationEngine
+    from spotifyforge.core.expansion import load_expansions
+    from spotifyforge.core.export import build_library_export, write_export
+    from spotifyforge.models.models import utc_now
+
+    # Known locally — asking Spotify who we are just to stamp provenance
+    # would be a round trip for a string already on disk.
+    user_id = _current_spotify_user_id()
+
+    async def _export(sp):
+        engine = CurationEngine(sp)
+        tracks = await engine.enrich_genres(await engine.fetch_liked(max_tracks))
+        return build_library_export(
+            tracks,
+            load_cached_features(),
+            load_expansions(),
+            user_id,
+            utc_now().isoformat(),
+        )
+
+    document = _run_spotify("Reading your library...", "Failed to export library", _export)
+    target = write_export(document, out)
+
+    albums = document["albums"]
+    complete = sum(1 for a in albums if (a["affinity"] or 0) >= 0.8)
+    console.print(
+        Panel(
+            f"[green]{len(albums)} album(s)[/green] from "
+            f"{sum(a['liked_track_count'] for a in albums)} liked track(s).\n"
+            f"{complete} album(s) at least 80% liked — the records you actually own in spirit.\n"
+            f"{len(document['discoveries'])} discovered niche(s) kept separate (unheard).",
+            title="Library exported",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]{target}[/dim]")
 
 
 # ╔═════════════════════════════════════════════════════════════════════════╗

@@ -83,6 +83,7 @@ class FakeSpotify:
         self.saved_tracks: dict[str, list[str]] = {}  # user -> liked track ids
         self.artist_genres: dict[str, list[str]] = {}
         self.artist_names: dict[str, str] = {}
+        self.followed_artists: dict[str, set[str]] = {}  # user -> artist ids
 
         self.valid_tokens: set[str] = set()
         self.valid_codes: dict[str, str] = {}  # auth code -> spotify user id
@@ -125,13 +126,24 @@ class FakeSpotify:
         album_id: str = "alb1",
         album_name: str = "Album One",
         release_date: str = "2024-01-01",
+        featured: list[tuple[str, str]] | None = None,
     ) -> str:
+        """Add a track. *featured* lists ``(id, name)`` guest artists.
+
+        Spotify credits guests in the same ``artists`` array as the
+        primary, distinguished only by position — which is why genre
+        inheritance has to care about the order.
+        """
         artist = _artist(artist_id, artist_name)
         self.artist_names[artist_id] = artist_name
+        guests = []
+        for guest_id, guest_name in featured or []:
+            self.artist_names[guest_id] = guest_name
+            guests.append(_artist(guest_id, guest_name))
         self.albums.setdefault(album_id, _album(album_id, album_name, artist, release_date))
         self.tracks[track_id] = {
             "album": self.albums[album_id],
-            "artists": [artist],
+            "artists": [artist, *guests],
             "available_markets": ["US"],
             "disc_number": 1,
             "duration_ms": 200_000,
@@ -402,6 +414,15 @@ class FakeSpotify:
                     return httpx.Response(200)
                 return httpx.Response(200, json=self._playlist_payload(playlist_id))
 
+            if len(parts) == 5 and parts[4] == "followers":
+                # Spotify has no delete; unfollowing your own playlist is
+                # what removes it from the profile.
+                if request.method == "DELETE":
+                    self.playlists.pop(playlist_id, None)
+                    self.playlist_tracks.pop(playlist_id, None)
+                    return httpx.Response(200)
+                return httpx.Response(200)
+
             if parts[4] == "images":
                 meta = self.playlists[playlist_id]
                 if request.method == "PUT":  # cover upload (base64 body)
@@ -485,6 +506,33 @@ class FakeSpotify:
                 if aid
             ]
             return httpx.Response(200, json={"artists": artists})
+
+        if path == "/v1/me/following/contains":
+            ids = query.get("ids", "").split(",")
+            followed = self.followed_artists.setdefault(me, set())
+            return httpx.Response(200, json=[aid in followed for aid in ids if aid])
+
+        if path == "/v1/me/following":
+            followed = self.followed_artists.setdefault(me, set())
+            if request.method == "PUT":
+                body = json.loads(request.content) if request.content else {}
+                ids = body.get("ids") or query.get("ids", "").split(",")
+                followed.update(aid for aid in ids if aid)
+                return httpx.Response(204)
+            items = [_artist(aid, self.artist_names.get(aid, aid)) for aid in sorted(followed)]
+            return httpx.Response(
+                200,
+                json={
+                    "artists": {
+                        "href": f"{API}/me/following",
+                        "items": items[:limit],
+                        "limit": limit,
+                        "next": None,
+                        "cursors": {"after": None},
+                        "total": len(items),
+                    }
+                },
+            )
 
         if path == "/v1/me/top/tracks":
             ids = self.top_tracks.get(me, [])
