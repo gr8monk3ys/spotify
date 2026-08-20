@@ -281,7 +281,9 @@ def test_cluster_splits_oversized_genre_by_decade():
 
     specs = cluster_library(tracks, min_size=10, max_size=80)
     assert {s.decade for s in specs} == {1990, 2020}
-    assert all("'" in s.title for s in specs)  # era shows in the name
+    # The era leads the name, the way followed playlists write it
+    # ("70s spiritual jazz"), rather than trailing as a parenthetical.
+    assert {s.title for s in specs} == {"90s shoegaze", "20s shoegaze"}
     assert all(len(s.tracks) == 50 for s in specs)
 
 
