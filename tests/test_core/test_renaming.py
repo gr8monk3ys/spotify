@@ -15,6 +15,7 @@ from spotifyforge.core.playlist_manager import PlaylistManager
 from spotifyforge.core.renaming import (
     Rename,
     apply_renames,
+    match_by_contents,
     migrate_cover_picks,
     plan_renames,
 )
@@ -111,6 +112,109 @@ def test_plan_pairs_legacy_names_with_current_ones():
 
     # The unclassified playlist's name did not change, so it is left out.
     assert renames == [Rename(old="shoegaze after hours ('90s)", new="90s shoegaze")]
+
+
+# ---------------------------------------------------------------------------
+# Matching a re-clustered catalogue onto the live one
+# ---------------------------------------------------------------------------
+
+
+def _spec(title, genre, track_ids):
+    from spotifyforge.core.curation import PlaylistSpec
+
+    return PlaylistSpec(
+        title=title,
+        description="",
+        genre=genre,
+        decade=None,
+        tracks=[_ct(t, (genre,)) for t in track_ids],
+    )
+
+
+def test_a_re_clustered_playlist_is_recognised_by_its_songs():
+    """The genre key moved, so only the tracks can say these are the
+    same playlist. Getting this wrong creates a duplicate and strands
+    the original's followers and artwork."""
+    spec = _spec("hard techno | techno | tekno", "hard techno", ["a", "b", "c", "d"])
+    live = {"acid techno | techno | hard techno": {"a", "b", "c", "x"}}
+
+    renames, unmatched = match_by_contents([spec], live)
+
+    assert renames == [
+        Rename(old="acid techno | techno | hard techno", new="hard techno | techno | tekno")
+    ]
+    assert unmatched == []
+
+
+def test_a_genuinely_new_playlist_is_left_to_be_forged():
+    spec = _spec("70s spiritual jazz", "spiritual jazz", ["p", "q", "r"])
+    live = {"strictly techno": {"a", "b", "c"}}
+
+    renames, unmatched = match_by_contents([spec], live)
+
+    assert renames == []
+    assert [s.title for s in unmatched] == ["70s spiritual jazz"]
+
+
+def test_two_similar_specs_cannot_claim_the_same_live_playlist():
+    """Both descend from one over-broad playlist; only the closer one
+    inherits it, and the other is forged fresh."""
+    close = _spec("hard techno | tekno", "hard techno", ["a", "b", "c", "d"])
+    loose = _spec("dub techno | idm", "dub techno", ["a", "b", "y", "z"])
+    live = {"techno": {"a", "b", "c", "d"}}
+
+    renames, unmatched = match_by_contents([close, loose], live)
+
+    assert renames == [Rename(old="techno", new="hard techno | tekno")]
+    assert [s.title for s in unmatched] == ["dub techno | idm"]
+
+
+def test_a_playlist_already_correctly_named_is_not_renamed_or_reclaimed():
+    """Its tracklist may have been re-sequenced out of recognition; the
+    name is proof enough, and nothing else may take it."""
+    keeper = _spec("shoegaze | dream pop", "shoegaze", ["m", "n"])
+    other = _spec("slowcore, quietly", "slowcore", ["m", "n", "o"])
+    live = {"shoegaze | dream pop": {"totally", "different", "ids"}}
+
+    renames, unmatched = match_by_contents([keeper, other], live)
+
+    assert renames == []
+    assert [s.title for s in unmatched] == ["slowcore, quietly"]
+
+
+def test_a_faint_overlap_is_not_a_match():
+    spec = _spec("bebop at 3am", "bebop", ["a", "b", "c", "d", "e", "f"])
+    live = {"the reptile house": {"a", "z1", "z2", "z3", "z4", "z5"}}
+
+    renames, unmatched = match_by_contents([spec], live)
+
+    assert renames == []
+    assert [s.title for s in unmatched] == ["bebop at 3am"]
+
+
+def test_an_empty_discovery_spec_never_claims_a_live_playlist():
+    """A spec waiting on pins has no tracks to match on, and must not
+    match a live playlist by having nothing in common with it."""
+    spec = _spec("gabber for the long room", "gabber", [])
+    live = {"strictly gabber": {"a", "b"}}
+
+    renames, unmatched = match_by_contents([spec], live)
+
+    assert renames == []
+    assert [s.title for s in unmatched] == ["gabber for the long room"]
+
+
+def test_matching_is_deterministic_so_a_dry_run_predicts_the_apply():
+    specs = [
+        _spec("one", "a", ["x", "y", "z"]),
+        _spec("two", "b", ["x", "y", "z"]),
+    ]
+    live = {"live a": {"x", "y", "z"}, "live b": {"x", "y", "z"}}
+
+    first = match_by_contents(specs, live)[0]
+    again = match_by_contents(list(reversed(specs)), dict(reversed(list(live.items()))))[0]
+
+    assert first == again
 
 
 def test_cover_picks_follow_the_rename(tmp_path):
