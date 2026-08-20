@@ -414,6 +414,15 @@ class FakeSpotify:
                     return httpx.Response(200)
                 return httpx.Response(200, json=self._playlist_payload(playlist_id))
 
+            if len(parts) == 5 and parts[4] == "followers":
+                # Spotify has no delete; unfollowing your own playlist is
+                # what removes it from the profile.
+                if request.method == "DELETE":
+                    self.playlists.pop(playlist_id, None)
+                    self.playlist_tracks.pop(playlist_id, None)
+                    return httpx.Response(200)
+                return httpx.Response(200)
+
             if parts[4] == "images":
                 meta = self.playlists[playlist_id]
                 if request.method == "PUT":  # cover upload (base64 body)

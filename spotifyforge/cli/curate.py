@@ -798,6 +798,94 @@ def curate_reflow(
     console.print(table)
 
 
+@curate_app.command("retire")
+def curate_retire(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually retire them (default: list them and stop)."
+    ),
+    limit: int | None = typer.Option(None, "--limit", "-l", help="Retire at most this many."),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Retire forged playlists the catalogue no longer plans.
+
+    A better genre assignment leaves playlists behind holding songs that
+    now belong elsewhere — the duplication the assignment fix was for.
+    This unfollows them; Spotify has no delete, and keeps them
+    recoverable from the web client for about ninety days.
+
+    A playlist is only ever a candidate if its description is one this
+    tool generated. Anything you wrote yourself is listed as kept and is
+    never touched, whatever its name or size.
+
+    Lists them and stops unless [bold]--apply[/bold] is passed.
+    """
+    from spotifyforge.core.curation import writable_specs
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.retiring import plan_retirements, retire_playlists
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _retire(sp):
+        plan = await _plan(sp, opts, features)
+        me = await sp.current_user()
+        owned = [
+            p for p in await PlaylistManager(sp).get_user_playlists() if p["owner_id"] == me.id
+        ]
+        live = {p["name"]: p.get("description") or "" for p in owned}
+        ids_by_name = {p["name"]: p["id"] for p in owned}
+
+        planned = {s.title for s in writable_specs(plan.specs, min_size)}
+        retirable, kept = plan_retirements(live, planned)
+        retirable = retirable[: limit or None]
+        if not apply:
+            return retirable, kept, [], False
+        retired, failed = await retire_playlists(sp, ids_by_name, retirable)
+        return retired, kept, failed, True
+
+    retirable, kept, failed, applied = _run_spotify(
+        "Retiring playlists..." if apply else "Working out what is no longer planned...",
+        "Failed to retire playlists",
+        _retire,
+    )
+
+    if not retirable:
+        console.print(
+            Panel(
+                f"Nothing to retire. {len(kept)} unplanned playlist(s) are yours, not forged.",
+                title="Nothing to retire",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold")
+    table.add_column("Retiring" if applied else "Would retire")
+    for name in retirable[:40]:
+        table.add_row(name)
+    console.print(table)
+    if len(retirable) > 40:
+        console.print(f"[dim]…and {len(retirable) - 40} more[/dim]")
+
+    verb = "Retired" if applied else "Would retire"
+    body = f"[bold]{verb} {len(retirable)}[/bold] forged playlist(s) the catalogue no longer plans."
+    body += (
+        f"\n[bold]{len(kept)}[/bold] unplanned playlist(s) kept — you wrote those, not this tool."
+    )
+    if failed:
+        body += f"\n[yellow]{len(failed)} could not be retired.[/yellow]"
+    if applied:
+        body += "\nSpotify keeps them recoverable from the web client for about 90 days."
+    else:
+        body += "\nNothing has changed — re-run with [bold]--apply[/bold] to do it."
+    console.print(Panel(body, title="Retire", border_style="green", expand=False))
+
+
 @curate_app.command("migrate")
 def curate_migrate(
     apply: bool = typer.Option(
