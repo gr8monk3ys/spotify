@@ -210,7 +210,7 @@ class CurationEngine:
             return out[:max_tracks]
 
         offsets = list(range(_LIKED_PAGE, first.total, _LIKED_PAGE))
-        for page in await _gather_bounded(
+        for page in await gather_bounded(
             [partial(self._sp.saved_tracks, limit=_LIKED_PAGE, offset=o) for o in offsets]
         ):
             if page is not None:
@@ -247,7 +247,7 @@ class CurationEngine:
         ]
 
         genres_by_artist: dict[str, tuple[str, ...]] = {}
-        for artists in await _gather_bounded([partial(self._sp.artists, b) for b in batches]):
+        for artists in await gather_bounded([partial(self._sp.artists, b) for b in batches]):
             for artist in artists or ():
                 genres_by_artist[artist.id] = tuple(artist.genres or ())
 
@@ -264,7 +264,7 @@ class CurationEngine:
         return enriched
 
 
-async def _gather_bounded(factories: list[Any]) -> list[Any]:
+async def gather_bounded(factories: list[Any]) -> list[Any]:
     """Await *factories* concurrently, at most ``_READ_CONCURRENCY`` at once.
 
     Each item is a zero-argument callable returning a fresh coroutine, so

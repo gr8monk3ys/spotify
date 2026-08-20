@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 
 _RENAME_DELAY = 1.0  # one write per second, same pacing as forge
 
+# Shared fraction of the smaller side above which a live playlist and a
+# planned one are the same playlist. Re-clustering moves a minority of
+# any playlist's tracks; a genuinely different genre shares far less.
+_MIN_OVERLAP = 0.5
+
 
 @dataclass(frozen=True)
 class Rename:
@@ -58,6 +63,80 @@ def plan_renames(specs: list[PlaylistSpec]) -> list[Rename]:
         for spec in specs
         if (old := legacy_title(spec.genre, spec.decade)) != spec.title
     ]
+
+
+def match_by_contents(
+    specs: list[PlaylistSpec],
+    live: dict[str, set[str]],
+    min_overlap: float = _MIN_OVERLAP,
+) -> tuple[list[Rename], list[PlaylistSpec]]:
+    """Pair each spec with the live playlist that already holds it.
+
+    :func:`plan_renames` can only follow a change of naming *template*,
+    because it re-derives the old title from ``(genre, decade)``. Change
+    how tracks are assigned to genres and that key moves too: a playlist
+    live as "acid techno | techno | hard techno" is planned as "hard
+    techno | techno | tekno", and matching by key would call it a new
+    playlist, create it, and strand the original along with its
+    followers, artwork and search ranking.
+
+    So matching happens on the one thing that survives a re-clustering:
+    the songs. *live* maps playlist name to its current track ids.
+    Scoring is the overlap coefficient — the shared fraction of the
+    smaller side — so a small playlist still matches the big one it came
+    out of. Pairs are taken greedily, best first, one spec to one
+    playlist, which keeps two similar specs from claiming the same live
+    playlist.
+
+    An exact title match is taken first and unconditionally: a playlist
+    already carrying its planned name is that playlist, whatever a
+    re-sequenced tracklist does to the overlap.
+
+    Returns ``(renames, unmatched)`` — the moves to apply, and the specs
+    that are genuinely new and should be forged.
+    """
+    renames: list[Rename] = []
+    spec_pool = list(specs)
+    live_pool = dict(live)
+
+    exact = [s for s in spec_pool if s.title in live_pool]
+    for spec in exact:
+        del live_pool[spec.title]
+        spec_pool.remove(spec)
+
+    scored: list[tuple[float, str, str]] = []
+    for spec in spec_pool:
+        wanted = {t.id for t in spec.tracks}
+        if not wanted:
+            continue
+        for name, held in live_pool.items():
+            shared = len(wanted & held)
+            if not shared:
+                continue
+            overlap = shared / min(len(wanted), len(held))
+            if overlap >= min_overlap:
+                scored.append((overlap, spec.title, name))
+
+    # Sort by overlap, then by name so a tie resolves the same way twice
+    # — a dry run has to predict what --apply will do.
+    scored.sort(key=lambda row: (-row[0], row[1], row[2]))
+    claimed_specs: set[str] = set()
+    claimed_live: set[str] = set()
+    for _, title, name in scored:
+        if title in claimed_specs or name in claimed_live:
+            continue
+        claimed_specs.add(title)
+        claimed_live.add(name)
+        renames.append(Rename(old=name, new=title))
+
+    unmatched = [s for s in spec_pool if s.title not in claimed_specs]
+    logger.info(
+        "Matched %d spec(s) by contents, %d already correctly named, %d genuinely new",
+        len(renames),
+        len(exact),
+        len(unmatched),
+    )
+    return renames, unmatched
 
 
 def migrate_cover_picks(renames: list[Rename], path: Path | None = None) -> int:

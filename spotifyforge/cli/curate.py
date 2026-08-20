@@ -795,6 +795,104 @@ def curate_reflow(
     console.print(table)
 
 
+@curate_app.command("migrate")
+def curate_migrate(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually rename (default: show the mapping and stop)."
+    ),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Move live playlists onto a re-clustered catalogue, by their songs.
+
+    Use this after the clustering itself changes — a different genre
+    assignment renames most of the catalogue, because titles are derived
+    from the genres. [bold]rename[/bold] cannot follow that: it re-derives
+    the old title from the genre, and the genre is what moved.
+
+    This matches each planned playlist to the live one that already
+    holds its songs and renames that one in place, so followers,
+    artwork, descriptions and search ranking survive. Playlists with no
+    live counterpart are reported as new — run [bold]forge[/bold] for
+    those, then [bold]reflow[/bold] to fix every tracklist.
+
+    Shows the mapping and stops unless [bold]--apply[/bold] is passed.
+    """
+    from functools import partial
+
+    from spotifyforge.core.curation import gather_bounded
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.renaming import apply_renames, match_by_contents
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _migrate(sp):
+        plan = await _plan(sp, opts, features)
+        manager = PlaylistManager(sp)
+        me = await sp.current_user()
+        owned = [p for p in await manager.get_user_playlists() if p["owner_id"] == me.id]
+
+        async def _contents(playlist):
+            # playlist_items yields PlaylistTrack wrappers, not tracks;
+            # reading .id off the wrapper silently gives None for every
+            # row, which matches nothing and reports a confident zero.
+            items = await manager.get_playlist_tracks(playlist["id"])
+            held = {i.track.id for i in items if i.track is not None and i.track.id is not None}
+            return playlist["name"], held
+
+        live = dict(await gather_bounded([partial(_contents, p) for p in owned]))
+        if owned and not any(live.values()):
+            # Every match is decided by these sets. Reading them all as
+            # empty is a bug, and it fails as "nothing to rename" —
+            # indistinguishable from a clean catalogue.
+            raise RuntimeError(
+                f"Read no tracks from any of {len(owned)} owned playlists; "
+                "refusing to report a migration based on that."
+            )
+        renames, unmatched = match_by_contents(plan.specs, live)
+        if not apply:
+            return renames, unmatched, [], [], False
+        renamed, already, failed = await apply_renames(manager, sp, renames)
+        return renamed, unmatched, already, failed, True
+
+    renames, unmatched, already, failed, applied = _run_spotify(
+        "Renaming playlists..." if apply else "Matching playlists to their songs...",
+        "Failed to migrate playlists",
+        _migrate,
+    )
+
+    if renames:
+        table = Table(box=box.SIMPLE, header_style="bold cyan")
+        table.add_column("Was", style="dim", max_width=42)
+        table.add_column("Now", style="green", max_width=42)
+        for rename in renames[:40]:
+            table.add_row(rename.old, rename.new)
+        console.print(table)
+        if len(renames) > 40:
+            console.print(f"[dim]…and {len(renames) - 40} more[/dim]")
+
+    verb = "Renamed" if applied else "Would rename"
+    body = f"[bold]{verb} {len(renames)}[/bold] playlist(s) in place."
+    if already:
+        body += f"\n{len(already)} already carried the new name."
+    if failed:
+        body += f"\n[yellow]{len(failed)} could not be renamed.[/yellow]"
+    body += f"\n[bold]{len(unmatched)}[/bold] planned playlist(s) have no live counterpart."
+    if applied:
+        body += (
+            "\nFollowers, artwork and descriptions are unchanged.\n"
+            "Next: [bold]curate forge[/bold] for the new ones, then "
+            "[bold]curate reflow[/bold]."
+        )
+    else:
+        body += "\nNothing has changed — re-run with [bold]--apply[/bold] to do it."
+    console.print(Panel(body, title="Migrate", border_style="green", expand=False))
+
+
 @curate_app.command("rename")
 def curate_rename(
     apply: bool = typer.Option(
