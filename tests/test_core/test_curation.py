@@ -581,9 +581,7 @@ async def test_plan_catalogue_reports_collapse_and_placement(fake_spotify, clien
     assert plan.entry_count == sum(len(s.tracks) for s in plan.specs)
 
 
-async def test_a_discovery_playlist_is_written_only_once_its_pins_fill_it(
-    fake_spotify, client_for
-):
+async def test_a_discovery_playlist_is_written_only_once_its_pins_fill_it(fake_spotify, client_for):
     """A genre that exclusive assignment emptied stays in the plan so
     expand can find it, and reaches Spotify only once its pinned unheard
     tracks fill it. Reflow must never write an empty tracklist over a
