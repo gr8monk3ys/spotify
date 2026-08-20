@@ -113,7 +113,11 @@ def build_library_export(
                 {"name": t.name, "artists": list(t.artist_names), "isrc": t.isrc} for t in pinned
             ],
         }
-        for (genre, decade), pinned in sorted(expansions.items())
+        # Undated pins sort first rather than raising: a pin key's decade
+        # is None or an int, and comparing the two ends the whole export.
+        for (genre, decade), pinned in sorted(
+            expansions.items(), key=lambda kv: (kv[0][0], -1 if kv[0][1] is None else kv[0][1])
+        )
         if pinned
     ]
 
