@@ -94,6 +94,12 @@ class CurationTrack:
     popularity: int
     isrc: str | None = None  # global recording id; the key for tempo/key lookups
     genres: tuple[str, ...] = ()
+    # Album identity. Curation itself never groups by album — these exist
+    # so the library can be exported at album level, which is the unit
+    # other platforms (Discogs releases, RYM ratings) are keyed by.
+    album_id: str | None = None
+    album_name: str = ""
+    album_total_tracks: int | None = None
 
 
 @dataclass
@@ -286,6 +292,11 @@ def to_curation_track(track: Any) -> CurationTrack:
         release_year=release_year,
         popularity=track.popularity if track.popularity is not None else 0,
         isrc=extract_isrc(track),
+        album_id=getattr(track.album, "id", None) if track.album is not None else None,
+        album_name=(getattr(track.album, "name", "") or "") if track.album is not None else "",
+        album_total_tracks=(
+            getattr(track.album, "total_tracks", None) if track.album is not None else None
+        ),
     )
 
 
