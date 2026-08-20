@@ -35,12 +35,11 @@ def export_library(
     [bold]curate expand[/bold] are kept in a separate section so no
     consumer mistakes them for music you have heard.
     """
-    from datetime import UTC, datetime
-
     from spotifyforge.core.audio_features import load_cached_features
     from spotifyforge.core.curation import CurationEngine
     from spotifyforge.core.expansion import load_expansions
     from spotifyforge.core.export import build_library_export, write_export
+    from spotifyforge.models.models import utc_now
 
     async def _export(sp):
         engine = CurationEngine(sp)
@@ -51,7 +50,7 @@ def export_library(
             load_cached_features(),
             load_expansions(),
             me.id,
-            datetime.now(UTC).isoformat(),
+            utc_now().isoformat(),
         )
 
     document = _run_spotify("Reading your library...", "Failed to export library", _export)
