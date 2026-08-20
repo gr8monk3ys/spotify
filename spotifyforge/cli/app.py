@@ -1014,10 +1014,11 @@ def curate_plan(
             f"Unique songs:          [bold]{plan.unique_count}[/bold] "
             f"({plan.collapsed_count} duplicate versions collapsed)\n"
             f"Playlists planned:     [bold]{len(plan.specs)}[/bold]\n"
-            f"Songs placed:          [bold]{plan.placed_count}[/bold] of {plan.unique_count} "
-            f"({plan.unique_count - plan.placed_count} in genres too small to fill a playlist)\n"
-            f"Playlist entries:      [bold]{plan.entry_count}[/bold] "
-            "(a song can belong to more than one genre)\n"
+            f"Songs placed:          [bold]{plan.placed_liked_count}[/bold] of "
+            f"{plan.unique_count} "
+            f"({plan.unplaced_count} in genres too small to fill a playlist)\n"
+            f"Playlist entries:      [bold]{plan.entry_count}[/bold] across "
+            f"{plan.placed_count} distinct songs (pinned discoveries included)\n"
             f"Sequenced by key+BPM:  [bold]{plan.harmonic_count}[/bold] of {len(plan.specs)} "
             "(the rest had too little key data)",
             title="Curation Plan",
@@ -1090,6 +1091,81 @@ def curate_forge(
         )
     )
     console.print(_specs_table([spec for spec, _ in created]))
+
+
+@curate_app.command("follow-artists")
+def curate_follow_artists(
+    limit: int = typer.Option(
+        50, "--limit", "-l", min=1, help="Maximum artists to follow this run."
+    ),
+    min_liked: int = typer.Option(
+        2, "--min-liked", min=1, help="Only artists with at least this many liked songs."
+    ),
+    max_tracks: int | None = _MAX_TRACKS,
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually follow them (default is a dry run)."
+    ),
+) -> None:
+    """Follow the artists behind your liked songs.
+
+    Ranks every artist credited on your saved tracks by how many of them
+    are theirs and follows the top ones, skipping any you already
+    follow. Dry run by default: it prints exactly who the next
+    [bold]--apply[/bold] would follow.
+
+    This follows artists only. Bulk-following listeners to collect
+    follow-backs is what Spotify's rules prohibit — use
+    [bold]curate curators[/bold] for a shortlist of people worth
+    following, and choose among them yourself.
+    """
+    from spotifyforge.core.curation import CurationEngine
+    from spotifyforge.core.following import follow_artists, rank_candidates, unfollowed
+
+    async def _follow(sp):
+        tracks = await CurationEngine(sp).fetch_liked(max_tracks=max_tracks)
+        ranked = rank_candidates(tracks, min_liked=min_liked)
+        pending_ids = set(await unfollowed(sp, [c.id for c in ranked]))
+        pending = [c for c in ranked if c.id in pending_ids][:limit]
+        if not apply:
+            return pending, [], len(ranked), len(tracks)
+        followed, failed = await follow_artists(sp, pending)
+        return pending, failed, len(ranked), len(tracks)
+
+    pending, failed, ranked_count, scanned = _run_spotify(
+        "Ranking the artists behind your liked songs...",
+        "Failed to follow artists",
+        _follow,
+    )
+
+    if not pending:
+        console.print(
+            Panel(
+                f"You already follow every artist with {min_liked}+ liked songs "
+                f"({ranked_count} of them, from {scanned} saved tracks).",
+                title="Nothing to follow",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold")
+    table.add_column("Artist")
+    table.add_column("Liked songs", justify="right")
+    for candidate in pending:
+        table.add_row(candidate.name, str(candidate.liked_tracks))
+    console.print(table)
+
+    verb = "Followed" if apply else "Would follow"
+    body = (
+        f"[bold]{verb} {len(pending)}[/bold] artist(s), from {ranked_count} with "
+        f"{min_liked}+ liked songs across {scanned} saved tracks."
+    )
+    if failed:
+        body += f"\n[yellow]{len(failed)} could not be followed.[/yellow]"
+    if not apply:
+        body += "\n\nRe-run with [bold]--apply[/bold] to follow them."
+    console.print(Panel(body, title="Follow artists", border_style="green", expand=False))
 
 
 @curate_app.command("curators")
@@ -1178,6 +1254,11 @@ def curate_covers(
         help="Use licensed photos (Pexels) matched to each playlist's vibe, "
         "covering personal playlists too. Needs SPOTIFYFORGE_PEXELS_API_KEY.",
     ),
+    repick_people: bool = typer.Option(
+        False,
+        "--repick-people",
+        help="With --photos: re-roll only the covers whose photo shows a person.",
+    ),
 ) -> None:
     """Give your playlists cover art.
 
@@ -1189,7 +1270,7 @@ def curate_covers(
     than failing it.
     """
     if photos:
-        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite)
+        _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, repick_people)
         return
 
     from spotifyforge.core.curation import apply_covers
@@ -1231,9 +1312,16 @@ def curate_covers(
     )
 
 
-def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
+def _photo_covers(
+    min_size, max_size, max_tracks, exclusive, overwrite, repick_people=False
+) -> None:
     """The --photos path of ``curate covers``: every owned playlist."""
-    from spotifyforge.core.photo_covers import PexelsSource, apply_photo_covers, picks_path
+    from spotifyforge.core.photo_covers import (
+        PexelsSource,
+        apply_photo_covers,
+        drop_person_picks,
+        picks_path,
+    )
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     if not settings.pexels_api_key:
@@ -1246,6 +1334,24 @@ def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
 
+    # Forgetting the pick is what re-rolls it, so this runs before the
+    # plan: the covers run that follows sees those playlists as unpinned
+    # and picks again, this time past the photo the filter now rejects.
+    reroll = drop_person_picks() if repick_people else None
+    if reroll is not None:
+        if not reroll:
+            console.print(
+                Panel(
+                    "No pinned cover shows a person.",
+                    title="Nothing to re-roll",
+                    border_style="green",
+                    expand=False,
+                )
+            )
+            return
+        console.print(f"[dim]Re-rolling {len(reroll)} cover(s): {', '.join(sorted(reroll))}[/dim]")
+        overwrite = True
+
     async def _photo(sp):
         plan = await _plan(sp, opts)
         vibe_by_title = {s.title: s.genre_label for s in plan.specs}
@@ -1255,6 +1361,8 @@ def _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite) -> None:
         ]
         # Forged playlists search by genre; personal ones by their name.
         targets = [(p["name"], p["id"], vibe_by_title.get(p["name"], p["name"])) for p in owned]
+        if reroll is not None:
+            targets = [t for t in targets if t[0] in set(reroll)]
         source = PexelsSource(settings.pexels_api_key)
         try:
             covered, failed, limited = await apply_photo_covers(

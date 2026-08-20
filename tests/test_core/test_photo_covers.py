@@ -18,6 +18,7 @@ from spotifyforge.core.photo_covers import (
     RateLimitedError,
     apply_photo_covers,
     choose_photo,
+    drop_person_picks,
     load_picks,
     queries_for,
     save_picks,
@@ -108,6 +109,45 @@ async def test_choose_photo_is_stable_unique_and_person_free():
     assert other is not None
     assert other["photo_id"] != first["photo_id"]  # account-wide unique
     assert first["photo_id"] != 2 and other["photo_id"] != 2  # no people
+
+
+@pytest.mark.parametrize(
+    "alt",
+    [
+        # Each of these put a person on a live cover: the word list did
+        # not name them, and "man" does not match "male" on a boundary.
+        "A 3D abstract composition featuring geometric shapes and a figure",
+        "Elegant arm entwined with measuring tape",
+        "A dancer in motion performs a contemporary dance move",
+        "Vibrant 3D illustration of a yellow hand raised in a gesture",
+        "Young photographer explores rugged desert landscape",
+        "Black and white of calm young male in stylish eyeglasses",
+        "Trendy young adults wearing hoodies in a modern studio",
+    ],
+)
+def test_a_person_described_in_any_of_these_words_is_rejected(tmp_path, alt):
+    path = tmp_path / "photo_covers.json"
+    save_picks({"a playlist": {"photo_id": 1, "alt": alt}}, path)
+
+    assert drop_person_picks(path) == ["a playlist"]
+    assert load_picks(path) == {}
+
+
+def test_re_rolling_leaves_every_other_cover_pinned(tmp_path):
+    """Only the offending playlist moves — the rest keep the artwork
+    they were given, which is the point of pinning picks at all."""
+    path = tmp_path / "photo_covers.json"
+    save_picks(
+        {
+            "keep me": {"photo_id": 1, "alt": "ink in water, deep blue"},
+            "drop me": {"photo_id": 2, "alt": "a woman by a window"},
+            "keep me too": {"photo_id": 3, "alt": ""},
+        },
+        path,
+    )
+
+    assert drop_person_picks(path) == ["drop me"]
+    assert set(load_picks(path)) == {"keep me", "keep me too"}
 
 
 async def test_search_cache_spends_quota_once_per_query():
