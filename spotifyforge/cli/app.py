@@ -1583,7 +1583,10 @@ app.add_typer(export_app)
 @export_app.command("library")
 def export_library(
     out: Path | None = typer.Option(
-        None, "--out", "-o", help="Where to write (default: ~/.spotifyforge/music-library.json)."
+        None,
+        "--out",
+        "-o",
+        help="Where to write (default: music-library.json beside the database).",
     ),
     max_tracks: int | None = _MAX_TRACKS,
 ) -> None:
@@ -1601,15 +1604,18 @@ def export_library(
     from spotifyforge.core.export import build_library_export, write_export
     from spotifyforge.models.models import utc_now
 
+    # Known locally — asking Spotify who we are just to stamp provenance
+    # would be a round trip for a string already on disk.
+    user_id = _current_spotify_user_id()
+
     async def _export(sp):
         engine = CurationEngine(sp)
         tracks = await engine.enrich_genres(await engine.fetch_liked(max_tracks))
-        me = await sp.current_user()
         return build_library_export(
             tracks,
             load_cached_features(),
             load_expansions(),
-            me.id,
+            user_id,
             utc_now().isoformat(),
         )
 
@@ -1617,8 +1623,7 @@ def export_library(
     target = write_export(document, out)
 
     albums = document["albums"]
-    with_affinity = [a for a in albums if a["affinity"] is not None]
-    complete = sum(1 for a in with_affinity if a["affinity"] >= 0.8)
+    complete = sum(1 for a in albums if (a["affinity"] or 0) >= 0.8)
     console.print(
         Panel(
             f"[green]{len(albums)} album(s)[/green] from "

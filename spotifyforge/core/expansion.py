@@ -110,8 +110,11 @@ def _track_from_dict(entry: dict[str, Any]) -> CurationTrack:
         popularity=entry["popularity"],
         isrc=entry["isrc"],
         genres=tuple(entry["genres"]),
-        # Read defensively: pins written before album identity existed
-        # carry none of these, and must keep loading.
+        # ``.get`` because the 801 pins on disk predate album identity.
+        # This buys round-trip fidelity, not compatibility: the dataclass
+        # defaults would load those files fine, but a field read with []
+        # here would be dropped on load and then written back as its
+        # default by the next save — silently erasing it from the pins.
         album_id=entry.get("album_id"),
         album_name=entry.get("album_name", ""),
         album_total_tracks=entry.get("album_total_tracks"),

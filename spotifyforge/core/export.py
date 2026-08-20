@@ -22,11 +22,15 @@ Discoveries (unheard tracks pinned by ``curate expand``) are kept in
 their own section rather than mixed into albums. A consumer that pushed
 an unheard track to a wantlist, or queued it to be rated, would be
 acting on music the user has never heard.
+
+The ``schema`` field is the compatibility contract. Nothing here reads
+the file back — the consumers live in other repos and parse it with
+plain ``json`` — so they own the version check, and the string is the
+only thing that tells them a future export is not theirs to read.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from collections import Counter
 from typing import TYPE_CHECKING, Any
@@ -94,12 +98,9 @@ def build_library_export(
     makes the file diffable between runs.
     """
     by_album: dict[str, list[CurationTrack]] = {}
-    unalbumed = 0
     for track in tracks:
-        if track.album_id is None:
-            unalbumed += 1
-            continue
-        by_album.setdefault(track.album_id, []).append(track)
+        if track.album_id:
+            by_album.setdefault(track.album_id, []).append(track)
 
     albums = [_album_entry(group, features) for group in by_album.values()]
     albums.sort(key=lambda a: (-a["liked_track_count"], a["title"]))
@@ -116,8 +117,9 @@ def build_library_export(
         if pinned
     ]
 
-    if unalbumed:
-        logger.info("%d liked track(s) carried no album and were skipped", unalbumed)
+    skipped = len(tracks) - sum(len(group) for group in by_album.values())
+    if skipped:
+        logger.info("%d liked track(s) carried no album and were skipped", skipped)
     logger.info("Exported %d album(s), %d discovered niche(s)", len(albums), len(discoveries))
 
     return {
@@ -136,18 +138,3 @@ def write_export(document: dict[str, Any], path: Path | None = None) -> Path:
     target = path or export_path()
     write_json_atomic(target, document)
     return target
-
-
-def load_export(path: Path | None = None) -> dict[str, Any]:
-    """Read an interchange file, refusing a schema this code cannot read.
-
-    Consumer repos are expected to make the same check. A silent read of
-    a future schema would surface as confusing downstream data rather
-    than as the version mismatch it is.
-    """
-    target = path or export_path()
-    document: dict[str, Any] = json.loads(target.read_text(encoding="utf-8"))
-    found = document.get("schema")
-    if found != SCHEMA:
-        raise ValueError(f"Unsupported export schema {found!r}; this build reads {SCHEMA!r}")
-    return document
