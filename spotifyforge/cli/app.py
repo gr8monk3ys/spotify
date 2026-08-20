@@ -1049,7 +1049,7 @@ def curate_forge(
     ),
 ) -> None:
     """Create the next batch of planned playlists on Spotify (resumable)."""
-    from spotifyforge.core.curation import forge_next
+    from spotifyforge.core.curation import forge_next, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     owner_id = _db_user_id()
@@ -1058,10 +1058,11 @@ def curate_forge(
 
     async def _forge(sp):
         plan = await _plan(sp, opts, features)
+        specs = writable_specs(plan.specs, min_size)
         created, pending = await forge_next(
-            PlaylistManager(sp), owner_id, plan.specs, limit, public=not private
+            PlaylistManager(sp), owner_id, specs, limit, public=not private
         )
-        return created, pending, len(plan.specs)
+        return created, pending, len(specs)
 
     created, pending, total = _run_spotify(
         "Forging playlists from your liked songs...",
@@ -1273,17 +1274,16 @@ def curate_covers(
         _photo_covers(min_size, max_size, max_tracks, exclusive, overwrite, repick_people)
         return
 
-    from spotifyforge.core.curation import apply_covers
+    from spotifyforge.core.curation import apply_covers, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
 
     async def _covers(sp):
         plan = await _plan(sp, opts)
-        uploaded, failed = await apply_covers(
-            PlaylistManager(sp), sp, plan.specs, overwrite=overwrite
-        )
-        return uploaded, failed, len(plan.specs)
+        specs = writable_specs(plan.specs, min_size)
+        uploaded, failed = await apply_covers(PlaylistManager(sp), sp, specs, overwrite=overwrite)
+        return uploaded, failed, len(specs)
 
     uploaded, failed, total = _run_spotify(
         "Painting playlist covers...", "Failed to set covers", _covers
@@ -1316,6 +1316,7 @@ def _photo_covers(
     min_size, max_size, max_tracks, exclusive, overwrite, repick_people=False
 ) -> None:
     """The --photos path of ``curate covers``: every owned playlist."""
+    from spotifyforge.core.curation import writable_specs
     from spotifyforge.core.photo_covers import (
         PexelsSource,
         apply_photo_covers,
@@ -1354,7 +1355,7 @@ def _photo_covers(
 
     async def _photo(sp):
         plan = await _plan(sp, opts)
-        vibe_by_title = {s.title: s.genre_label for s in plan.specs}
+        vibe_by_title = {s.title: s.genre_label for s in writable_specs(plan.specs, min_size)}
         me = await sp.current_user()
         owned = [
             p for p in await PlaylistManager(sp).get_user_playlists() if p["owner_id"] == me.id
@@ -1406,7 +1407,7 @@ def curate_describe(
     without touching tracks, titles, followers, or artwork. Playlists
     already carrying the wanted text are skipped.
     """
-    from spotifyforge.core.curation import apply_descriptions
+    from spotifyforge.core.curation import apply_descriptions, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
@@ -1414,8 +1415,9 @@ def curate_describe(
 
     async def _push(sp):
         plan = await _plan(sp, opts, features)
-        updated, failed = await apply_descriptions(PlaylistManager(sp), sp, plan.specs)
-        return updated, failed, len(plan.specs)
+        specs = writable_specs(plan.specs, min_size)
+        updated, failed = await apply_descriptions(PlaylistManager(sp), sp, specs)
+        return updated, failed, len(specs)
 
     updated, failed, total = _run_spotify(
         "Rewriting playlist descriptions...", "Failed to update descriptions", _push
@@ -1632,7 +1634,7 @@ def curate_reflow(
     harmonic: bool = _HARMONIC,
 ) -> None:
     """Re-sequence playlists you already forged, keeping their URLs and followers."""
-    from spotifyforge.core.curation import reflow
+    from spotifyforge.core.curation import reflow, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
@@ -1640,8 +1642,9 @@ def curate_reflow(
 
     async def _reflow(sp):
         plan = await _plan(sp, opts, features)
-        rewritten, failed = await reflow(PlaylistManager(sp), sp, plan.specs)
-        return rewritten, failed, len(plan.specs)
+        specs = writable_specs(plan.specs, min_size)
+        rewritten, failed = await reflow(PlaylistManager(sp), sp, specs)
+        return rewritten, failed, len(specs)
 
     rewritten, failed, total = _run_spotify(
         "Re-sequencing your forged playlists...", "Failed to reflow playlists", _reflow
@@ -1705,7 +1708,7 @@ def curate_migrate(
     """
     from functools import partial
 
-    from spotifyforge.core.curation import gather_bounded
+    from spotifyforge.core.curation import gather_bounded, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
     from spotifyforge.core.renaming import apply_renames, match_by_contents
 
@@ -1735,7 +1738,7 @@ def curate_migrate(
                 f"Read no tracks from any of {len(owned)} owned playlists; "
                 "refusing to report a migration based on that."
             )
-        renames, unmatched = match_by_contents(plan.specs, live)
+        renames, unmatched = match_by_contents(writable_specs(plan.specs, min_size), live)
         if not apply:
             return renames, unmatched, [], [], False
         renamed, already, failed = await apply_renames(manager, sp, renames)
@@ -1799,6 +1802,7 @@ def curate_rename(
     Playlists already carrying their new name are skipped, so an
     interrupted run can simply be re-run.
     """
+    from spotifyforge.core.curation import writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
     from spotifyforge.core.renaming import apply_renames, plan_renames
 
@@ -1807,7 +1811,7 @@ def curate_rename(
 
     async def _rename(sp):
         plan = await _plan(sp, opts, features)
-        renames = plan_renames(plan.specs)[: limit or None]
+        renames = plan_renames(writable_specs(plan.specs, min_size))[: limit or None]
         if not apply:
             return renames, [], [], False
         renamed, already, failed = await apply_renames(PlaylistManager(sp), sp, renames)
