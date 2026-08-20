@@ -110,6 +110,11 @@ def _track_from_dict(entry: dict[str, Any]) -> CurationTrack:
         popularity=entry["popularity"],
         isrc=entry["isrc"],
         genres=tuple(entry["genres"]),
+        # Read defensively: pins written before album identity existed
+        # carry none of these, and must keep loading.
+        album_id=entry.get("album_id"),
+        album_name=entry.get("album_name", ""),
+        album_total_tracks=entry.get("album_total_tracks"),
     )
 
 
