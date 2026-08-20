@@ -685,3 +685,83 @@ def curate_reflow(
         )
     )
     console.print(table)
+
+
+@curate_app.command("rename")
+def curate_rename(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually rename (default: show the mapping and stop)."
+    ),
+    limit: int | None = typer.Option(None, "--limit", "-l", help="Rename at most this many."),
+    min_size: int = _MIN_SIZE,
+    max_size: int = _MAX_SIZE,
+    max_tracks: int | None = _MAX_TRACKS,
+    exclusive: bool = _EXCLUSIVE,
+    harmonic: bool = _HARMONIC,
+) -> None:
+    """Move forged playlists onto the current naming scheme.
+
+    Playlist identity here is the title, so changing the naming scheme
+    without renaming the live playlists would make the next
+    [bold]forge[/bold] create duplicates and strand the originals —
+    followers, artwork and all. This renames them in place instead, and
+    carries their cover picks across.
+
+    Shows the mapping and stops unless [bold]--apply[/bold] is passed.
+    Playlists already carrying their new name are skipped, so an
+    interrupted run can simply be re-run.
+    """
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.renaming import apply_renames, plan_renames
+
+    opts = _curation_options(min_size, max_size, max_tracks, exclusive)
+    features = _features_or_warn(harmonic)
+
+    async def _rename(sp):
+        plan = await _plan(sp, opts, features)
+        renames = plan_renames(plan.specs)[: limit or None]
+        if not apply:
+            return renames, [], [], False
+        renamed, already, failed = await apply_renames(PlaylistManager(sp), sp, renames)
+        return renamed, already, failed, True
+
+    renames, already, failed, applied = _run_spotify(
+        "Renaming playlists..." if apply else "Working out the new names...",
+        "Failed to rename playlists",
+        _rename,
+    )
+
+    if not renames and not already:
+        console.print(
+            Panel(
+                "Every playlist already carries its current name.",
+                title="Nothing to rename",
+                border_style="green",
+                expand=False,
+            )
+        )
+        return
+
+    if renames:
+        table = Table(box=box.SIMPLE, header_style="bold cyan")
+        table.add_column("Was", style="dim", max_width=44)
+        table.add_column("Now", style="green", max_width=44)
+        for rename in renames[:40]:
+            table.add_row(rename.old, rename.new)
+        console.print(table)
+        if len(renames) > 40:
+            console.print(f"[dim]…and {len(renames) - 40} more[/dim]")
+
+    if applied:
+        body = f"[green]Renamed {len(renames)} playlist(s)[/green] in place."
+        if already:
+            body += f"\n{len(already)} already carried the new name."
+        if failed:
+            body += f"\n[yellow]{len(failed)} could not be renamed[/yellow] (not found on Spotify)."
+        body += "\nFollowers, artwork and descriptions are unchanged."
+    else:
+        body = (
+            f"[bold]{len(renames)} playlist(s)[/bold] would be renamed.\n"
+            "Nothing has changed — re-run with [bold]--apply[/bold] to do it."
+        )
+    console.print(Panel(body, title="Rename", border_style="green", expand=False))
