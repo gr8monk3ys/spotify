@@ -511,9 +511,19 @@ def cluster_library(
             if len(decade_members) >= min_size:
                 specs.append(_make_spec(genre, decade, decade_members, features))
 
+    # A genre with enough tracks to be worth a playlist, that exclusive
+    # assignment then left too thin to be one, becomes a discovery spec:
+    # the playlist stays, and expand fills it with music from that niche
+    # the user has never heard. This is what stops the fix from quietly
+    # abandoning a live playlist to the songs it no longer deserves.
     built = {(s.genre or "", s.decade) for s in specs}
-    for genre, decade in sorted(discovery_keys):
-        if genre and (genre, decade) not in built:
+    assigned = {s.genre for s in specs if s.genre}
+    emptied = {(genre, None) for genre in viable if genre not in assigned}
+    # Sorted only for a stable spec order; the undated key sorts first
+    # rather than blowing up comparing None against a decade.
+    keys = emptied | {k for k in discovery_keys if k[0]}
+    for genre, decade in sorted(keys, key=lambda k: (k[0], -1 if k[1] is None else k[1])):
+        if (genre, decade) not in built:
             specs.append(_make_spec(genre, decade, [], features))
 
     if include_unclassified:
@@ -1119,6 +1129,19 @@ def merge_expansions(
     ]
 
 
+def writable_specs(specs: list[PlaylistSpec], min_size: int) -> list[PlaylistSpec]:
+    """The specs solid enough to write to Spotify.
+
+    A discovery spec starts empty and is only worth a playlist once
+    ``expand`` has pinned enough unheard tracks to fill it. It has to
+    stay in the plan so expand can find it at all, which is exactly why
+    the write paths — and only the write paths — drop it: reflow must
+    never replace a live playlist's songs with three of them, and forge
+    must not create a playlist that thin.
+    """
+    return [spec for spec in specs if len(spec.tracks) >= min_size]
+
+
 async def plan_catalogue(
     spotify: Spotify,
     opts: CurationOptions,
@@ -1145,11 +1168,6 @@ async def plan_catalogue(
         discovery_keys=tuple(expansions or ()),
     )
     specs = merge_expansions(specs, expansions, features)
-    # A discovery spec starts empty and is only worth a playlist once its
-    # pinned tracks fill it. Dropping the thin ones here — after the
-    # merge, never before — is what keeps reflow from writing an empty
-    # tracklist over a live playlist that still has songs on it.
-    specs = [s for s in specs if len(s.tracks) >= opts.min_size]
     in_catalogue = {t.id for s in specs for t in s.tracks}
     return CurationPlan(
         liked_count=len(liked),

@@ -26,6 +26,7 @@ from spotifyforge.core.curation import (
     order_for_flow,
     plan_catalogue,
     reflow,
+    writable_specs,
 )
 from spotifyforge.models.models import Playlist
 
@@ -278,6 +279,50 @@ def test_exclusive_never_puts_a_song_in_two_playlists():
 
     placements = Counter(t.id for s in specs for t in s.tracks)
     assert placements and max(placements.values()) == 1
+
+
+def test_a_genre_exclusive_assignment_emptied_stays_as_a_discovery_spec():
+    """It had enough tracks to deserve a playlist and lost them to a
+    tighter label. The playlist stays so expand can fill it with unheard
+    music, rather than being abandoned holding other playlists' songs."""
+    # "rock" is carried by 12 tracks, so it is viable — but every one of
+    # them files under the tighter label it also carries.
+    tracks = [_ct(f"s{i}", genres=("rock", "slowcore")) for i in range(6)]
+    tracks += [_ct(f"h{i}", genres=("rock", "shoegaze")) for i in range(6)]
+
+    specs = cluster_library(tracks, min_size=4, exclusive=True)
+    by_genre = {s.genre: s for s in specs}
+
+    assert len(by_genre["slowcore"].tracks) == 6
+    assert len(by_genre["shoegaze"].tracks) == 6
+    assert by_genre["rock"].tracks == []  # kept, empty, awaiting pins
+
+
+def test_shared_clustering_produces_no_empty_specs():
+    tracks = [_ct(f"s{i}", genres=("rock", "slowcore")) for i in range(6)]
+
+    specs = cluster_library(tracks, min_size=4, exclusive=False)
+
+    assert all(s.tracks for s in specs)
+
+
+def test_discovery_keys_mix_dated_and_undated_without_comparing_them():
+    """Real pins carry both, and sorting them together compared None to
+    an int — every plan died before it reached the caller."""
+    tracks = [_ct(f"t{i}", genres=("shoegaze",)) for i in range(10)]
+
+    specs = cluster_library(
+        tracks,
+        min_size=4,
+        exclusive=True,
+        discovery_keys=[("gabber", 1990), ("gabber", None), ("zeuhl", 1970)],
+    )
+
+    assert {(s.genre, s.decade) for s in specs} >= {
+        ("gabber", 1990),
+        ("gabber", None),
+        ("zeuhl", 1970),
+    }
 
 
 def test_discovery_keys_come_back_empty_for_expansions_to_fill():
@@ -536,11 +581,13 @@ async def test_plan_catalogue_reports_collapse_and_placement(fake_spotify, clien
     assert plan.entry_count == sum(len(s.tracks) for s in plan.specs)
 
 
-async def test_a_discovery_playlist_survives_only_once_its_pins_fill_it(fake_spotify, client_for):
-    """A genre that exclusive assignment emptied comes back as a spec so
-    its pinned unheard tracks keep a home — but only if there are enough
-    of them. Otherwise reflow would write an empty tracklist over a live
-    playlist that still has songs on it."""
+async def test_a_discovery_playlist_is_written_only_once_its_pins_fill_it(
+    fake_spotify, client_for
+):
+    """A genre that exclusive assignment emptied stays in the plan so
+    expand can find it, and reaches Spotify only once its pinned unheard
+    tracks fill it. Reflow must never write an empty tracklist over a
+    live playlist that still has songs on it."""
     _seed_library(fake_spotify, genres=("coldwave",), count=20)
     pins = {
         ("gabber", None): [_ct(f"p{i}", genres=("gabber",)) for i in range(6)],
@@ -548,10 +595,15 @@ async def test_a_discovery_playlist_survives_only_once_its_pins_fill_it(fake_spo
     }
 
     plan = await plan_catalogue(client_for("user1"), CurationOptions(min_size=4), expansions=pins)
-    by_genre = {s.genre: s for s in plan.specs}
+    planned = {s.genre: s for s in plan.specs}
+    writable = {s.genre: s for s in writable_specs(plan.specs, min_size=4)}
 
-    assert len(by_genre["gabber"].tracks) == 6  # kept, filled by its pins
-    assert "zeuhl" not in by_genre  # one pin is not a playlist
+    # Both stay in the plan — expand has to be able to find them.
+    assert len(planned["gabber"].tracks) == 6
+    assert len(planned["zeuhl"].tracks) == 1
+    # Only the filled one is written; one pin is not a playlist.
+    assert "gabber" in writable
+    assert "zeuhl" not in writable
     # Pinned tracks are not liked songs, so they must not be counted as
     # liked songs that found a home.
     assert plan.placed_liked_count <= plan.unique_count
