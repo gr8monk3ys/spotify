@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from functools import cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -36,7 +37,8 @@ logger = logging.getLogger(__name__)
 _RETIRE_DELAY = 1.0  # one write per second, same pacing as forge
 
 
-def _template_patterns() -> list[re.Pattern[str]]:
+@cache
+def _template_patterns() -> tuple[re.Pattern[str], ...]:
     """Every description this code can emit, as a matcher.
 
     Built from the templates rather than restated, so a new template
@@ -62,7 +64,7 @@ def _template_patterns() -> list[re.Pattern[str]]:
         # to be cut short at Spotify's 300-character limit.
         body = re.escape(template).replace(r"\{genre\}", ".+?").replace(r"\{artists\}", ".+?")
         patterns.append(re.compile(rf"^{body}", re.IGNORECASE))
-    return patterns
+    return tuple(patterns)
 
 
 def was_forged(description: str) -> bool:
@@ -81,9 +83,14 @@ def plan_retirements(
     ``(retirable, kept)`` — the forged playlists the catalogue no longer
     plans, and everything else it will not touch.
     """
-    unplanned = [name for name in live if name not in set(planned_titles)]
-    retirable = sorted(name for name in unplanned if was_forged(live[name]))
-    kept = sorted(name for name in unplanned if not was_forged(live[name]))
+    planned = set(planned_titles)
+    retirable: list[str] = []
+    kept: list[str] = []
+    unplanned = [name for name in live if name not in planned]
+    for name in unplanned:
+        (retirable if was_forged(live[name]) else kept).append(name)
+    retirable.sort()
+    kept.sort()
     logger.info(
         "%d unplanned playlist(s): %d forged and retirable, %d kept (not forged by this tool)",
         len(unplanned),
