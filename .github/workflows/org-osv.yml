@@ -25,7 +25,7 @@ jobs:
   # of the action, so calling it is the intended shape — and the one upstream
   # recommends over using the scanner action directly.
   osv:
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@c5996e0193a3df57d695c1b8a1dec2a4c62e8730
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67
     with:
       fail-on-vuln: false
       upload-sarif: false
