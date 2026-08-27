@@ -116,17 +116,29 @@ def key(artist: str, title: str) -> tuple[str, str]:
     return (strip_article(artist), normalise(title))
 
 
+def _is_plain(title: str) -> bool:
+    """True when *title* carries no edition noise — the canonical release."""
+    return _SPACE.sub(" ", _PUNCT.sub(" ", title)).strip().casefold() == normalise(title)
+
+
 async def find_album(sp: tekore.Spotify, record: OwnedRecord) -> Match:
     """Resolve *record* to one Spotify album, or to none.
 
-    Exactly one hit whose artist+title pair matches after normalisation
-    is accepted. Zero is "not on Spotify"; two or more editions of the
-    same record is ambiguous, and ambiguity is reported, never guessed.
+    Hits are kept only when the artist+title pair matches after
+    normalisation. Spotify then routinely lists one record several
+    times — plain, Deluxe, Super Deluxe, 30th Anniversary — and those
+    are editions of the record the user owns, not rival candidates: the
+    plain title is taken as canonical. What is still refused, and
+    reported rather than guessed: no hit, several hits with no plain
+    edition among them, or two plain editions (a reissue under a second
+    artist entry, say).
     """
     query = f"album:{normalise(record.title)} artist:{record.artist}"
     (albums,) = await sp.search(query, types=("album",), limit=5)
     wanted = key(record.artist, record.title)
     hits = [a for a in albums.items if a.artists and key(a.artists[0].name, a.name) == wanted]
+    if len(hits) > 1:
+        hits = [a for a in hits if _is_plain(a.name)]
     if len(hits) != 1:
         return Match(record, None, None)
     return Match(record, hits[0].id, hits[0].name)

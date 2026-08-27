@@ -118,12 +118,32 @@ async def test_find_album_refuses_zero_matches(fake_spotify, client_for):
     assert match.album_id is None and match.record == _record()
 
 
-async def test_find_album_refuses_two_equally_good_matches(fake_spotify, client_for):
-    """Two editions of the same record are two candidates; picking one
-    by position would be a guess written to a real account."""
+async def test_find_album_prefers_the_plain_edition_among_several(fake_spotify, client_for):
+    """Spotify lists In Utero four times (plain, Deluxe, Super Deluxe,
+    30th Anniversary). Those are one record, not four candidates; the
+    plain title is the canonical one and is saved."""
+    fake_spotify.add_user("user1")
+    fake_spotify.add_album("alb1", "In Utero (Deluxe Edition)", "nirv", "Nirvana")
+    fake_spotify.add_album("alb2", "In Utero", "nirv", "Nirvana")
+    fake_spotify.add_album("alb3", "In Utero (Super Deluxe Edition)", "nirv", "Nirvana")
+
+    assert (await find_album(client_for("user1"), _record())).album_id == "alb2"
+
+
+async def test_find_album_refuses_several_editions_with_no_plain_one(fake_spotify, client_for):
+    """Two decorated editions and no canonical title: picking one by
+    position would be a guess written to a real account."""
+    fake_spotify.add_user("user1")
+    fake_spotify.add_album("alb1", "In Utero (Remastered)", "nirv", "Nirvana")
+    fake_spotify.add_album("alb2", "In Utero (Deluxe Edition)", "nirv", "Nirvana")
+
+    assert (await find_album(client_for("user1"), _record())).album_id is None
+
+
+async def test_find_album_refuses_two_plain_editions(fake_spotify, client_for):
     fake_spotify.add_user("user1")
     fake_spotify.add_album("alb1", "In Utero", "nirv", "Nirvana")
-    fake_spotify.add_album("alb2", "In Utero (Remastered)", "nirv", "Nirvana")
+    fake_spotify.add_album("alb2", "In Utero", "nirv2", "Nirvana")
 
     assert (await find_album(client_for("user1"), _record())).album_id is None
 
