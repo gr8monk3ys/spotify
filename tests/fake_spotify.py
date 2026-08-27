@@ -84,6 +84,7 @@ class FakeSpotify:
         self.artist_genres: dict[str, list[str]] = {}
         self.artist_names: dict[str, str] = {}
         self.followed_artists: dict[str, set[str]] = {}  # user -> artist ids
+        self.saved_albums: dict[str, list[str]] = {}  # user -> saved album ids
 
         self.valid_tokens: set[str] = set()
         self.valid_codes: dict[str, str] = {}  # auth code -> spotify user id
@@ -198,6 +199,21 @@ class FakeSpotify:
             "refresh_token": refresh,
             "scope": "playlist-modify-public playlist-modify-private",
         }
+
+    def add_album(
+        self,
+        album_id: str,
+        name: str,
+        artist_id: str = "art1",
+        artist_name: str = "Artist One",
+        release_date: str = "2024-01-01",
+    ) -> str:
+        """Add a standalone album (no tracks) so album search can find it."""
+        self.artist_names[artist_id] = artist_name
+        self.albums[album_id] = _album(
+            album_id, name, _artist(artist_id, artist_name), release_date
+        )
+        return album_id
 
     def save_track(self, user_id: str, track_id: str) -> None:
         """Add *track_id* to *user_id*'s liked songs."""
@@ -507,6 +523,17 @@ class FakeSpotify:
             ]
             return httpx.Response(200, json={"artists": artists})
 
+        if path == "/v1/me/albums/contains":
+            ids = query.get("ids", "").split(",")
+            saved = self.saved_albums.setdefault(me, [])
+            return httpx.Response(200, json=[aid in saved for aid in ids if aid])
+
+        if path == "/v1/me/albums" and request.method == "PUT":
+            saved = self.saved_albums.setdefault(me, [])
+            ids = query.get("ids", "").split(",")
+            saved.extend(aid for aid in ids if aid and aid not in saved)
+            return httpx.Response(200)
+
         if path == "/v1/me/following/contains":
             ids = query.get("ids", "").split(",")
             followed = self.followed_artists.setdefault(me, set())
@@ -557,6 +584,21 @@ class FakeSpotify:
             head = q.split()[0].lower() if q.split() else ""
             words = [w for w in re.split(r"[^a-z0-9]+", head) if w]
             types = query.get("type", "track").split(",")
+
+            if "album" in types:
+                # Album search matches on words anywhere in the query, so
+                # a filtered query ("album:x artist:y") still finds albums.
+                all_words = [w for w in re.split(r"[^a-z0-9]+", q.lower()) if w]
+                hits = [
+                    a
+                    for a in self.albums.values()
+                    if all_words and any(w in a["name"].lower() for w in all_words)
+                ]
+                items = hits[offset : offset + limit]
+                return httpx.Response(
+                    200,
+                    json={"albums": self._paging(f"{API}/search", items, limit, offset, len(hits))},
+                )
 
             if "playlist" in types:
                 hits = [
