@@ -3,8 +3,19 @@
 import os
 from pathlib import Path
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_music_dir() -> Path:
+    """``~/.music`` unless the plain ``MUSIC_DIR`` variable says otherwise.
+
+    The directory is shared with the discogs and rym repos, none of which
+    know this package's ``SPOTIFYFORGE_`` prefix — so the unprefixed name
+    is honoured here too. ``SPOTIFYFORGE_MUSIC_DIR`` still wins, via the
+    normal prefixed lookup.
+    """
+    return Path(os.environ.get("MUSIC_DIR") or Path.home() / ".music").expanduser()
 
 
 class Settings(BaseSettings):
@@ -29,6 +40,9 @@ class Settings(BaseSettings):
     db_path: Path = Path.home() / ".spotifyforge" / "spotifyforge.db"
     database_url: str = ""  # If set, overrides db_path; use postgresql://... for production
 
+    # Shared interchange directory (music-library.json, discogs.json, rym.json).
+    music_dir: Path = Field(default_factory=_default_music_dir)
+
     # Scheduling
     scheduler_enabled: bool = True
 
@@ -51,6 +65,7 @@ class Settings(BaseSettings):
         explicitly so nothing silently falls back to insecure defaults.
         """
         self.db_path = self.db_path.expanduser()
+        self.music_dir = self.music_dir.expanduser()
         if self.environment != "development":
             missing = []
             if not self.spotify_client_id:

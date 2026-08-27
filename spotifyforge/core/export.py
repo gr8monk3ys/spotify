@@ -48,7 +48,18 @@ SCHEMA = "music-library/1"
 
 
 def export_path() -> Path:
-    """Where the interchange file lives: ``<db_path parent>/music-library.json``."""
+    """Where the interchange file lives: ``<music_dir>/music-library.json``.
+
+    ``music_dir`` is the directory the discogs and rym repos read from too
+    (``MUSIC_DIR``, default ``~/.music``).
+    """
+    from spotifyforge.config import settings
+
+    return settings.music_dir / "music-library.json"
+
+
+def legacy_export_path() -> Path:
+    """Where the file lived before ``~/.music``: beside the database."""
     from spotifyforge.config import sidecar_path
 
     return sidecar_path("music-library.json")
@@ -141,4 +152,10 @@ def write_export(document: dict[str, Any], path: Path | None = None) -> Path:
 
     target = path or export_path()
     write_json_atomic(target, document)
+    if path is None:
+        # Consumers still on the old path (~/.spotifyforge/music-library.json)
+        # keep reading a fresh file; remove after 2026-10.
+        legacy = legacy_export_path()
+        if legacy != target:
+            write_json_atomic(legacy, document)
     return target

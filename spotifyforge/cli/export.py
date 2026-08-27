@@ -26,7 +26,7 @@ def export_library(
         None,
         "--out",
         "-o",
-        help="Where to write (default: music-library.json beside the database).",
+        help="Where to write (default: music-library.json in MUSIC_DIR, ~/.music).",
     ),
     max_tracks: int | None = _MAX_TRACKS,
 ) -> None:
