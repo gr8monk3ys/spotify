@@ -1,331 +1,99 @@
 # SpotifyForge
 
-<p align="center">
-  <img src="docs/assets/hero.png" alt="spotify preview" width="640">
-</p>
+I wrote this to turn my 3,001 liked songs into genre playlists. Spotify tags
+genres on artists, not tracks, so the first pass unions every credited
+artist's genres onto each liked track; that library carried 421 distinct
+genres, and letting a track join every genre it carries is what turned ~50
+obvious playlists into 221 niche ones, each sequenced so it flows. Running it
+against the real account is also how the interesting bugs surfaced: the very
+first forged playlist held "Lamento Boliviano" twice under two track IDs
+(album cut and remaster), and collapsing edition variants removed 377
+duplicates, 12.5% of the library.
 
-The all-in-one platform for serious Spotify playlist curators.
+The tests are the part I would point to. `tests/fake_spotify.py` is an
+in-memory Spotify Web API served through `httpx.MockTransport`, so the real
+tekore client builds every request and parses every response; nothing in
+`spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
+which is what proves OAuth exchange, token refresh and storage work end to
+end. The 465 tests run in about 15 seconds with no network.
+`tests/test_core/test_curation.py` records the decisions that came out of
+real data: an ASCII-only title normaliser flattened every CASIOPEA title to
+`""` and merged the whole catalogue into one track, so CJK titles are kept
+distinct while `四面道歌 - 2019 Remastering` still collapses; `(Reprise)` and
+`(Part 2)` are different songs, `(Remastered)` is not; and `--exclusive`
+files a track under its rarest genre rather than the umbrella one.
 
-SpotifyForge gives you a powerful CLI and REST API to manage, curate, discover,
-and automate your Spotify playlists -- backed by a local cache database and a
-built-in scheduler for hands-off playlist maintenance.
+Spotify withdrew `GET /v1/audio-features` for new apps, so tempo and key come
+from Deezer and AcousticBrainz, looked up by ISRC (`core/audio_features.py`).
+On my library that covered key for 52% of recordings, enough for 97 of the
+221 playlists to be sequenced by Camelot-wheel key distance; the rest fall
+back to a popularity arc. Same-artist separation always outranks harmony.
 
-## Feature Highlights
+## Install
 
-- **Playlist management** -- list, inspect, create, sync, export (JSON/CSV), and deduplicate playlists
-- **Music discovery** -- top tracks, deep cuts, genre-based playlists, and time-capsule generators
-- **Bulk curation** -- turn your liked songs into a catalogue of hundreds of niche, genre-clustered playlists, each sequenced for flow
-- **Harmonic sequencing** -- tempo and musical key sourced by ISRC from Deezer and AcousticBrainz, then Camelot-wheel mixing (Spotify's own audio-features endpoint is withdrawn for new apps)
-- **Automated scheduling** -- cron-driven jobs for syncing, archiving Discover Weekly, deduplication, and genre refresh
-- **REST API** -- full FastAPI server with OAuth login, CRUD endpoints, and Swagger docs at `/docs`
-- **Rich CLI** -- beautiful terminal output powered by Typer + Rich
-- **Local cache** -- SQLite database with async support (aiosqlite) for offline-friendly workflows
-- **Type-safe** -- strict mypy, Pydantic v2 settings, and PEP 561 `py.typed` marker
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   User / Browser                    │
-└──────────┬──────────────────┬───────────────────────┘
-           │ CLI (Typer)      │ HTTP (FastAPI)
-           ▼                  ▼
-┌──────────────────┐ ┌───────────────────┐
-│ spotifyforge.cli │ │ spotifyforge.web  │
-│   (Typer app)    │ │ (FastAPI + routes) │
-└────────┬─────────┘ └────────┬──────────┘
-         │                    │
-         ▼                    ▼
-┌─────────────────────────────────────────┐
-│           spotifyforge.core             │
-│  PlaylistManager · DiscoveryEngine      │
-│  SchedulerService                       │
-└────────┬──────────────────┬─────────────┘
-         │                  │
-         ▼                  ▼
-┌─────────────────┐ ┌──────────────────┐
-│ spotifyforge.db │ │ spotifyforge.auth│
-│ SQLite (async)  │ │ Spotify OAuth    │
-│ SQLModel models │ │ (tekore / PKCE)  │
-└─────────────────┘ └──────────────────┘
-```
-
-## Quick Start
-
-### 1. Install
+Requires Python 3.11+ and a Spotify app from
+<https://developer.spotify.com/dashboard>.
 
 ```bash
-pip install -e .
+git clone https://github.com/gr8monk3ys/spotify.git
+cd spotify
+uv sync --all-extras          # or: pip install -e ".[dev]"
+cp .env.example .env          # set SPOTIFYFORGE_SPOTIFY_CLIENT_ID / _SECRET
+uv run spotifyforge auth login
 ```
 
-### 2. Configure
+`auth login` opens the browser; paste the redirect URL back into the prompt.
+Tokens go to the OS keyring.
+
+## Use
 
 ```bash
-cp .env.example .env
-# Edit .env and add your Spotify client ID and secret.
-# Get credentials at https://developer.spotify.com/dashboard
-```
+spotifyforge curate plan                 # preview the catalogue; writes nothing
+spotifyforge curate forge --limit 25     # create the next 25; re-run to continue
+spotifyforge curate features             # fetch tempo/key by ISRC, cached on disk
+spotifyforge curate reflow --harmonic    # re-sequence in place, URLs preserved
+spotifyforge curate curators             # people whose public playlists overlap yours
 
-### 3. Authenticate
-
-```bash
-spotifyforge auth login
-```
-
-This opens your browser for Spotify OAuth. After you authorize, your browser
-lands on the redirect URI (the page itself may not load — that's expected
-when the API server isn't running); paste that full redirect URL back into
-the prompt. Tokens are stored securely via `keyring`.
-
-### 4. Run Your First Command
-
-```bash
 spotifyforge playlist list
-```
-
-## CLI Usage
-
-SpotifyForge organises commands into sub-groups: `auth`, `playlist`, `discover`,
-`curate`, `schedule`, and `config`.
-
-```bash
-# Authentication
-spotifyforge auth login          # Open browser for Spotify OAuth
-spotifyforge auth status         # Show current auth state
-spotifyforge auth logout         # Remove stored tokens
-
-# Playlists
-spotifyforge playlist list                         # List all your playlists
-spotifyforge playlist show <playlist_id>           # Show playlist details and tracks
-spotifyforge playlist create "Chill Vibes"         # Create a new playlist
-spotifyforge playlist create "Private Mix" --private
-spotifyforge playlist sync <playlist_id>           # Sync playlist to local cache
-spotifyforge playlist deduplicate <playlist_id>    # Remove duplicate tracks
+spotifyforge playlist deduplicate <playlist_id>
 spotifyforge playlist export <playlist_id> -f csv -o tracks.csv
-
-# Discovery
-spotifyforge discover top-tracks --time-range short_term --limit 10
-spotifyforge discover deep-cuts 4Z8W4fKeB5YxbusRsdQVPb --threshold 25   # takes a Spotify artist ID
-spotifyforge discover genre indie-rock --limit 30                       # creates a playlist (max 50 tracks)
-spotifyforge discover time-capsule --time-range long_term               # creates a playlist
-
-# Bulk curation (liked songs -> a catalogue of niche playlists)
-spotifyforge curate plan                            # Preview the catalogue; writes nothing
-spotifyforge curate plan --min-size 10 --max-size 50
-spotifyforge curate forge --limit 25                # Create the next 25; re-run to continue
-spotifyforge curate forge --exclusive               # Each song in one genre only
-spotifyforge curate forge --private
-spotifyforge curate reflow                          # Re-sequence existing ones in place
-spotifyforge curate features                        # Fetch BPM (Deezer) for your library
-spotifyforge curate features --deep                 # Also fetch musical key (AcousticBrainz)
-spotifyforge curate reflow --harmonic               # Re-sequence by key + BPM (Camelot wheel)
-spotifyforge curate covers                          # Generate + upload cover art
-spotifyforge curate curators                        # List curators who share your taste
-
-# Scheduling
-spotifyforge schedule list
-spotifyforge schedule add \
-    --name "Weekly sync" \
-    --type sync \
-    --playlist <playlist_id> \
-    --cron "0 8 * * 1"
-spotifyforge schedule remove <job_id>
-spotifyforge schedule run       # Start the scheduler daemon
-
-# Configuration
-spotifyforge config show
-spotifyforge config set spotify_client_id <your_id>
-
-# Version
-spotifyforge --version
-```
-
-## API Usage
-
-### Start the Server
-
-```bash
-# Development (auto-reload)
-uvicorn spotifyforge.web.app:app --reload --port 8000
-
-# Production
-uvicorn spotifyforge.web.app:app --host 0.0.0.0 --port 8000 --workers 1
-
-# Or with Docker
-docker compose up --build
-```
-
-Interactive API docs are available at `http://localhost:8000/docs` (Swagger UI).
-
-### Key Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/api/auth/login` | Get Spotify OAuth URL (sets CSRF state cookie) |
-| `GET` | `/api/auth/me` | Current user profile |
-| `POST` | `/api/auth/logout` | Clear the session cookie |
-| `GET` | `/api/playlists` | List user playlists |
-| `POST` | `/api/playlists` | Create a playlist |
-| `GET` | `/api/playlists/{id}` | Get playlist details |
-| `PUT` | `/api/playlists/{id}` | Update a playlist |
-| `POST` | `/api/playlists/{id}/sync` | Sync from Spotify |
-| `POST` | `/api/playlists/{id}/deduplicate` | Remove duplicates |
-| `POST` | `/api/playlists/{id}/tracks` | Add tracks |
-| `DELETE` | `/api/playlists/{id}/tracks` | Remove tracks |
-| `GET` | `/api/discover/top-tracks` | User's top tracks |
-| `GET` | `/api/discover/top-artists` | User's top artists |
-| `GET` | `/api/discover/deep-cuts/{artist_id}` | Artist deep cuts |
-| `POST` | `/api/discover/genre-playlist` | Create genre playlist |
-| `POST` | `/api/discover/time-capsule` | Create time capsule |
-| `GET` | `/api/schedules` | List scheduled jobs |
-| `POST` | `/api/schedules` | Create a scheduled job |
-| `DELETE` | `/api/schedules/{id}` | Delete a job |
-| `PUT` | `/api/schedules/{id}/toggle` | Enable/disable a job |
-
-## Scheduling Examples
-
-SpotifyForge uses APScheduler with standard 5-field cron expressions
-(`minute hour day month day_of_week`). Jobs run inside the API server, or in
-the standalone daemon started with `spotifyforge schedule run`.
-
-The job types (shared by the CLI, API, and scheduler):
-
-| Type | Does | Extra options |
-|------|------|---------------|
-| `sync` | Sync a playlist into the local cache | `--playlist` |
-| `archive` | Append a source playlist into a target (e.g. Discover Weekly) | `--playlist`, `--source-playlist` |
-| `deduplicate` | Remove duplicate tracks, keeping one copy of each | `--playlist` |
-| `genre_refresh` | Refresh a playlist from a genre search | `--playlist`, `--genre` |
-| `time_capsule` | Snapshot your current top tracks into a new playlist | `--time-range` |
-
-```bash
-# Sync a playlist every Monday at 8:00 AM
-spotifyforge schedule add \
-    --name "Monday sync" \
-    --type sync \
-    --playlist 37i9dQZF1DXcBWIGoYBM5M \
-    --cron "0 8 * * 1"
-
-# Archive Discover Weekly into a keeper playlist every Monday
-spotifyforge schedule add \
-    --name "DW archive" \
-    --type archive \
-    --playlist <target_playlist_id> \
-    --source-playlist <discover_weekly_id> \
-    --cron "0 9 * * 1"
-
-# Deduplicate a playlist daily at midnight
-spotifyforge schedule add \
-    --name "Nightly dedup" \
-    --type deduplicate \
-    --playlist 37i9dQZF1DXcBWIGoYBM5M \
-    --cron "0 0 * * *"
-
-# Start the scheduler daemon (foreground)
+spotifyforge discover deep-cuts <artist_id> --threshold 25
+spotifyforge schedule add --name "Nightly dedup" --type deduplicate \
+    --playlist <playlist_id> --cron "0 0 * * *"
 spotifyforge schedule run
 ```
 
-## Configuration Reference
+Groups: `auth`, `playlist`, `discover`, `curate`, `schedule`, `config`;
+`spotifyforge <group> --help` lists the rest. `curate curators` is read-only
+on purpose: auto-following for follow-backs is the engagement pattern
+Spotify's rules prohibit, and `REQUIRED_SCOPES` deliberately omits
+`user-follow-modify`.
 
-All settings are loaded from environment variables (with a `SPOTIFYFORGE_`
-prefix) or a `.env` file. See `.env.example` for a complete template.
+There is also a FastAPI server (`uv run uvicorn spotifyforge.web.app:app`,
+Swagger at `/docs`) over the same core services, and `docker compose up`
+runs it with the scheduler.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SPOTIFYFORGE_ENVIRONMENT` | `development` | Any other value enforces required settings (secret key + credentials) |
-| `SPOTIFYFORGE_SECRET_KEY` | `""` | Encryption/signing key (required outside development) |
-| `SPOTIFYFORGE_SPOTIFY_CLIENT_ID` | `""` | Spotify app client ID (required) |
-| `SPOTIFYFORGE_SPOTIFY_CLIENT_SECRET` | `""` | Spotify app client secret (required) |
-| `SPOTIFYFORGE_SPOTIFY_REDIRECT_URI` | `http://localhost:8000/api/auth/callback` | OAuth redirect URI |
-| `SPOTIFYFORGE_DB_PATH` | `~/.spotifyforge/spotifyforge.db` | SQLite database path |
-| `SPOTIFYFORGE_DATABASE_URL` | `""` | Database URL; overrides DB_PATH (e.g. `postgresql://...`) |
-| `SPOTIFYFORGE_CORS_ORIGINS` | localhost dev origins | Comma-separated allowed CORS origins |
-| `SPOTIFYFORGE_WEB_HOST` | `127.0.0.1` | API server bind address |
-| `SPOTIFYFORGE_WEB_PORT` | `8000` | API server port |
-| `SPOTIFYFORGE_LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
-| `SPOTIFYFORGE_SCHEDULER_ENABLED` | `true` | Enable background scheduler |
-| `SPOTIFYFORGE_CACHE_TTL_AUDIO_FEATURES` | `0` | Audio features cache (seconds, 0 = indefinite) |
-| `SPOTIFYFORGE_CACHE_TTL_TRACK_METADATA` | `604800` | Track metadata cache (7 days) |
-| `SPOTIFYFORGE_CACHE_TTL_ARTIST_DATA` | `86400` | Artist data cache (24 hours) |
-| `SPOTIFYFORGE_CACHE_TTL_PLAYLIST_CONTENTS` | `3600` | Playlist contents cache (1 hour) |
-
-## Development Setup
-
-```bash
-# Clone and install with dev dependencies
-git clone https://github.com/your-org/spotifyforge.git
-cd spotifyforge
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-# Copy environment template
-cp .env.example .env
-
-# Run linter
-ruff check .
-
-# Run type checker
-mypy spotifyforge
-
-# Run tests
-pytest
-
-# Run tests with coverage
-pytest --cov=spotifyforge --cov-report=term-missing
-```
-
-## Project Structure
+## Layout
 
 ```
 spotifyforge/
-├── pyproject.toml               # Build config, dependencies, tool settings
-├── Dockerfile                   # Multi-stage production container
-├── docker-compose.yml           # Local development orchestration
-├── .env.example                 # Environment variable template
-├── conftest.py                  # Shared pytest fixtures
-├── tests/
-│   ├── test_auth/               # Authentication tests
-│   ├── test_cli/                # CLI command tests
-│   ├── test_core/               # Core business logic tests
-│   ├── test_db/                 # Database layer tests
-│   ├── test_models/             # Model and schema tests
-│   └── test_web/                # API endpoint tests
-└── spotifyforge/
-    ├── __init__.py              # Package version
-    ├── config.py                # Pydantic settings (env-driven)
-    ├── py.typed                 # PEP 561 typed package marker
-    ├── auth/
-    │   └── oauth.py             # Spotify OAuth (PKCE) + token management
-    ├── cli/
-    │   └── app.py               # Typer CLI with Rich output
-    ├── core/
-    │   ├── playlist_manager.py  # Playlist CRUD, sync, dedup, export
-    │   ├── discovery.py         # Top tracks, deep cuts, genre, time capsule
-    │   ├── curation.py          # Liked songs -> genre clusters -> flow-ordered playlists
-    │   ├── audio_features.py    # Tempo/key by ISRC (Deezer, AcousticBrainz) + Camelot wheel
-    │   ├── curators.py          # Find curators whose playlists overlap your library
-    │   ├── covers.py            # Generated playlist cover art (Pillow)
-    │   └── scheduler.py         # APScheduler service + job dispatch
-    ├── db/
-    │   ├── engine.py            # SQLite engine, session helpers, init_db()
-    │   └── repositories.py      # Data access layer
-    ├── models/
-    │   └── models.py            # SQLModel tables + Pydantic schemas
-    └── web/
-        ├── app.py               # FastAPI factory, lifespan, dependencies
-        └── routes.py            # API routers (auth, playlists, discovery, schedules)
+├── cli/        Typer app; one module per command group, helpers in _shared.py
+├── core/       curation, audio_features, discovery, playlist_manager, scheduler
+├── auth/       Spotify OAuth (PKCE) and keyring token store
+├── db/, models/  SQLite via SQLModel; alembic/ holds migrations
+└── web/        FastAPI app and routes
+tests/fake_spotify.py   the in-memory Spotify API the whole suite runs against
 ```
 
-## Contributing
+Settings are `SPOTIFYFORGE_*` environment variables or `.env`; see
+`.env.example` for the full list.
 
-1. Fork the repository and create a feature branch.
-2. Install dev dependencies: `pip install -e ".[dev]"`
-3. Make your changes and ensure linting passes: `ruff check .`
-4. Verify types: `mypy spotifyforge`
-5. Add or update tests and confirm they pass: `pytest`
-6. Submit a pull request with a clear description of your changes.
+## Develop
 
-## License
+```bash
+uv run ruff check . && uv run ruff format --check .
+uv run mypy .
+uv run pytest
+```
 
-This project is licensed under the MIT License. See the [pyproject.toml](pyproject.toml) for details.
+MIT licensed.
