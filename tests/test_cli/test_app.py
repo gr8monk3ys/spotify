@@ -842,3 +842,38 @@ class TestEndToEndFlow:
         result = runner.invoke(app, ["schedule", "list"])
         assert result.exit_code == 1
         assert "Not logged in" in result.stderr
+
+
+class TestScopeErrors:
+    def test_a_scope_the_saved_token_lacks_says_to_re_authorise(self, cli_env, monkeypatch):
+        """A saved token carries the scopes it was granted, so adding one
+        to REQUIRED_SCOPES leaves every existing token short. Spotify
+        answers with the offending URL and nothing actionable, which is
+        what `curate follow-artists` showed on the real account."""
+        fake = cli_env
+        _login(fake)
+        # Two liked songs by one artist, so there is a candidate to check
+        # and the command actually reaches /v1/me/following.
+        for i in range(2):
+            fake.add_track(f"t{i}", artist_id="stott", artist_name="Andy Stott")
+            fake.save_track("user1", f"t{i}")
+
+        import httpx
+
+        original = fake.handler
+
+        def deny_following(request: httpx.Request):
+            if "/v1/me/following" in str(request.url):
+                return httpx.Response(
+                    403,
+                    json={"error": {"status": 403, "message": "Insufficient client scope"}},
+                )
+            return original(request)
+
+        monkeypatch.setattr(fake, "handler", deny_following)
+
+        result = runner.invoke(app, ["curate", "follow-artists"])
+
+        assert result.exit_code == 1
+        assert "auth login" in result.stderr
+        assert "Re-authorisation needed" in result.stderr
