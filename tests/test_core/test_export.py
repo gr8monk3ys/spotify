@@ -196,3 +196,42 @@ def test_discoveries_survive_a_mix_of_dated_and_undated_pins():
         ("gabber", 1990),
         ("zeuhl", 1970),
     ]
+
+
+def test_export_path_honours_music_dir(monkeypatch, tmp_path):
+    """Three repos read this file from one shared directory; the plain
+    MUSIC_DIR variable (no SPOTIFYFORGE_ prefix) is what they all honour."""
+    from spotifyforge.config import Settings
+    from spotifyforge.core import export
+
+    monkeypatch.setenv("MUSIC_DIR", str(tmp_path / "music"))
+    monkeypatch.setattr("spotifyforge.config.settings", Settings())
+
+    assert export.export_path() == tmp_path / "music" / "music-library.json"
+
+
+def test_music_dir_defaults_to_dot_music(monkeypatch):
+    from pathlib import Path
+
+    from spotifyforge.config import Settings
+
+    monkeypatch.delenv("MUSIC_DIR", raising=False)
+    monkeypatch.delenv("SPOTIFYFORGE_MUSIC_DIR", raising=False)
+    assert Settings().music_dir == Path.home() / ".music"
+
+
+def test_write_export_keeps_a_legacy_sidecar_for_old_readers(monkeypatch, tmp_path):
+    """Consumers still on ~/.spotifyforge/music-library.json keep working
+    for one release."""
+    from spotifyforge.config import Settings
+    from spotifyforge.core import export
+
+    monkeypatch.setenv("MUSIC_DIR", str(tmp_path / "music"))
+    fresh = Settings()
+    fresh.db_path = tmp_path / "cfg" / "app.db"
+    monkeypatch.setattr("spotifyforge.config.settings", fresh)
+
+    target = export.write_export(_build([_track("t1")]))
+
+    assert target == tmp_path / "music" / "music-library.json"
+    assert (tmp_path / "cfg" / "music-library.json").exists()

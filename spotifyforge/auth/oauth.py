@@ -77,6 +77,7 @@ REQUIRED_SCOPES = tekore.Scope(
     "playlist-read-private",
     "playlist-read-collaborative",
     "user-library-read",
+    "user-library-modify",  # core/library.py saves Discogs-owned records
     "user-top-read",
     "user-read-recently-played",
     "user-follow-read",

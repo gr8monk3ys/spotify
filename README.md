@@ -60,10 +60,16 @@ spotifyforge playlist export <playlist_id> -f csv -o tracks.csv
 spotifyforge discover deep-cuts <artist_id> --threshold 25
 spotifyforge schedule add --name "Nightly dedup" --type deduplicate \
     --playlist <playlist_id> --cron "0 0 * * *"
+
+# Other platforms (shared files in MUSIC_DIR, default ~/.music)
+spotifyforge export library                         # Write ~/.music/music-library.json for discogs + rym
+spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
+spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
 spotifyforge schedule run
 ```
 
-Groups: `auth`, `playlist`, `discover`, `curate`, `schedule`, `config`;
+Groups: `auth`, `playlist`, `discover`, `curate`, `export`, `library`, `schedule`,
+`config`;
 `spotifyforge <group> --help` lists the rest. `curate curators` is read-only
 on purpose: auto-following for follow-backs is the engagement pattern
 Spotify's rules prohibit, and `REQUIRED_SCOPES` deliberately omits
@@ -86,7 +92,9 @@ tests/fake_spotify.py   the in-memory Spotify API the whole suite runs against
 ```
 
 Settings are `SPOTIFYFORGE_*` environment variables or `.env`; see
-`.env.example` for the full list.
+`.env.example` for the full list. `SPOTIFYFORGE_MUSIC_DIR` (or `MUSIC_DIR`,
+default `~/.music`) is the shared directory `export library` writes
+`music-library.json` to, read by the discogs and rym repos.
 
 ## Develop
 
