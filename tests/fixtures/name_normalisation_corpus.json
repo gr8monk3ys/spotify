@@ -1,0 +1,207 @@
+[
+  {
+    "input": "In Utero (Deluxe Edition)",
+    "normalised": "in utero",
+    "stripped_article": "in utero"
+  },
+  {
+    "input": "OK Computer - Remastered 2011",
+    "normalised": "ok computer",
+    "stripped_article": "ok computer"
+  },
+  {
+    "input": "The Beatles",
+    "normalised": "the beatles",
+    "stripped_article": "beatles"
+  },
+  {
+    "input": "Scenery = シーナリィ",
+    "normalised": "scenery シーナリィ",
+    "stripped_article": "scenery シーナリィ"
+  },
+  {
+    "input": "Ágætis byrjun",
+    "normalised": "ágætis byrjun",
+    "stripped_article": "ágætis byrjun"
+  },
+  {
+    "input": "Agaetis Byrjun",
+    "normalised": "agaetis byrjun",
+    "stripped_article": "agaetis byrjun"
+  },
+  {
+    "input": "Sgt. Pepper's Lonely Hearts Club Band",
+    "normalised": "sgt pepper s lonely hearts club band",
+    "stripped_article": "sgt pepper s lonely hearts club band"
+  },
+  {
+    "input": "Blonde on Blonde [Mono]",
+    "normalised": "blonde on blonde",
+    "stripped_article": "blonde on blonde"
+  },
+  {
+    "input": "Watch the Throne (feat. Frank Ocean)",
+    "normalised": "watch the throne",
+    "stripped_article": "watch the throne"
+  },
+  {
+    "input": "",
+    "normalised": "",
+    "stripped_article": ""
+  },
+  {
+    "input": "   ",
+    "normalised": "",
+    "stripped_article": ""
+  },
+  {
+    "input": "!!!",
+    "normalised": "",
+    "stripped_article": ""
+  },
+  {
+    "input": "...",
+    "normalised": "",
+    "stripped_article": ""
+  },
+  {
+    "input": "The Dark Side of the Moon — 50th Anniversary",
+    "normalised": "the dark side of the moon 50th anniversary",
+    "stripped_article": "dark side of the moon 50th anniversary"
+  },
+  {
+    "input": "A Love Supreme",
+    "normalised": "a love supreme",
+    "stripped_article": "love supreme"
+  },
+  {
+    "input": "An Awesome Wave",
+    "normalised": "an awesome wave",
+    "stripped_article": "awesome wave"
+  },
+  {
+    "input": "Kid A",
+    "normalised": "kid a",
+    "stripped_article": "kid a"
+  },
+  {
+    "input": "MTV Unplugged in New York (Live)",
+    "normalised": "mtv unplugged in new york",
+    "stripped_article": "mtv unplugged in new york"
+  },
+  {
+    "input": "Illmatic (Explicit)",
+    "normalised": "illmatic",
+    "stripped_article": "illmatic"
+  },
+  {
+    "input": "Discovery [Japan Edition]",
+    "normalised": "discovery",
+    "stripped_article": "discovery"
+  },
+  {
+    "input": "Nevermind - Super Deluxe",
+    "normalised": "nevermind",
+    "stripped_article": "nevermind"
+  },
+  {
+    "input": "US Girls",
+    "normalised": "us girls",
+    "stripped_article": "us girls"
+  },
+  {
+    "input": "UK Subs",
+    "normalised": "uk subs",
+    "stripped_article": "uk subs"
+  },
+  {
+    "input": "Mono",
+    "normalised": "mono",
+    "stripped_article": "mono"
+  },
+  {
+    "input": "Stereo",
+    "normalised": "stereo",
+    "stripped_article": "stereo"
+  },
+  {
+    "input": "The Clean",
+    "normalised": "the clean",
+    "stripped_article": "clean"
+  },
+  {
+    "input": "Special",
+    "normalised": "special",
+    "stripped_article": "special"
+  },
+  {
+    "input": "AM",
+    "normalised": "am",
+    "stripped_article": "am"
+  },
+  {
+    "input": "†",
+    "normalised": "",
+    "stripped_article": ""
+  },
+  {
+    "input": "Sigur Rós — ( )",
+    "normalised": "sigur rós",
+    "stripped_article": "sigur rós"
+  },
+  {
+    "input": "( )",
+    "normalised": "",
+    "stripped_article": ""
+  },
+  {
+    "input": "Loveless (Remastered)",
+    "normalised": "loveless",
+    "stripped_article": "loveless"
+  },
+  {
+    "input": "Untitled #23",
+    "normalised": "untitled 23",
+    "stripped_article": "untitled 23"
+  },
+  {
+    "input": "Music for 18 Musicians",
+    "normalised": "music for 18 musicians",
+    "stripped_article": "music for 18 musicians"
+  },
+  {
+    "input": "E•MO•TION",
+    "normalised": "e mo tion",
+    "stripped_article": "e mo tion"
+  },
+  {
+    "input": "Donuts (Instrumental)",
+    "normalised": "donuts",
+    "stripped_article": "donuts"
+  },
+  {
+    "input": "In Rainbows – Disk 2",
+    "normalised": "in rainbows disk 2",
+    "stripped_article": "in rainbows disk 2"
+  },
+  {
+    "input": "Selected Ambient Works 85-92",
+    "normalised": "selected ambient works 85 92",
+    "stripped_article": "selected ambient works 85 92"
+  },
+  {
+    "input": "Bitches Brew (Legacy Edition)",
+    "normalised": "bitches brew",
+    "stripped_article": "bitches brew"
+  },
+  {
+    "input": "The The",
+    "normalised": "the the",
+    "stripped_article": "the"
+  },
+  {
+    "input": "the the the",
+    "normalised": "the the the",
+    "stripped_article": "the the"
+  }
+]
