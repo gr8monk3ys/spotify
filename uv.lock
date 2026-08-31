@@ -938,6 +938,11 @@ wheels = [
 ]
 
 [[package]]
+name = "media-core"
+version = "0.1.0"
+source = { git = "https://github.com/gr8monk3ys/media-core?rev=v0.1.0#f50e4e215bb8629368b114939719565baccbb0e8" }
+
+[[package]]
 name = "more-itertools"
 version = "11.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1457,6 +1462,7 @@ dependencies = [
     { name = "greenlet" },
     { name = "httpx" },
     { name = "keyring" },
+    { name = "media-core" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -1487,6 +1493,7 @@ requires-dist = [
     { name = "greenlet", specifier = ">=3.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "keyring", specifier = ">=25.0" },
+    { name = "media-core", git = "https://github.com/gr8monk3ys/media-core?rev=v0.1.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pydantic", specifier = ">=2.0" },

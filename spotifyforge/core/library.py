@@ -5,25 +5,43 @@ directory (written by ``discogs export`` in its own repo); nothing here
 talks to Discogs. Each record is resolved to a Spotify album by an
 artist+title search, and only an *unambiguous* hit is accepted — a
 false match saves a stranger's record to a real account, while a missed
-one only shows up as "no match" in the table. The matching rules are
-copied from ``rym/match.py`` rather than imported: the repos are coupled
-only by the interchange files.
+one only shows up as "no match" in the table. The matching rules come
+from ``media_core.names``, which is where the three hand-kept copies of
+them ended up; only ``_is_plain`` below is this repo's own.
 
 Saving is idempotent (already-saved albums are skipped) and batched.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import tekore
+from media_core.export import ExportError, read_export
+from media_core.names import key, normalise, strip_article
 
 DISCOGS_SCHEMA = "discogs/1"
 BATCH = 20
+
+# `normalise`, `strip_article` and `key` are part of this module's surface even
+# though they now live in media_core: callers and tests import them from here.
+__all__ = [
+    "DISCOGS_SCHEMA",
+    "LibraryFileError",
+    "Match",
+    "OwnedRecord",
+    "find_album",
+    "key",
+    "normalise",
+    "plan",
+    "read_discogs_collection",
+    "save_albums",
+    "saved_status",
+    "strip_article",
+]
 
 
 class LibraryFileError(Exception):
@@ -52,17 +70,14 @@ def read_discogs_collection(path: Path) -> list[OwnedRecord]:
     own, and saving it would make the library say otherwise.
     """
     if not path.exists():
+        # Checked here rather than left to read_export: the useful part of this
+        # message is which command in which repo produces the file, and that is
+        # something only this end of the contract knows.
         raise LibraryFileError(f"{path} does not exist — run `discogs export` first.")
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise LibraryFileError(f"{path} is not valid JSON: {exc}") from exc
-    schema = document.get("schema") if isinstance(document, dict) else None
-    if schema != DISCOGS_SCHEMA:
-        raise LibraryFileError(
-            f"{path} has schema {schema!r}; this command reads {DISCOGS_SCHEMA!r} "
-            "(produced by `discogs export`)."
-        )
+        document = read_export(path, DISCOGS_SCHEMA)
+    except ExportError as exc:
+        raise LibraryFileError(f"{exc} It is produced by `discogs export`.") from exc
 
     records = []
     for item in document.get("collection") or []:
@@ -80,40 +95,18 @@ def read_discogs_collection(path: Path) -> list[OwnedRecord]:
     return records
 
 
-# -- matching (copied from rym/match.py; keep the three copies identical) --
+# -- matching -------------------------------------------------------------
+#
+# ``normalise``, ``strip_article`` and ``key`` are re-exported from
+# ``media_core.names`` rather than defined here. They used to be a verbatim copy
+# kept in step with two other repos by hand, pinned by the golden corpus in
+# ``tests/fixtures/name_normalisation_corpus.json``; the corpus still holds them
+# to exactly the behaviour it did then.
 
-_EDITION = re.compile(
-    r"\s*[\(\[-]\s*("
-    r"deluxe|expanded|remaster|remastered|reissue|anniversary|special|"
-    r"bonus|deluxe edition|super deluxe|legacy|collector|mono|stereo|"
-    r"explicit|clean|international|japan|uk|us"
-    r")\b.*$",
-    re.IGNORECASE,
-)
-_BRACKETS = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*$")
+# Only used by _is_plain, which is this repo's alone: the shared normaliser
+# strips edition noise, and the question here is whether there was any.
 _PUNCT = re.compile(r"[^\w\s]")
 _SPACE = re.compile(r"\s+")
-
-
-def normalise(text: str) -> str:
-    """Strip edition noise, punctuation and casing from a title or artist."""
-    cleaned = _EDITION.sub("", text)
-    cleaned = _BRACKETS.sub("", cleaned)
-    cleaned = _PUNCT.sub(" ", cleaned)
-    return _SPACE.sub(" ", cleaned).strip().casefold()
-
-
-def strip_article(name: str) -> str:
-    """Catalogues file "The Beatles" under Beatles about as often as not."""
-    stripped = normalise(name)
-    for article in ("the ", "a ", "an "):
-        if stripped.startswith(article):
-            return stripped[len(article) :]
-    return stripped
-
-
-def key(artist: str, title: str) -> tuple[str, str]:
-    return (strip_article(artist), normalise(title))
 
 
 def _is_plain(title: str) -> bool:
