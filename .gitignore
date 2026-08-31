@@ -13,3 +13,6 @@ build/
 .venv/
 venv/
 .coverage
+.claude/settings.local.json
+.DS_Store
+.remember/

@@ -28,7 +28,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -40,7 +40,7 @@ from spotifyforge.core.audio_features import AudioFeature, key_distance
 from spotifyforge.core.playlist_manager import extract_isrc
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Collection, Iterable
 
     from tekore import Spotify
 
@@ -83,7 +83,13 @@ _UNKNOWN_TEMPO_GAP = 4
 
 @dataclass
 class CurationTrack:
-    """A liked track reduced to the fields curation decisions need."""
+    """A liked track: what curation decides on, plus album identity.
+
+    Album fields are carried for :mod:`spotifyforge.core.export` rather
+    than for any curation decision — clustering never groups by album.
+    They ride along because the saved-tracks payload already contains
+    them; recovering them later would cost a second library walk.
+    """
 
     id: str
     uri: str
@@ -94,6 +100,12 @@ class CurationTrack:
     popularity: int
     isrc: str | None = None  # global recording id; the key for tempo/key lookups
     genres: tuple[str, ...] = ()
+    # Album identity. Curation itself never groups by album — these exist
+    # so the library can be exported at album level, which is the unit
+    # other platforms (Discogs releases, RYM ratings) are keyed by.
+    album_id: str | None = None
+    album_name: str = ""
+    album_total_tracks: int | None = None
 
 
 @dataclass
@@ -133,6 +145,12 @@ class CurationPlan:
     liked_count: int
     unique_count: int
     specs: list[PlaylistSpec]
+    # Liked songs that reached a playlist. Kept as a field rather than
+    # derived from the specs because those also carry pinned tracks the
+    # user has never heard: counting rows in the catalogue and calling
+    # them placed liked songs reported more songs placed than exist,
+    # and "-4 unplaced".
+    placed_liked_count: int = 0
 
     @property
     def collapsed_count(self) -> int:
@@ -140,8 +158,13 @@ class CurationPlan:
         return self.liked_count - self.unique_count
 
     @property
+    def unplaced_count(self) -> int:
+        """Liked songs in genres too small to fill a playlist."""
+        return self.unique_count - self.placed_liked_count
+
+    @property
     def placed_count(self) -> int:
-        """Distinct songs that landed in at least one playlist."""
+        """Distinct songs in the catalogue, pinned discoveries included."""
         return len({t.id for s in self.specs for t in s.tracks})
 
     @property
@@ -187,7 +210,7 @@ class CurationEngine:
             return out[:max_tracks]
 
         offsets = list(range(_LIKED_PAGE, first.total, _LIKED_PAGE))
-        for page in await _gather_bounded(
+        for page in await gather_bounded(
             [partial(self._sp.saved_tracks, limit=_LIKED_PAGE, offset=o) for o in offsets]
         ):
             if page is not None:
@@ -197,7 +220,26 @@ class CurationEngine:
         return out
 
     async def enrich_genres(self, tracks: list[CurationTrack]) -> list[CurationTrack]:
-        """Fill each track's ``genres`` from its artists (batched, 50/call)."""
+        """Fill each track's ``genres`` from its **primary** artist.
+
+        Spotify tags genres on artists, never on tracks, so a track's
+        genres can only be inherited. Inheriting them from *every*
+        credited artist looked more generous and was the single largest
+        source of wrong placements: a feature drags its own genres onto
+        a song it guests on. Rico Nasty's "Vvgina" landed on an acid
+        techno playlist because Locked Club guests on it; Riot Shift's
+        hardstyle "666" landed on hard techno because its feature
+        carries that tag. Measured over this library, 251 tracks carried
+        a genre their primary artist does not have, and the worst
+        offenders — all multi-artist collaborations — reached nine
+        playlists each.
+
+        A track whose primary artist Spotify has not tagged gets no
+        genres at all rather than borrowing its features'. That is what
+        the unclassified playlists are for, and "we do not know" beats a
+        confident wrong answer on a catalogue whose whole claim is that
+        the genres mean something.
+        """
         artist_ids = sorted({aid for t in tracks for aid in t.artist_ids})
         batches = [
             artist_ids[offset : offset + _ARTIST_BATCH]
@@ -205,17 +247,12 @@ class CurationEngine:
         ]
 
         genres_by_artist: dict[str, tuple[str, ...]] = {}
-        for artists in await _gather_bounded([partial(self._sp.artists, b) for b in batches]):
+        for artists in await gather_bounded([partial(self._sp.artists, b) for b in batches]):
             for artist in artists or ():
                 genres_by_artist[artist.id] = tuple(artist.genres or ())
 
         enriched = [
-            replace(
-                t,
-                genres=_ordered_unique(
-                    g for aid in t.artist_ids for g in genres_by_artist.get(aid, ())
-                ),
-            )
+            replace(t, genres=genres_by_artist.get(t.artist_ids[0], ()) if t.artist_ids else ())
             for t in tracks
         ]
         logger.info(
@@ -227,7 +264,7 @@ class CurationEngine:
         return enriched
 
 
-async def _gather_bounded(factories: list[Any]) -> list[Any]:
+async def gather_bounded(factories: list[Any]) -> list[Any]:
     """Await *factories* concurrently, at most ``_READ_CONCURRENCY`` at once.
 
     Each item is a zero-argument callable returning a fresh coroutine, so
@@ -271,10 +308,11 @@ def _saved_page_to_tracks(paging: Any) -> list[CurationTrack]:
 
 
 def to_curation_track(track: Any) -> CurationTrack:
+    album = track.album
     release_year: int | None = None
-    if track.album is not None and track.album.release_date:
+    if album is not None and album.release_date:
         try:
-            release_year = int(str(track.album.release_date)[:4])
+            release_year = int(str(album.release_date)[:4])
         except ValueError:
             release_year = None
     return CurationTrack(
@@ -286,6 +324,13 @@ def to_curation_track(track: Any) -> CurationTrack:
         release_year=release_year,
         popularity=track.popularity if track.popularity is not None else 0,
         isrc=extract_isrc(track),
+        album_id=album.id if album else None,
+        album_name=(album.name or "") if album else "",
+        # Only ``total_tracks`` is genuinely optional: a LocalAlbum has no
+        # such attribute. Hedging the other two the same way would turn a
+        # model change into 1700 albums silently exported with a null
+        # affinity — the very field consumers are told to rank by.
+        album_total_tracks=getattr(album, "total_tracks", None),
     )
 
 
@@ -354,6 +399,55 @@ def dedupe_versions(tracks: list[CurationTrack]) -> list[CurationTrack]:
 # ---------------------------------------------------------------------------
 
 
+def _genre_affinity(tracks: list[CurationTrack], viable: set[str]) -> dict[tuple[str, str], int]:
+    """How often each pair of viable genres sits on the same track."""
+    affinity: dict[tuple[str, str], int] = defaultdict(int)
+    for t in tracks:
+        carried = [g for g in t.genres if g in viable]
+        for a in carried:
+            for b in carried:
+                if a != b:
+                    affinity[(a, b)] += 1
+    return affinity
+
+
+def _core_genre(
+    candidates: list[str],
+    counts: Counter[str],
+    affinity: dict[tuple[str, str], int],
+) -> str:
+    """The one genre that best describes a track carrying *candidates*.
+
+    Scores each candidate by how much of *its own* membership sits
+    inside the track's other genres. A specific subgenre is almost
+    always co-tagged with its parents, so nearly all of it falls inside
+    the cluster and it scores high; an umbrella like "rock" has most of
+    its tracks outside and scores low. The winner is therefore the
+    tightest genre that still genuinely describes the track — which is
+    also the nichest one that is actually true.
+
+    Normalising by the *sibling's* size instead inverts this and elects
+    the umbrella every time: 15 of 15 slowcore tracks being rock says
+    slowcore is contained in rock, and reads as evidence for "rock".
+
+    Picking the plain *rarest* candidate — the obvious reading of "most
+    niche" — is a different failure. Rarity says how few artists carry a
+    tag, not how well it fits: it filed five Raxeller hard techno tracks
+    under "industrial" (8 tracks library-wide, and their rarest tag) and
+    dissolved the techno playlists altogether. Rarity survives only as
+    the tie-break, where two genres describe the track equally well and
+    the nicher one is the better calling card.
+    """
+
+    def score(genre: str) -> tuple[float, int, str]:
+        containment = sum(
+            affinity[(genre, other)] / counts[genre] for other in candidates if other != genre
+        )
+        return (-containment, counts[genre], genre)
+
+    return min(candidates, key=score)
+
+
 def cluster_library(
     tracks: list[CurationTrack],
     min_size: int = 12,
@@ -361,6 +455,7 @@ def cluster_library(
     exclusive: bool = False,
     include_unclassified: bool = True,
     features: dict[str, AudioFeature] | None = None,
+    discovery_keys: Collection[tuple[str, int | None]] = (),
 ) -> list[PlaylistSpec]:
     """Group tracks into niche playlist specs.
 
@@ -370,8 +465,17 @@ def cluster_library(
     By default a track joins **every** viable genre it carries: a song
     really is both psychedelic rock and neo-psychedelic, and that overlap
     is what turns a few dozen playlists into a few hundred. With
-    *exclusive* it joins only its rarest viable genre, which yields
-    fewer but sharper-edged playlists.
+    *exclusive* it joins only the one genre that best describes it (see
+    :func:`_core_genre`), so no song is ever in two playlists — which
+    also dissolves the near-identical playlists that heavy overlap
+    produces, where four techno lists shared the same five tracks.
+
+    *discovery_keys* names ``(genre, decade)`` pairs to keep as specs
+    even when too few tracks land in them — the playlists that exclusive
+    assignment empties out. They come back with no liked songs at all,
+    for :func:`merge_expansions` to fill with pinned unheard music;
+    :func:`plan_catalogue` drops any that stay under *min_size*, so a
+    live playlist is never reflowed down to nothing.
 
     With *include_unclassified*, tracks that no viable genre claims —
     Spotify tags no genre at all on plenty of small artists — are
@@ -384,13 +488,15 @@ def cluster_library(
     genre_counts: Counter[str] = Counter(g for t in tracks for g in t.genres)
     viable = {g for g, count in genre_counts.items() if count >= min_size}
 
+    affinity = _genre_affinity(tracks, viable) if exclusive else {}
+
     by_genre: dict[str, list[CurationTrack]] = {}
     for t in tracks:
         candidates = [g for g in t.genres if g in viable]
         if not candidates:
             continue
         if exclusive:
-            candidates = [min(candidates, key=lambda g: (genre_counts[g], g))]
+            candidates = [_core_genre(candidates, genre_counts, affinity)]
         for genre in candidates:
             by_genre.setdefault(genre, []).append(t)
 
@@ -404,6 +510,21 @@ def cluster_library(
         for decade, decade_members in _split_by_decade(members):
             if len(decade_members) >= min_size:
                 specs.append(_make_spec(genre, decade, decade_members, features))
+
+    # A genre with enough tracks to be worth a playlist, that exclusive
+    # assignment then left too thin to be one, becomes a discovery spec:
+    # the playlist stays, and expand fills it with music from that niche
+    # the user has never heard. This is what stops the fix from quietly
+    # abandoning a live playlist to the songs it no longer deserves.
+    built = {(s.genre or "", s.decade) for s in specs}
+    assigned = {s.genre for s in specs if s.genre}
+    emptied = {(genre, None) for genre in viable if genre not in assigned}
+    # Sorted only for a stable spec order; the undated key sorts first
+    # rather than blowing up comparing None against a decade.
+    keys = emptied | {k for k in discovery_keys if k[0]}
+    for genre, decade in sorted(keys, key=lambda k: (k[0], -1 if k[1] is None else k[1])):
+        if (genre, decade) not in built:
+            specs.append(_make_spec(genre, decade, [], features))
 
     if include_unclassified:
         placed = {t.id for s in specs for t in s.tracks}
@@ -577,7 +698,21 @@ def _space_artists(tracks: list[CurationTrack]) -> list[CurationTrack]:
 # Naming
 # ---------------------------------------------------------------------------
 
-_TITLE_TEMPLATES = [
+# Naming follows what actually gets followed. A sample of 212 playlists
+# other people own, pulled from Spotify search across sixteen niche
+# genres, says: 67% keep the genre word in the title (it is the strongest
+# thing search indexes), 18% stack sibling genres behind separators, 15%
+# lead with an era or nationality, and the median name is 20 characters
+# and three words. So a title takes the shape its own data supports —
+# stacked when the playlist genuinely spans siblings, era-led when it is
+# a decade split, an atmospheric hook when neither — and always names its
+# genre.
+#
+# The old scheme was eight templates over three hundred playlists, so
+# every phrasing repeated ~38 times. Those templates survive as
+# _LEGACY_TITLE_TEMPLATES purely so ``curate rename`` can find the live
+# playlists it has to rename; nothing else should read them.
+_LEGACY_TITLE_TEMPLATES = [
     "{genre} // late transmissions",
     "strictly {genre}",
     "{genre} for empty rooms",
@@ -588,6 +723,295 @@ _TITLE_TEMPLATES = [
     "{a} {genre} field guide",
 ]
 _UNCLASSIFIED_TITLE = "beyond genre"
+
+# A sibling has to carry a real share of the playlist before it earns
+# billing — stacking a genre that two tracks happen to mention is the
+# keyword-spam version of this pattern, and it misdescribes the mix.
+_PARTNER_SHARE = 0.4
+_MAX_PARTNERS = 2
+# Spotify allows 100 characters, but the sampled median was 20; a stacked
+# title past this reads as a tag dump, so it sheds partners instead.
+_MAX_TITLE = 48
+
+# Atmospheric hooks for playlists with no sibling to stack and no decade
+# to lead with. Grouped by family so a jazz playlist sounds like jazz —
+# the same reasoning as the cover-art scenes. First match wins.
+# Keywords match on word boundaries, never as substrings: "core" inside
+# "score" put film scores in the metal family, and "minimal" inside
+# "minimalism" put Philip Glass in the coldwave one. Compound genres are
+# therefore listed in full ("hardcore punk", not "core").
+_HOOKS: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
+    (
+        ("jazz", "bop", "bebop", "swing", "bossa nova", "dixieland"),
+        (
+            "{genre} after the last set",
+            "the {genre} smoke room",
+            "{genre} at 3am",
+            "blue hour {genre}",
+            "{genre} on a slow night",
+        ),
+    ),
+    (
+        (
+            "techno",
+            "house",
+            "rave",
+            "edm",
+            "electro",
+            "club",
+            "trance",
+            "dance",
+            "gabber",
+            "tekno",
+            "dubstep",
+            "riddim",
+            "drum and bass",
+            "jungle",
+            "footwork",
+            "juke",
+            "breakcore",
+            "speedcore",
+            "hardcore techno",
+        ),
+        (
+            "{genre} until the lights",
+            "concrete {genre}",
+            "{genre} for the long room",
+            "{genre}, no encore",
+            "6am {genre}",
+        ),
+    ),
+    (
+        ("ambient", "drone", "new age", "field recordings", "minimalism"),
+        (
+            "{genre} for empty rooms",
+            "{genre}, no hurry",
+            "the {genre} long view",
+            "{genre} at low tide",
+        ),
+    ),
+    (
+        (
+            "metal",
+            "metalcore",
+            "mathcore",
+            "hardcore",
+            "hardcore punk",
+            "punk",
+            "grindcore",
+            "sludge",
+            "doom",
+            "screamo",
+            "deathstep",
+            "trap metal",
+        ),
+        ("{genre}, no apologies", "heavy {genre}", "{genre} at full volume", "the {genre} pit"),
+    ),
+    (
+        ("hip hop", "rap", "trap", "drill", "grime", "boom bap", "horrorcore"),
+        (
+            "{genre}, dust and vinyl",
+            "the {genre} basement",
+            "{genre} on tape",
+            "{genre} after midnight",
+        ),
+    ),
+    (
+        ("folk", "country", "americana", "bluegrass", "singer"),
+        (
+            "{genre} at the treeline",
+            "{genre}, porch light on",
+            "back road {genre}",
+            "{genre} in the morning",
+        ),
+    ),
+    (
+        ("afrobeat", "afrobeats", "amapiano", "highlife", "afro r&b", "alté", "gqom"),
+        (
+            "{genre} after dark",
+            "{genre}, sun and dust",
+            "the {genre} hours",
+            "{genre} on the corner",
+        ),
+    ),
+    (
+        (
+            "latin",
+            "reggaeton",
+            "salsa",
+            "cumbia",
+            "bolero",
+            "tango",
+            "trova",
+            "mpb",
+            "samba",
+            "bachata",
+            "chicha",
+            "soca",
+            "candombe",
+            "ranchera",
+            "bossa",
+        ),
+        (
+            "{genre} after dark",
+            "{genre}, sun and shade",
+            "the {genre} hours",
+            "{genre} on the corner",
+        ),
+    ),
+    (
+        ("soul", "r&b", "funk", "disco", "motown"),
+        ("{genre}, lights low", "the {genre} groove", "{genre} on 45", "slow {genre}"),
+    ),
+    (
+        (
+            "psychedelic",
+            "neo-psychedelic",
+            "shoegaze",
+            "dream pop",
+            "space rock",
+            "krautrock",
+            "acid rock",
+        ),
+        (
+            "{genre} in slow collapse",
+            "{genre}, dissolved",
+            "the {genre} haze",
+            "{genre} underwater",
+        ),
+    ),
+    (
+        (
+            "coldwave",
+            "darkwave",
+            "new wave",
+            "minimal wave",
+            "synthpop",
+            "synthwave",
+            "goth",
+            "gothic rock",
+            "deathrock",
+            "industrial",
+            "ebm",
+            "post-punk",
+        ),
+        (
+            "{genre} after dark",
+            "{genre} and streetlight",
+            "{genre}, concrete and neon",
+            "the {genre} winter",
+        ),
+    ),
+    (
+        ("dungeon synth", "medieval folk", "neofolk", "ritual", "gregorian chant"),
+        (
+            "{genre} for long winters",
+            "{genre} by candle",
+            "the {genre} keep",
+            "{genre}, moss and stone",
+        ),
+    ),
+    (
+        (
+            "library music",
+            "musique concrete",
+            "tape music",
+            "noise",
+            "japanoise",
+            "avant-garde",
+            "experimental",
+            "score",
+            "soundtrack",
+            "sound collage",
+        ),
+        (
+            "{genre}, reel to reel",
+            "the {genre} archive",
+            "found {genre}",
+            "{genre} in the wrong room",
+        ),
+    ),
+    (
+        ("rock", "indie", "garage", "emo", "grunge", "britpop", "madchester"),
+        (
+            "{genre}, loud and early",
+            "the {genre} basement",
+            "{genre} on rotation",
+            "{genre} after hours",
+        ),
+    ),
+    (
+        ("pop", "bedroom pop", "hyperpop", "city pop", "art pop"),
+        (
+            "{genre}, quietly",
+            "{genre} at the end of the night",
+            "the {genre} hours",
+            "{genre} on repeat",
+        ),
+    ),
+]
+_DEFAULT_HOOKS = (
+    "{genre}, quietly",
+    "the {genre} hours",
+    "{genre} in the margins",
+    "a room of {genre}",
+    "{genre}, unfiled",
+    "deep {genre}",
+)
+
+
+def _partner_genres(genre: str, tracks: list[CurationTrack]) -> list[str]:
+    """Sibling genres carried by enough of *tracks* to deserve billing."""
+    if not tracks:
+        return []
+    counts = Counter(g for t in tracks for g in t.genres if g != genre)
+    floor = max(2, round(len(tracks) * _PARTNER_SHARE))
+    return [g for g, n in counts.most_common(_MAX_PARTNERS) if n >= floor]
+
+
+def _hook_title(genre: str) -> str:
+    """A stable atmospheric title, flavoured by the genre's family."""
+    pool: tuple[str, ...] = _DEFAULT_HOOKS
+    for keywords, hooks in _HOOKS:
+        if any(re.search(rf"\b{re.escape(k)}\b", genre) for k in keywords):
+            pool = hooks
+            break
+    return pool[hashlib.sha256(genre.encode()).digest()[0] % len(pool)].format(genre=genre)
+
+
+def title_for(genre: str | None, decade: int | None, tracks: list[CurationTrack]) -> str:
+    """The playlist's name: stacked, era-led, or hooked — always genre-named."""
+    if genre is None:
+        return f"{_UNCLASSIFIED_TITLE} ('{decade % 100:02d}s)" if decade else _UNCLASSIFIED_TITLE
+    if decade:
+        # Real curators lead with the era ("70s spiritual jazz"); the old
+        # trailing "('70s)" read as a footnote rather than a hook.
+        return f"{decade % 100:02d}s {genre}"
+    partners = _partner_genres(genre, tracks)
+    while partners:
+        stacked = " | ".join([genre, *partners])
+        if len(stacked) <= _MAX_TITLE:
+            return stacked
+        partners.pop()
+    return _hook_title(genre)
+
+
+def legacy_title(genre: str | None, decade: int | None) -> str:
+    """What :func:`title_for` would have produced before the rename.
+
+    ``curate rename`` finds live playlists by this name; nothing else
+    should depend on it.
+    """
+    if genre is None:
+        title = _UNCLASSIFIED_TITLE
+    else:
+        template = _LEGACY_TITLE_TEMPLATES[
+            sum(ord(c) for c in genre) % len(_LEGACY_TITLE_TEMPLATES)
+        ]
+        article = "an" if genre[:1].lower() in "aeiou" else "a"
+        title = template.format(genre=genre, a=article)
+    return f"{title} ('{decade % 100:02d}s)" if decade else title
+
 
 # The description is the only text besides the name that Spotify's search
 # indexes, and artist names are what searchers actually type — so every
@@ -663,18 +1087,9 @@ def _make_spec(
     members: list[CurationTrack],
     features: dict[str, AudioFeature] | None = None,
 ) -> PlaylistSpec:
-    if genre is None:
-        title = _UNCLASSIFIED_TITLE
-    else:
-        # Deterministic template choice so re-runs produce the same names.
-        template = _TITLE_TEMPLATES[sum(ord(c) for c in genre) % len(_TITLE_TEMPLATES)]
-        article = "an" if genre[:1].lower() in "aeiou" else "a"
-        title = template.format(genre=genre, a=article)
-    if decade:
-        title = f"{title} ('{decade % 100:02d}s)"
     ordered, ordering = order_with_mode(members, features)
     return PlaylistSpec(
-        title=title,
+        title=title_for(genre, decade, ordered),
         description=_describe(genre, decade, ordered, ordering),
         genre=genre,
         decade=decade,
@@ -726,6 +1141,19 @@ def merge_expansions(
     return merged
 
 
+def writable_specs(specs: list[PlaylistSpec], min_size: int) -> list[PlaylistSpec]:
+    """The specs solid enough to write to Spotify.
+
+    A discovery spec starts empty and is only worth a playlist once
+    ``expand`` has pinned enough unheard tracks to fill it. It has to
+    stay in the plan so expand can find it at all, which is exactly why
+    the write paths — and only the write paths — drop it: reflow must
+    never replace a live playlist's songs with three of them, and forge
+    must not create a playlist that thin.
+    """
+    return [spec for spec in specs if len(spec.tracks) >= min_size]
+
+
 async def plan_catalogue(
     spotify: Spotify,
     opts: CurationOptions,
@@ -749,9 +1177,16 @@ async def plan_catalogue(
         max_size=opts.max_size,
         exclusive=opts.exclusive,
         features=features,
+        discovery_keys=tuple(expansions or ()),
     )
     specs = merge_expansions(specs, expansions, features)
-    return CurationPlan(liked_count=len(liked), unique_count=len(unique), specs=specs)
+    in_catalogue = {t.id for s in specs for t in s.tracks}
+    return CurationPlan(
+        liked_count=len(liked),
+        unique_count=len(unique),
+        specs=specs,
+        placed_liked_count=len({t.id for t in unique} & in_catalogue),
+    )
 
 
 async def forge_next(

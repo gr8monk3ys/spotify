@@ -101,7 +101,7 @@ ignore_missing_imports = true
 module = [
     "spotifyforge.db.repositories",
     "spotifyforge.db.engine",
-    "spotifyforge.cli.app",
+    "spotifyforge.cli.*",
     "spotifyforge.core.playlist_manager",
     "spotifyforge.core.scheduler",
     "spotifyforge.core.clients",

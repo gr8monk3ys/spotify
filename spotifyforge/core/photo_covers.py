@@ -50,9 +50,19 @@ _UPLOAD_DELAY = 1.0  # one write per second, same pacing as forge
 
 # Alt text that signals a person in frame. Empty alt is allowed — it
 # proves nothing either way.
+#
+# The list is long because the short version leaked. Eight covers got
+# through on a word it did not name: "male" (which "man" does not match
+# under a word boundary), and "figure", "arm", "hand", "dancer",
+# "adults", "photographer". Pexels alt text describes people in whatever
+# noun fits, so this errs wide — a false positive costs one re-roll from
+# a pool of eighty candidates, while a false negative puts a stranger's
+# face on a public playlist and stays there.
 _PEOPLE = re.compile(
-    r"\b(person|people|man|men|woman|women|girl|boy|portrait|model|face|"
-    r"couple|bride|groom|lady|guy|child|kid|selfie|crowd)\b",
+    r"\b(person|people|man|men|male|woman|women|female|girl|boy|portrait|model|"
+    r"face|couple|bride|groom|lady|guy|child|children|kid|kids|selfie|crowd|"
+    r"adult|adults|figure|silhouette|dancer|dancing|photographer|"
+    r"hand|hands|arm|arms|leg|legs|shoulder|hair|skin|torso|body)\b",
     re.IGNORECASE,
 )
 
@@ -193,6 +203,26 @@ def _eligible(photo: dict[str, Any], used: set[Any]) -> bool:
     if photo.get("id") in used:
         return False
     return not _PEOPLE.search(photo.get("alt") or "")
+
+
+def drop_person_picks(path: Path | None = None) -> list[str]:
+    """Forget every pinned pick whose alt text names a person.
+
+    Widening :data:`_PEOPLE` only changes what *future* picks accept;
+    the covers already uploaded stay until their pick is forgotten and
+    re-chosen. Dropping the pick is enough to re-roll it: ``choose_photo``
+    walks the same title-hashed pool and now skips the photo it settled
+    on before, so only the offending playlists move and every other
+    cover stays exactly as it was.
+    """
+    picks = load_picks(path)
+    flagged = [title for title, pick in picks.items() if _PEOPLE.search(pick.get("alt") or "")]
+    if flagged:
+        for title in flagged:
+            del picks[title]
+        save_picks(picks, path)
+    logger.info("Dropped %d cover pick(s) showing a person", len(flagged))
+    return flagged
 
 
 async def choose_photo(

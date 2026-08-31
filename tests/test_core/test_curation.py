@@ -8,6 +8,7 @@ functions tested directly.
 from __future__ import annotations
 
 import html
+from collections import Counter
 from dataclasses import replace
 
 import pytest
@@ -25,6 +26,7 @@ from spotifyforge.core.curation import (
     order_for_flow,
     plan_catalogue,
     reflow,
+    writable_specs,
 )
 from spotifyforge.models.models import Playlist
 
@@ -95,6 +97,46 @@ async def test_enrich_genres_batches_artists(fake_spotify, client_for):
     assert tracks[1].genres == ("slowcore",)
     # 60 unique artists at 50/batch = 2 GET /v1/artists calls.
     assert len([r for r in fake_spotify.requests if r == ("GET", "/v1/artists")]) == 2
+
+
+async def test_a_guest_artist_does_not_lend_its_genres_to_the_song(fake_spotify, client_for):
+    """The real defect: Rico Nasty's "Vvgina" sat on an acid techno
+    playlist because Locked Club guests on it. Genres describe the act
+    whose song it is, not everyone who turned up on it."""
+    fake_spotify.add_user("user1")
+    fake_spotify.add_track(
+        "t1", artist_id="rico", artist_name="Rico Nasty", featured=[("locked", "Locked Club")]
+    )
+    fake_spotify.save_track("user1", "t1")
+    fake_spotify.set_artist_genres("rico", ["trap", "hip hop"])
+    fake_spotify.set_artist_genres("locked", ["acid techno"])
+
+    engine = CurationEngine(client_for("user1"))
+    tracks = await engine.enrich_genres(await engine.fetch_liked())
+
+    assert tracks[0].genres == ("trap", "hip hop")
+
+
+async def test_an_untagged_primary_borrows_nothing_from_its_guests(fake_spotify, client_for):
+    """Jack Ü carries no genre tag, so "Holla Out" inherited all five of
+    its guests' and reached nine playlists. Unclassified is the honest
+    answer."""
+    fake_spotify.add_user("user1")
+    fake_spotify.add_track(
+        "t1",
+        artist_id="jackU",
+        artist_name="Jack U",
+        featured=[("skrillex", "Skrillex"), ("diplo", "Diplo")],
+    )
+    fake_spotify.save_track("user1", "t1")
+    fake_spotify.set_artist_genres("jackU", [])
+    fake_spotify.set_artist_genres("skrillex", ["dubstep", "edm"])
+    fake_spotify.set_artist_genres("diplo", ["moombahton"])
+
+    engine = CurationEngine(client_for("user1"))
+    tracks = await engine.enrich_genres(await engine.fetch_liked())
+
+    assert tracks[0].genres == ()
 
 
 async def test_enrich_keeps_empty_genres_empty(fake_spotify, client_for):
@@ -194,9 +236,10 @@ def test_dedupe_then_cluster_drops_the_duplicate_from_the_playlist():
 # ---------------------------------------------------------------------------
 
 
-def test_exclusive_assigns_track_to_rarest_genre():
-    # 20 plain rock tracks, plus 15 tagged both rock and slowcore:
-    # the dual-tagged ones must land in slowcore (the rarer label).
+def test_exclusive_files_a_track_under_the_specific_genre_not_the_umbrella():
+    # 20 plain rock tracks, plus 15 tagged both rock and slowcore: the
+    # dual-tagged ones belong in slowcore. All of slowcore is inside the
+    # pair, only some of rock is, so slowcore is the tighter description.
     tracks = [_ct(f"r{i}", genres=("rock",)) for i in range(20)]
     tracks += [_ct(f"s{i}", genres=("rock", "slowcore")) for i in range(15)]
 
@@ -206,6 +249,95 @@ def test_exclusive_assigns_track_to_rarest_genre():
     assert set(by_genre) == {"rock", "slowcore"}
     assert len(by_genre["slowcore"].tracks) == 15
     assert len(by_genre["rock"].tracks) == 20
+
+
+def test_exclusive_ignores_a_rare_tag_that_does_not_describe_the_cluster():
+    """The bug the rarest-genre rule caused: five hard techno tracks
+    filed under "industrial" purely because it was their rarest tag."""
+    # A tight techno cluster, all six tracks carrying both labels...
+    tracks = [_ct(f"h{i}", genres=("hard techno", "techno")) for i in range(6)]
+    # ...plus an industrial scene that only half-overlaps it.
+    tracks += [_ct(f"x{i}", genres=("hard techno", "techno", "industrial")) for i in range(4)]
+    tracks += [_ct(f"i{i}", genres=("industrial",)) for i in range(6)]
+
+    by_genre = {s.genre: s for s in cluster_library(tracks, min_size=4, exclusive=True)}
+
+    assert "hard techno" in by_genre
+    # The four dual-tagged tracks stay with techno; industrial keeps its own.
+    assert len(by_genre["hard techno"].tracks) == 10
+    assert len(by_genre["industrial"].tracks) == 6
+
+
+def test_exclusive_never_puts_a_song_in_two_playlists():
+    """The whole point: four near-identical techno playlists shared the
+    same five tracks, and that is what the account showed."""
+    tracks = [
+        _ct(f"t{i}", genres=("hard techno", "techno", "tekno", "acid techno", "industrial"))
+        for i in range(20)
+    ]
+    specs = cluster_library(tracks, min_size=4, exclusive=True)
+
+    placements = Counter(t.id for s in specs for t in s.tracks)
+    assert placements and max(placements.values()) == 1
+
+
+def test_a_genre_exclusive_assignment_emptied_stays_as_a_discovery_spec():
+    """It had enough tracks to deserve a playlist and lost them to a
+    tighter label. The playlist stays so expand can fill it with unheard
+    music, rather than being abandoned holding other playlists' songs."""
+    # "rock" is carried by 12 tracks, so it is viable — but every one of
+    # them files under the tighter label it also carries.
+    tracks = [_ct(f"s{i}", genres=("rock", "slowcore")) for i in range(6)]
+    tracks += [_ct(f"h{i}", genres=("rock", "shoegaze")) for i in range(6)]
+
+    specs = cluster_library(tracks, min_size=4, exclusive=True)
+    by_genre = {s.genre: s for s in specs}
+
+    assert len(by_genre["slowcore"].tracks) == 6
+    assert len(by_genre["shoegaze"].tracks) == 6
+    assert by_genre["rock"].tracks == []  # kept, empty, awaiting pins
+
+
+def test_shared_clustering_produces_no_empty_specs():
+    tracks = [_ct(f"s{i}", genres=("rock", "slowcore")) for i in range(6)]
+
+    specs = cluster_library(tracks, min_size=4, exclusive=False)
+
+    assert all(s.tracks for s in specs)
+
+
+def test_discovery_keys_mix_dated_and_undated_without_comparing_them():
+    """Real pins carry both, and sorting them together compared None to
+    an int — every plan died before it reached the caller."""
+    tracks = [_ct(f"t{i}", genres=("shoegaze",)) for i in range(10)]
+
+    specs = cluster_library(
+        tracks,
+        min_size=4,
+        exclusive=True,
+        discovery_keys=[("gabber", 1990), ("gabber", None), ("zeuhl", 1970)],
+    )
+
+    assert {(s.genre, s.decade) for s in specs} >= {
+        ("gabber", 1990),
+        ("gabber", None),
+        ("zeuhl", 1970),
+    }
+
+
+def test_discovery_keys_come_back_empty_for_expansions_to_fill():
+    tracks = [_ct(f"t{i}", genres=("shoegaze",)) for i in range(10)]
+
+    specs = cluster_library(
+        tracks, min_size=4, exclusive=True, discovery_keys=[("gabber", None), ("shoegaze", None)]
+    )
+    by_genre = {s.genre: s for s in specs}
+
+    # shoegaze already had a spec and is not duplicated; gabber is new
+    # and empty, waiting on pinned tracks.
+    assert len(by_genre["shoegaze"].tracks) == 10
+    assert by_genre["gabber"].tracks == []
+    assert sum(1 for s in specs if s.genre == "shoegaze") == 1
 
 
 def test_overlap_puts_a_track_in_every_viable_genre():
@@ -281,7 +413,9 @@ def test_cluster_splits_oversized_genre_by_decade():
 
     specs = cluster_library(tracks, min_size=10, max_size=80)
     assert {s.decade for s in specs} == {1990, 2020}
-    assert all("'" in s.title for s in specs)  # era shows in the name
+    # The era leads the name, the way followed playlists write it
+    # ("70s spiritual jazz"), rather than trailing as a parenthetical.
+    assert {s.title for s in specs} == {"90s shoegaze", "20s shoegaze"}
     assert all(len(s.tracks) == 50 for s in specs)
 
 
@@ -445,6 +579,33 @@ async def test_plan_catalogue_reports_collapse_and_placement(fake_spotify, clien
     assert plan.specs
     assert plan.placed_count <= plan.unique_count
     assert plan.entry_count == sum(len(s.tracks) for s in plan.specs)
+
+
+async def test_a_discovery_playlist_is_written_only_once_its_pins_fill_it(fake_spotify, client_for):
+    """A genre that exclusive assignment emptied stays in the plan so
+    expand can find it, and reaches Spotify only once its pinned unheard
+    tracks fill it. Reflow must never write an empty tracklist over a
+    live playlist that still has songs on it."""
+    _seed_library(fake_spotify, genres=("coldwave",), count=20)
+    pins = {
+        ("gabber", None): [_ct(f"p{i}", genres=("gabber",)) for i in range(6)],
+        ("zeuhl", None): [_ct("p9", genres=("zeuhl",))],
+    }
+
+    plan = await plan_catalogue(client_for("user1"), CurationOptions(min_size=4), expansions=pins)
+    planned = {s.genre: s for s in plan.specs}
+    writable = {s.genre: s for s in writable_specs(plan.specs, min_size=4)}
+
+    # Both stay in the plan — expand has to be able to find them.
+    assert len(planned["gabber"].tracks) == 6
+    assert len(planned["zeuhl"].tracks) == 1
+    # Only the filled one is written; one pin is not a playlist.
+    assert "gabber" in writable
+    assert "zeuhl" not in writable
+    # Pinned tracks are not liked songs, so they must not be counted as
+    # liked songs that found a home.
+    assert plan.placed_liked_count <= plan.unique_count
+    assert plan.unplaced_count >= 0
 
 
 async def test_plan_splits_a_large_genre_by_decade(fake_spotify, client_for):

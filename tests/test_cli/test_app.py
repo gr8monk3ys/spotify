@@ -842,3 +842,139 @@ class TestEndToEndFlow:
         result = runner.invoke(app, ["schedule", "list"])
         assert result.exit_code == 1
         assert "Not logged in" in result.stderr
+
+
+class TestScopeErrors:
+    def test_a_scope_the_saved_token_lacks_says_to_re_authorise(self, cli_env, monkeypatch):
+        """A saved token carries the scopes it was granted, so adding one
+        to REQUIRED_SCOPES leaves every existing token short. Spotify
+        answers with the offending URL and nothing actionable, which is
+        what `curate follow-artists` showed on the real account."""
+        fake = cli_env
+        _login(fake)
+        # Two liked songs by one artist, so there is a candidate to check
+        # and the command actually reaches /v1/me/following.
+        for i in range(2):
+            fake.add_track(f"t{i}", artist_id="stott", artist_name="Andy Stott")
+            fake.save_track("user1", f"t{i}")
+
+        import httpx
+
+        original = fake.handler
+
+        def deny_following(request: httpx.Request):
+            if "/v1/me/following" in str(request.url):
+                return httpx.Response(
+                    403,
+                    json={"error": {"status": 403, "message": "Insufficient client scope"}},
+                )
+            return original(request)
+
+        monkeypatch.setattr(fake, "handler", deny_following)
+
+        result = runner.invoke(app, ["curate", "follow-artists"])
+
+        assert result.exit_code == 1
+        assert "auth login" in result.stderr
+        assert "Re-authorisation needed" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Library
+# ---------------------------------------------------------------------------
+
+
+class TestLibrarySave:
+    @staticmethod
+    def _discogs_file(tmp_path):
+        from tests.test_core.test_library import FIXTURE
+
+        path = tmp_path / "discogs.json"
+        path.write_text(json.dumps(FIXTURE), encoding="utf-8")
+        return path
+
+    def _seed(self, fake):
+        _login(fake)
+        fake.add_album("alb_utero", "In Utero", "nirv", "Nirvana")
+        fake.saved_albums["user1"] = []
+        # Kid A is deliberately absent: one match, one "no match".
+
+    def test_dry_run_lists_matches_and_saves_nothing(self, cli_env, tmp_path):
+        fake = cli_env
+        self._seed(fake)
+
+        result = runner.invoke(
+            app, ["library", "save", "--from-discogs", "--file", str(self._discogs_file(tmp_path))]
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert "In Utero" in result.output
+        assert "no match" in result.output
+        assert "would save" in result.output
+        assert fake.saved_albums["user1"] == []
+        assert not [p for m, p in fake.requests if m == "PUT" and p == "/v1/me/albums"]
+
+    def test_apply_saves_the_unsaved_matches(self, cli_env, tmp_path):
+        fake = cli_env
+        self._seed(fake)
+
+        result = runner.invoke(
+            app,
+            [
+                "library",
+                "save",
+                "--from-discogs",
+                "--file",
+                str(self._discogs_file(tmp_path)),
+                "--apply",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert fake.saved_albums["user1"] == ["alb_utero"]
+        assert "Saved 1" in result.output
+
+    def test_already_saved_albums_are_reported_not_resaved(self, cli_env, tmp_path):
+        fake = cli_env
+        self._seed(fake)
+        fake.saved_albums["user1"] = ["alb_utero"]
+
+        result = runner.invoke(
+            app,
+            [
+                "library",
+                "save",
+                "--from-discogs",
+                "--file",
+                str(self._discogs_file(tmp_path)),
+                "--apply",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert "already saved" in result.output
+        assert not [p for m, p in fake.requests if m == "PUT" and p == "/v1/me/albums"]
+
+    def test_missing_file_exits_2_and_names_discogs_export(self, cli_env, tmp_path):
+        fake = cli_env
+        _login(fake)
+
+        result = runner.invoke(
+            app, ["library", "save", "--from-discogs", "--file", str(tmp_path / "none.json")]
+        )
+
+        assert result.exit_code == 2
+        assert "discogs export" in result.stderr
+
+    def test_default_file_is_discogs_json_in_music_dir(self, cli_env, tmp_path, monkeypatch):
+        from spotifyforge.config import settings
+
+        fake = cli_env
+        self._seed(fake)
+        monkeypatch.setattr(settings, "music_dir", tmp_path)
+        self._discogs_file(tmp_path)
+
+        result = runner.invoke(app, ["library", "save", "--from-discogs"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "In Utero" in result.output
