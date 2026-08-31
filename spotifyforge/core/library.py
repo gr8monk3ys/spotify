@@ -14,14 +14,13 @@ Saving is idempotent (already-saved albums are skipped) and batched.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import tekore
 from media_core.export import ExportError, read_export
-from media_core.names import key, normalise, strip_article
+from media_core.names import fold, key, normalise, strip_article
 
 DISCOGS_SCHEMA = "discogs/1"
 BATCH = 20
@@ -103,15 +102,17 @@ def read_discogs_collection(path: Path) -> list[OwnedRecord]:
 # ``tests/fixtures/name_normalisation_corpus.json``; the corpus still holds them
 # to exactly the behaviour it did then.
 
-# Only used by _is_plain, which is this repo's alone: the shared normaliser
-# strips edition noise, and the question here is whether there was any.
-_PUNCT = re.compile(r"[^\w\s]")
-_SPACE = re.compile(r"\s+")
-
 
 def _is_plain(title: str) -> bool:
-    """True when *title* carries no edition noise — the canonical release."""
-    return _SPACE.sub(" ", _PUNCT.sub(" ", title)).strip().casefold() == normalise(title)
+    """True when *title* carries no edition noise — the canonical release.
+
+    ``fold`` is ``normalise`` without the edition-stripping, so the two agree
+    exactly when there was nothing to strip. Both halves come from
+    ``media_core.names``: this used to re-derive the ``fold`` half from private
+    copies of that module's regexes, which left one invariant spanning a package
+    boundary with nothing keeping the two sides in step.
+    """
+    return fold(title) == normalise(title)
 
 
 async def find_album(sp: tekore.Spotify, record: OwnedRecord) -> Match:
