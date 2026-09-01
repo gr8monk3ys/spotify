@@ -27,6 +27,11 @@ The ``schema`` field is the compatibility contract. Nothing here reads
 the file back — the consumers live in other repos and parse it with
 plain ``json`` — so they own the version check, and the string is the
 only thing that tells them a future export is not theirs to read.
+
+The envelope round the albums (``schema``, ``generated_at``, the sections
+in order) and the atomic write are ``media_core.export``: five repos had
+written the same two functions under the same two names. The rows are
+still built here, because building them needs this account.
 """
 
 from __future__ import annotations
@@ -34,6 +39,9 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from typing import TYPE_CHECKING, Any
+
+from media_core.export import build_export
+from media_core.export import write_export as _write_envelope
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -46,11 +54,16 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = "music-library/1"
 
+# This repo writes the compact form: no indentation, ASCII-escaped, no trailing
+# newline. media_core defaults to the indented form the other tools use, so the
+# choice is passed explicitly and the file's bytes do not move.
+_JSON_STYLE: dict[str, Any] = {"indent": None, "ensure_ascii": True, "newline": False}
+
 
 def export_path() -> Path:
     """Where the interchange file lives: ``<music_dir>/music-library.json``.
 
-    ``music_dir`` is the directory the discogs and rym repos read from too
+    ``music_dir`` is the directory the other collection tools read from too
     (``MUSIC_DIR``, default ``~/.music``).
     """
     from spotifyforge.config import settings
@@ -137,25 +150,25 @@ def build_library_export(
         logger.info("%d liked track(s) carried no album and were skipped", skipped)
     logger.info("Exported %d album(s), %d discovered niche(s)", len(albums), len(discoveries))
 
-    return {
-        "schema": SCHEMA,
-        "generated_at": generated_at,
-        "source": {"platform": "spotify", "user": user_id},
-        "albums": albums,
-        "discoveries": discoveries,
-    }
+    # `source` is passed as a section rather than as media_core's `username`:
+    # this export names the platform beside the user, which the file-per-account
+    # exports do not, so it keeps its own shape in its own position.
+    return build_export(
+        SCHEMA,
+        generated_at,
+        source={"platform": "spotify", "user": user_id},
+        albums=albums,
+        discoveries=discoveries,
+    )
 
 
 def write_export(document: dict[str, Any], path: Path | None = None) -> Path:
     """Write *document* out atomically and return where it landed."""
-    from spotifyforge.config import write_json_atomic
-
-    target = path or export_path()
-    write_json_atomic(target, document)
+    target = _write_envelope(document, path or export_path(), **_JSON_STYLE)
     if path is None:
         # Consumers still on the old path (~/.spotifyforge/music-library.json)
         # keep reading a fresh file; remove after 2026-10.
         legacy = legacy_export_path()
         if legacy != target:
-            write_json_atomic(legacy, document)
+            _write_envelope(document, legacy, **_JSON_STYLE)
     return target

@@ -14,6 +14,7 @@ from spotifyforge.core.library import (
     DISCOGS_SCHEMA,
     LibraryFileError,
     OwnedRecord,
+    _is_plain,
     find_album,
     key,
     normalise,
@@ -93,6 +94,54 @@ def test_normalisation_strips_edition_noise_and_articles():
     assert normalise("In Utero (Deluxe Edition)") == "in utero"
     assert normalise("OK Computer - Remastered 2011") == "ok computer"
     assert key("The Beatles", "Abbey Road") == ("beatles", "abbey road")
+
+
+# `_is_plain` is how find_album picks the canonical release out of several
+# editions of one record, and it holds an invariant that spans a package
+# boundary: it is true exactly when `media_core.names.fold` and `normalise`
+# agree, i.e. when there was no edition noise for `normalise` to strip. Nothing
+# in media-core knows this repo asks that question, so it is pinned here.
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "In Utero",
+        "Sgt. Pepper's Lonely Hearts Club Band",  # punctuation is not edition noise
+        "Untitled #23",  # nor is a symbol
+        "Kid A",
+        "The The",
+    ],
+)
+def test_is_plain_accepts_a_title_with_no_edition_noise(title):
+    assert _is_plain(title) is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "In Utero (Deluxe Edition)",
+        "OK Computer - Remastered 2011",
+        "Blonde on Blonde [Mono]",
+        "Nevermind - Super Deluxe",
+        "Illmatic (Explicit)",
+    ],
+)
+def test_is_plain_rejects_a_decorated_edition(title):
+    assert _is_plain(title) is False
+
+
+def test_is_plain_is_exactly_the_fold_equals_normalise_identity():
+    """The invariant itself, stated against media-core's own two functions.
+
+    If a future media-core changes `fold` or `normalise` independently, this is
+    what catches it — the parametrized cases above would still pass while
+    `find_album` silently started preferring the wrong edition.
+    """
+    from media_core.names import fold
+
+    for title in ("In Utero", "In Utero (Deluxe Edition)", "Loveless (Remastered)", "AM", ""):
+        assert _is_plain(title) == (fold(title) == normalise(title))
 
 
 def _record(artist="Nirvana", title="In Utero"):

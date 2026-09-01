@@ -2,6 +2,11 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+# media-core is a git dependency (see [project].dependencies) rather than a
+# PyPI release; hatchling refuses direct references without this.
+allow-direct-references = true
+
 [project]
 name = "spotifyforge"
 version = "0.1.0"
@@ -10,6 +15,11 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
+    # The name-matching rules, the shared ~/.music path and the export
+    # envelope, extracted from the three repos that were keeping copies of
+    # them identical by hand. Pinned to a tag: a change to normalisation is a
+    # change to which record matches which, and it should arrive deliberately.
+    "media-core @ git+https://github.com/gr8monk3ys/media-core@v0.1.1",
     "tekore>=5.0,<7.0",
     "sqlmodel>=0.0.14",
     "typer>=0.12",
