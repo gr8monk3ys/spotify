@@ -68,19 +68,28 @@ def _make_auth():
         _error_panel(str(exc), title="Configuration Error")
 
 
+# A run must start with at least this much token life left. Sized to
+# the longest command (a full-catalogue covers or reflow pass), not to
+# tekore's is_expiring (<60s) — a bulk run that starts with eight
+# minutes remaining dies 401 halfway through with its work unsaved.
+_TOKEN_HEADROOM_SECONDS = 45 * 60
+
+
 def _load_token(auth: Any, spotify_user_id: str) -> tekore.Token:
-    """Load (and refresh if expiring) the stored token for a user.
+    """Load the stored token, refreshed unless it can outlast a bulk run.
 
     A refreshed token is persisted to both the keyring and the local DB
     row — scheduled jobs authenticate from the DB, so it must not go stale.
     """
     token = auth.token_store.load_token(spotify_user_id)
-    if token.is_expiring:
-        if not token.refresh_token:
-            raise RuntimeError("Stored token expired with no refresh token; log in again.")
+    if token.expires_in >= _TOKEN_HEADROOM_SECONDS:
+        return token
+    if token.refresh_token:
         token = auth.credentials.refresh_user_token(token.refresh_token)
         auth.token_store.save_token(spotify_user_id, token)
         _persist_tokens_to_db(spotify_user_id, token)
+    elif token.is_expiring:
+        raise RuntimeError("Stored token expired with no refresh token; log in again.")
     return token
 
 

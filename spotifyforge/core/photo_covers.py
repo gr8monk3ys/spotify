@@ -32,7 +32,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 
 from spotifyforge.core.covers import encode_jpeg
 
@@ -142,10 +142,18 @@ class RateLimitedError(Exception):
     """Pexels said stop for now; progress so far is saved."""
 
 
+# Transient-failure backoff. A bulk run without this lost 250 covers to
+# one bad network stretch: tekore retries the Spotify side, but every
+# Pexels ReadError was failing its playlist outright.
+_RETRY_DELAYS = (1.0, 4.0)
+
+
 class PexelsSource:
     """Minimal Pexels client. Searches count against the hourly quota
     (and are cached per query for the life of this source); image
-    downloads are CDN fetches and do not."""
+    downloads are CDN fetches and do not. Transport errors and 5xx
+    responses are retried with backoff; 429 always raises
+    :class:`RateLimitedError` so runs pause instead of burning quota."""
 
     def __init__(self, api_key: str, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(timeout=30.0)
@@ -155,25 +163,40 @@ class PexelsSource:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def _get(self, url: str, **kwargs: Any) -> httpx.Response:
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+            try:
+                response = await self._client.get(url, **kwargs)
+            except httpx.HTTPError as exc:
+                if delay is None:
+                    raise
+                logger.info("Pexels transport error (%r); retrying in %ss", exc, delay)
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code == 429:
+                raise RateLimitedError
+            if response.status_code >= 500 and delay is not None:
+                logger.info("Pexels %s; retrying in %ss", response.status_code, delay)
+                await asyncio.sleep(delay)
+                continue
+            response.raise_for_status()
+            return response
+        raise AssertionError("unreachable")  # pragma: no cover
+
     async def search(self, query: str) -> list[dict[str, Any]]:
         if query in self._cache:
             return self._cache[query]
-        response = await self._client.get(
+        response = await self._get(
             _API,
             params={"query": query, "per_page": _PER_PAGE, "orientation": "square"},
             headers={"Authorization": self._key},
         )
-        if response.status_code == 429:
-            raise RateLimitedError
-        response.raise_for_status()
         photos = list(response.json().get("photos") or [])
         self._cache[query] = photos
         return photos
 
     async def fetch(self, url: str) -> bytes:
-        response = await self._client.get(url)
-        response.raise_for_status()
-        return response.content
+        return (await self._get(url)).content
 
 
 def _eligible(photo: dict[str, Any], used: set[Any]) -> bool:
@@ -233,11 +256,81 @@ async def choose_photo(
     return None
 
 
-def to_cover(data: bytes) -> bytes:
+# Half the catalogue gets its title set on the cover, half stays clean —
+# an A/B the weekly follower stats can settle. Hashed from the title so
+# the cohort survives re-runs and re-rolls.
+_CAPTION_FONTS = [
+    "/System/Library/Fonts/Supplemental/Futura.ttc",
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+_CAPTION_MARGIN = 36
+
+
+def cover_variant(title: str) -> str:
+    """Which cover cohort a playlist belongs to: ``text`` or ``plain``."""
+    return "text" if hashlib.sha256(title.encode()).digest()[2] % 2 else "plain"
+
+
+def _caption_font(size: int) -> ImageFont.FreeTypeFont | None:
+    for path in _CAPTION_FONTS:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return None
+
+
+def _caption(image: Image.Image, text: str) -> Image.Image:
+    """The title, lowercase, over a soft scrim in the lower-left corner.
+
+    No installed font means no caption — a cover must never fail over
+    typography, and Pillow's bitmap fallback font would look worse than
+    none.
+    """
+    text = text.lower()
+    width, height = image.size
+    font = None
+    for size in range(44, 26, -2):
+        candidate = _caption_font(size)
+        if candidate is None:
+            return image
+        if candidate.getlength(text) <= width - 2 * _CAPTION_MARGIN:
+            font = candidate
+            break
+    if font is None:  # still too long at the smallest size: trim
+        font = _caption_font(28)
+        if font is None:
+            return image
+        while text and font.getlength(text + "…") > width - 2 * _CAPTION_MARGIN:
+            text = text[:-1]
+        text += "…"
+
+    band = height // 3
+    scrim = Image.new("L", (width, band), 0)
+    scrim_draw = ImageDraw.Draw(scrim)
+    for y in range(band):
+        scrim_draw.line([(0, y), (width, y)], fill=int(165 * (y / band) ** 1.4))
+    image.paste(Image.new("RGB", (width, band), (12, 12, 14)), (0, height - band), scrim)
+
+    draw = ImageDraw.Draw(image)
+    ascent, descent = font.getmetrics()
+    draw.text(
+        (_CAPTION_MARGIN, height - _CAPTION_MARGIN - ascent - descent),
+        text,
+        font=font,
+        fill=(242, 240, 234),
+    )
+    return image
+
+
+def to_cover(data: bytes, caption: str | None = None) -> bytes:
     """Centre-crop to a square, resize, and grade for cohesion.
 
     The slight desaturation is what keeps 280 unrelated photographs
-    reading as one account rather than a mood board.
+    reading as one account rather than a mood board. *caption* sets the
+    playlist title into the artwork (the ``text`` cohort of the A/B).
     """
     image = Image.open(io.BytesIO(data)).convert("RGB")
     side = min(image.size)
@@ -248,6 +341,8 @@ def to_cover(data: bytes) -> bytes:
     )
     image = ImageEnhance.Color(image).enhance(0.82)
     image = ImageEnhance.Contrast(image).enhance(1.05)
+    if caption:
+        image = _caption(image, caption)
     return encode_jpeg(image)
 
 
@@ -258,6 +353,7 @@ async def apply_photo_covers(
     overwrite: bool = False,
     path: Path | None = None,
     delay: float = _UPLOAD_DELAY,
+    restyle: bool = False,
 ) -> tuple[list[str], list[str], bool]:
     """Give each ``(title, playlist_id, vibe)`` target a photo cover.
 
@@ -266,6 +362,11 @@ async def apply_photo_covers(
     Uniqueness is account-wide: a photo any pick already uses is never
     chosen again. Returns ``(covered, failed, rate_limited)``; hitting
     the quota saves progress and returns early instead of raising.
+
+    *restyle* re-renders each target's already-pinned photo under the
+    current styling (grade, caption cohort) and re-uploads it — no
+    Pexels searches, no photo changes — for rolling a styling change
+    like the title-caption A/B across covers that already exist.
     """
     import base64
 
@@ -276,15 +377,34 @@ async def apply_photo_covers(
     rate_limited = False
 
     for title, playlist_id, vibe in targets:
-        if title in picks and not overwrite:
-            continue
-        try:
-            pick = await choose_photo(source, title, vibe, used)
-            if pick is None or not pick["src"]:
-                logger.info("No usable photo for %r (%s)", title, vibe)
-                failed.append(title)
+        if restyle:
+            if title not in picks:
                 continue
-            payload = base64.b64encode(to_cover(await source.fetch(pick["src"]))).decode("ascii")
+        elif title in picks and not overwrite:
+            continue
+        variant = cover_variant(title)
+        caption = title if variant == "text" else None
+        try:
+            if restyle:
+                pick = picks[title]
+                if pick.get("variant") == variant and not overwrite:
+                    continue
+                if variant == "plain" and "variant" not in pick and not overwrite:
+                    # Pre-A/B covers were already rendered plain; the
+                    # cohort just needs recording, not a re-upload.
+                    pick["variant"] = variant
+                    picks[title] = pick
+                    save_picks(picks, path)
+                    continue
+            else:
+                chosen = await choose_photo(source, title, vibe, used)
+                if chosen is None or not chosen["src"]:
+                    logger.info("No usable photo for %r (%s)", title, vibe)
+                    failed.append(title)
+                    continue
+                pick = chosen
+            cover = to_cover(await source.fetch(pick["src"]), caption=caption)
+            payload = base64.b64encode(cover).decode("ascii")
             await spotify.playlist_cover_image_upload(playlist_id, payload)
         except RateLimitedError:
             rate_limited = True
@@ -293,6 +413,7 @@ async def apply_photo_covers(
             logger.warning("Could not photo-cover %r: %s", title, exc)
             failed.append(title)
             continue
+        pick["variant"] = variant
         picks[title] = pick
         used.add(pick["photo_id"])
         covered.append(title)
