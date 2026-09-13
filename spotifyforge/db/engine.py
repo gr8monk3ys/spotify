@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 
+from sqlalchemy import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -97,6 +98,38 @@ def init_db() -> None:
 
     engine = get_engine()
     SQLModel.metadata.create_all(engine)
+    _drop_removed_columns(engine)
+
+
+def _drop_removed_columns(engine: Engine) -> None:
+    """Drop columns that models no longer declare.
+
+    ``create_all`` never alters existing tables, so a database created
+    before a column was removed keeps it forever — and if it was NOT
+    NULL, every INSERT that follows the current model fails. Dead
+    columns whose data nothing reads are safe to drop in place.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        for table in SQLModel.metadata.tables.values():
+            if not inspector.has_table(table.name):
+                continue
+            declared = {column.name for column in table.columns}
+            doomed = {
+                existing["name"]
+                for existing in inspector.get_columns(table.name)
+                if existing["name"] not in declared
+            }
+            if not doomed:
+                continue
+            # Indexes over a doomed column block its DROP COLUMN.
+            for index in inspector.get_indexes(table.name):
+                if index["name"] and doomed.intersection(index["column_names"]):
+                    connection.execute(text(f'DROP INDEX "{index["name"]}"'))
+            for name in sorted(doomed):
+                connection.execute(text(f'ALTER TABLE "{table.name}" DROP COLUMN "{name}"'))
 
 
 # ---------------------------------------------------------------------------
