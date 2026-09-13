@@ -1,6 +1,18 @@
-# CLAUDE.md
+# spotify
 
-Guidance for Claude Code in this repo. Fleet-wide operating notes live in `~/code/CLAUDE.md`.
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `gr8monk3ys/spotify`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, label string equal to role name. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ## Media fleet: the join is alive, the engines are frozen (2026-08-30)
 
