@@ -16,8 +16,10 @@ from PIL import Image
 from spotifyforge.core.photo_covers import (
     PexelsSource,
     RateLimitedError,
+    _caption_font,
     apply_photo_covers,
     choose_photo,
+    cover_variant,
     drop_person_picks,
     load_picks,
     queries_for,
@@ -79,6 +81,25 @@ def test_to_cover_squares_grades_and_fits_limit():
     image = Image.open(io.BytesIO(cover))
     assert image.size == (640, 640)
     assert len(cover) < 256 * 1024
+
+
+def test_cover_variant_splits_titles_deterministically():
+    titles = [f"playlist {i}" for i in range(24)]
+    variants = {t: cover_variant(t) for t in titles}
+    assert variants == {t: cover_variant(t) for t in titles}  # stable
+    assert set(variants.values()) == {"text", "plain"}  # both cohorts occur
+
+
+def test_caption_sets_type_into_the_artwork():
+    if _caption_font(30) is None:
+        pytest.skip("no caption font on this machine")
+    plain = to_cover(_jpeg_bytes())
+    captioned = to_cover(_jpeg_bytes(), caption="the bebop index")
+    assert captioned != plain
+    assert Image.open(io.BytesIO(captioned)).size == (640, 640)
+    # A title longer than the cover fits is trimmed, never a crash.
+    long = to_cover(_jpeg_bytes(), caption="an extremely long playlist title " * 4)
+    assert Image.open(io.BytesIO(long)).size == (640, 640)
 
 
 def test_picks_roundtrip(tmp_path):
@@ -206,6 +227,26 @@ async def test_apply_uploads_skips_pinned_and_records_attribution(
         await source.close()
 
 
+async def test_overwrite_rerolls_to_a_different_photo(fake_spotify, client_for, tmp_path):
+    """The CLI's --only re-roll promises a different image; the promise
+    holds because the outgoing pick still occupies the account-wide
+    ``used`` set when its replacement is chosen."""
+    fake_spotify.add_user("user1")
+    fake_spotify.add_playlist("pl1", name="strictly coldwave")
+    path = tmp_path / "photo_covers.json"
+    sp = client_for("user1")
+    source, _ = _pexels({"coldwave abstract": [_photo_payload(1), _photo_payload(2)]})
+    targets = [("strictly coldwave", "pl1", "coldwave")]
+    try:
+        await apply_photo_covers(sp, targets, source, path=path, delay=0)
+        first = load_picks(path)["strictly coldwave"]["photo_id"]
+        await apply_photo_covers(sp, targets, source, overwrite=True, path=path, delay=0)
+        second = load_picks(path)["strictly coldwave"]["photo_id"]
+    finally:
+        await source.close()
+    assert {first, second} == {1, 2}
+
+
 async def test_apply_pauses_on_rate_limit_and_resumes(fake_spotify, client_for, tmp_path):
     fake_spotify.add_user("user1")
     fake_spotify.add_playlist("pl1", name="a")
@@ -262,6 +303,95 @@ async def test_apply_tolerates_a_bad_photo(fake_spotify, client_for, tmp_path):
     finally:
         await source.close()
     assert (covered, failed, limited) == (["b"], ["a"], False)
+
+
+async def test_restyle_recaptions_pinned_covers_without_searches(
+    fake_spotify, client_for, tmp_path
+):
+    """Rolling the caption A/B across existing covers re-uses the pinned
+    photos: no Pexels searches, plain-cohort legacy picks just get their
+    cohort recorded, text-cohort picks are re-rendered and re-uploaded."""
+    fake_spotify.add_user("user1")
+    names = (f"crate {i}" for i in range(20))
+    text_title = next(n for n in names if cover_variant(n) == "text")
+    plain_title = next(n for n in names if cover_variant(n) == "plain")
+    fake_spotify.add_playlist("pl1", name=text_title)
+    fake_spotify.add_playlist("pl2", name=plain_title)
+    path = tmp_path / "photo_covers.json"
+    # Legacy picks from before the A/B existed: no variant recorded.
+    save_picks(
+        {
+            text_title: {"photo_id": 1, "src": "https://images.pexels.com/1.jpg"},
+            plain_title: {"photo_id": 2, "src": "https://images.pexels.com/2.jpg"},
+        },
+        path,
+    )
+    sp = client_for("user1")
+    source, calls = _pexels({})
+    targets = [(text_title, "pl1", "x"), (plain_title, "pl2", "y")]
+    try:
+        covered, failed, limited = await apply_photo_covers(
+            sp, targets, source, path=path, delay=0, restyle=True
+        )
+    finally:
+        await source.close()
+    assert failed == [] and not limited
+    assert calls["n"] == 0  # no quota spent
+    picks = load_picks(path)
+    assert picks[text_title]["variant"] == "text"
+    assert picks[plain_title]["variant"] == "plain"
+    assert fake_spotify.playlists["pl1"].get("cover_image")  # re-uploaded
+    assert not fake_spotify.playlists["pl2"].get("cover_image")  # recorded only
+    assert covered == [text_title]
+
+    # A second restyle is a no-op: every pick already carries its cohort.
+    fresh, calls2 = _pexels({})
+    try:
+        covered, _, _ = await apply_photo_covers(
+            sp, targets, fresh, path=path, delay=0, restyle=True
+        )
+    finally:
+        await fresh.close()
+    assert covered == [] and calls2["n"] == 0
+
+
+async def test_source_retries_transient_failures(monkeypatch):
+    import spotifyforge.core.photo_covers as pc
+
+    monkeypatch.setattr(pc, "_RETRY_DELAYS", (0, 0))
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadError("", request=request)
+        if calls["n"] == 2:
+            return httpx.Response(522)
+        return httpx.Response(200, json={"photos": [_photo_payload(1)]})
+
+    source = PexelsSource("key", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        photos = await source.search("anything")
+    finally:
+        await source.close()
+    assert [p["id"] for p in photos] == [1]
+    assert calls["n"] == 3
+
+
+async def test_source_gives_up_after_retries(monkeypatch):
+    import spotifyforge.core.photo_covers as pc
+
+    monkeypatch.setattr(pc, "_RETRY_DELAYS", (0, 0))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("", request=request)
+
+    source = PexelsSource("key", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        with pytest.raises(httpx.ReadError):
+            await source.search("anything")
+    finally:
+        await source.close()
 
 
 async def test_source_raises_rate_limited():
