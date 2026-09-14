@@ -1,6 +1,6 @@
 # Cross-platform music sync: Spotify → Discogs → RateYourMusic
 
-**Status:** approved design, not yet implemented
+**Status:** historical. Approved 2026-08-19; the Spotify → Discogs leg shipped as the liked-library export, the RateYourMusic leg was retired on 2026-08-30 (`rym` archived, see the media-fleet section of `CLAUDE.md`). Kept as the record of the design and its measurements.
 **Date:** 2026-08-19
 **Repos touched:** `~/code/spotify` (source), `~/code/discogs` (consumer), `~/code/rym` (new consumer)
 
