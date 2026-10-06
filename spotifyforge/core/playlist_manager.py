@@ -245,6 +245,8 @@ class PlaylistManager:
                     session.add(db_track)
                     await session.flush()
 
+                # Both branches leave a persisted row, so the database has assigned its id.
+                assert db_track.id is not None
                 assoc = PlaylistTrack(
                     playlist_id=playlist_pk,
                     track_id=db_track.id,

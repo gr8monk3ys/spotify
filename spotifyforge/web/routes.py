@@ -734,6 +734,8 @@ async def create_schedule(
                 detail=f"Playlist {body.playlist_id} not found.",
             )
 
+    # get_current_user only returns users loaded from the database, which always have an id.
+    assert current_user.id is not None
     job = ScheduledJob(
         user_id=current_user.id,
         name=body.name,
