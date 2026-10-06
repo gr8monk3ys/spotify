@@ -519,10 +519,9 @@ def cluster_library(
     built = {(s.genre or "", s.decade) for s in specs}
     assigned = {s.genre for s in specs if s.genre}
     emptied = {(genre, None) for genre in viable if genre not in assigned}
-    # Sorted only for a stable spec order; the undated key sorts first
-    # rather than blowing up comparing None against a decade.
+    # Sorted only for a stable spec order.
     keys = emptied | {k for k in discovery_keys if k[0]}
-    for genre, decade in sorted(keys, key=lambda k: (k[0], -1 if k[1] is None else k[1])):
+    for genre, decade in sorted(keys, key=_undated_first):
         if (genre, decade) not in built:
             specs.append(_make_spec(genre, decade, [], features))
 
@@ -536,6 +535,16 @@ def cluster_library(
     # Most niche first: rarer genres make better calling cards.
     specs.sort(key=lambda s: (len(s.tracks), s.title))
     return specs
+
+
+def _undated_first(key: tuple[str, int | None]) -> tuple[str, int]:
+    """Sort key for ``(genre, decade)``: the undated key sorts first.
+
+    A plain sort blows up comparing ``None`` against a decade as soon as
+    one genre is keyed both ways.
+    """
+    genre, decade = key
+    return genre, -1 if decade is None else decade
 
 
 def _split_by_decade(
@@ -1135,7 +1144,9 @@ def merge_expansions(
     known = {(spec.genre or "", spec.decade) for spec in specs}
     merged += [
         _make_spec(genre or None, decade, dedupe_versions(additions), features)
-        for (genre, decade), additions in sorted(extras.items())
+        for (genre, decade), additions in sorted(
+            extras.items(), key=lambda kv: _undated_first(kv[0])
+        )
         if (genre, decade) not in known and additions
     ]
     return merged

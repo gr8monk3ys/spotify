@@ -116,6 +116,44 @@ def test_merge_without_pins_changes_nothing():
     assert merge_expansions(specs, {}) is specs
 
 
+def test_merge_orders_undated_and_dated_pins_of_one_genre():
+    """A genre pinned both undated and by decade must not crash the plan.
+
+    The weekly refresh/reflow/describe all died on ``'<' not supported
+    between instances of 'NoneType' and 'int'`` once a genre carried pins
+    under ``(genre, None)`` and ``(genre, 2020)``: sorting the pin keys
+    compared the two decades.
+    """
+
+    def pin(track_id: str, year: int | None) -> CurationTrack:
+        return CurationTrack(
+            id=track_id,
+            uri=f"spotify:track:{track_id}",
+            name=f"Psych {track_id}",
+            artist_ids=(f"a{track_id}",),
+            artist_names=(f"Artist {track_id}",),
+            release_year=year,
+            popularity=10,
+            genres=("psychedelic rock",),
+        )
+
+    pins = {
+        ("psychedelic rock", 2020): [pin("d1", 2021)],
+        ("psychedelic rock", None): [pin("u1", None)],
+        ("art rock", 2010): [pin("d2", 2012)],
+    }
+
+    merged = merge_expansions([], pins)
+
+    # Undated sorts first within a genre, as cluster_library orders them.
+    assert [(s.genre, s.decade) for s in merged] == [
+        ("art rock", 2010),
+        ("psychedelic rock", None),
+        ("psychedelic rock", 2020),
+    ]
+    assert [[t.id for t in s.tracks] for s in merged] == [["d2"], ["u1"], ["d1"]]
+
+
 # ---------------------------------------------------------------------------
 # Picking candidates (through the fake backend)
 # ---------------------------------------------------------------------------
