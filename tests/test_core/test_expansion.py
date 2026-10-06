@@ -116,6 +116,39 @@ def test_merge_without_pins_changes_nothing():
     assert merge_expansions(specs, {}) is specs
 
 
+def test_merge_mixes_dated_and_undated_pins_without_comparing_them():
+    """A genre pinned both undated and per-decade (``art rock|`` and
+    ``art rock|2010`` in a real sidecar) sorted None against an int and
+    killed every plan — so refresh, reflow and describe all crashed."""
+
+    def pin(track_id: str, year: int | None) -> CurationTrack:
+        return CurationTrack(
+            id=track_id,
+            uri=f"spotify:track:{track_id}",
+            name=f"Art Rock {track_id}",
+            artist_ids=(f"ar_{track_id}",),
+            artist_names=(f"Artist {track_id}",),
+            release_year=year,
+            popularity=20,
+            genres=("art rock",),
+        )
+
+    extras = {
+        ("art rock", 2010): [pin("d1", 2012)],
+        ("art rock", None): [pin("u1", None)],
+        ("art rock", 2020): [pin("d2", 2021)],
+    }
+
+    merged = merge_expansions([], extras)
+
+    # Undated first, then decades ascending: deterministic, never a crash.
+    assert [(s.genre, s.decade) for s in merged] == [
+        ("art rock", None),
+        ("art rock", 2010),
+        ("art rock", 2020),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Picking candidates (through the fake backend)
 # ---------------------------------------------------------------------------

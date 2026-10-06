@@ -1133,9 +1133,13 @@ def merge_expansions(
         for spec in specs
     ]
     known = {(spec.genre or "", spec.decade) for spec in specs}
+    # A genre can be pinned both undated and per decade; the undated key
+    # sorts first rather than blowing up comparing None against a decade.
     merged += [
         _make_spec(genre or None, decade, dedupe_versions(additions), features)
-        for (genre, decade), additions in sorted(extras.items())
+        for (genre, decade), additions in sorted(
+            extras.items(), key=lambda kv: (kv[0][0], -1 if kv[0][1] is None else kv[0][1])
+        )
         if (genre, decade) not in known and additions
     ]
     return merged

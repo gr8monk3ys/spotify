@@ -24,6 +24,7 @@ from spotifyforge.core.curation import (
     dedupe_versions,
     forge_next,
     order_for_flow,
+    order_with_mode,
     plan_catalogue,
     reflow,
     writable_specs,
@@ -841,6 +842,28 @@ def test_flow_falls_back_to_the_arc_when_too_little_is_analysed():
 
     ordered = order_for_flow(tracks, features)
     assert ordered[0].popularity == max(t.popularity for t in tracks)
+
+
+def test_harmonic_chain_keeps_tracks_with_no_key():
+    # Coverage clears the floor, so the chain runs with keyless tracks in
+    # it: a tempo-only reading, a key with no mode, and no reading at all.
+    # They must take part (no key preference) rather than be compared.
+    tracks = [
+        replace(_ct(f"t{i}", popularity=90 - i, artist=f"a{i}"), isrc=f"t{i}") for i in range(6)
+    ]
+    features = {
+        "t0": AudioFeature(tempo=120.0, key=9, mode=0),
+        "t1": AudioFeature(tempo=122.0, key=0, mode=1),
+        "t2": AudioFeature(tempo=118.0, key=4, mode=0),
+        "t3": AudioFeature(tempo=121.0),
+        "t4": AudioFeature(key=7, mode=None),
+    }
+
+    ordered, mode = order_with_mode(tracks, features)
+
+    assert mode == "harmonic"
+    assert ordered[0].id == "t0"
+    assert sorted(t.id for t in ordered) == [t.id for t in tracks]
 
 
 def test_flow_ignores_features_that_match_no_track():
