@@ -151,7 +151,7 @@ async def test_liked_library_is_cached_until_refresh(logged_in):
     assert (await _ok("search_liked", refresh=True))["total_matches"] == 2
 
 
-async def test_create_playlist_sequences_liked_tracks_and_defaults_private(logged_in):
+async def test_create_playlist_sequences_liked_tracks_and_is_private(logged_in):
     fake = logged_in
     # Three tracks by one artist and one by another: the arc ordering must
     # not leave the given order (a, b, c, d) standing, because it leads
@@ -184,12 +184,24 @@ async def test_create_playlist_keeps_given_order_when_a_track_is_not_liked(logge
     _like(fake, "b", artist="miles", genres=["jazz"], popularity=90)
     fake.add_track("stranger")
 
-    out = await _ok("create_playlist", name="Mixed", track_ids=["a", "stranger", "b"], public=True)
+    out = await _ok("create_playlist", name="Mixed", track_ids=["a", "stranger", "b"])
 
     assert out["ordering"] == "given"
     assert "1 track(s) are not in the user's liked songs" in out["note"]
     assert fake.playlist_tracks[out["playlist_id"]] == ["a", "stranger", "b"]
-    assert fake.playlists[out["playlist_id"]]["public"] is True
+    assert fake.playlists[out["playlist_id"]]["public"] is False
+
+
+async def test_create_playlist_cannot_be_asked_to_publish(logged_in):
+    fake = logged_in
+    _like(fake, "a", artist="miles", genres=["jazz"])
+
+    result = await _call("create_playlist", name="Loud", track_ids=["a"], public=True)
+
+    # Either the unknown argument is rejected or it is ignored; what must
+    # not happen is a public playlist.
+    assert all(p["public"] is False for p in fake.playlists.values())
+    assert result.is_error or result.structured_content["public"] is False
 
 
 async def test_create_playlist_refuses_an_empty_track_list(logged_in):
@@ -224,6 +236,39 @@ async def test_deduplicate_playlist(logged_in):
 
     assert out["duplicates_removed"] == 1
     assert fake.playlist_tracks["pl"] == ["t1", "t2"]
+
+
+async def test_deduplicate_refuses_a_playlist_owned_by_someone_else(logged_in):
+    fake = logged_in
+    fake.add_user("other")
+    fake.add_track("t1")
+    fake.add_playlist("theirs", owner="other", name="Theirs", track_ids=["t1", "t1"])
+
+    result = await _call("deduplicate_playlist", playlist_id="theirs")
+
+    assert result.is_error
+    assert "belongs to someone else" in result.content[0].text
+    assert fake.playlist_tracks["theirs"] == ["t1", "t1"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("get_playlist", {"playlist_id": "../me/tracks"}),
+        ("deduplicate_playlist", {"playlist_id": "pl?fields=x"}),
+        ("create_playlist", {"name": "X", "track_ids": ["a", "../../me"]}),
+    ],
+)
+async def test_ids_that_are_not_spotify_ids_never_reach_a_request(logged_in, tool, arguments):
+    fake = logged_in
+    before = len(fake.requests)
+
+    result = await _call(tool, **arguments)
+
+    assert result.is_error
+    assert "is not a Spotify" in result.content[0].text
+    assert len(fake.requests) == before
+    assert fake.playlists == {}
 
 
 async def test_a_spotify_error_reaches_the_model_with_its_message(logged_in):

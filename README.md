@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 511 tests run in under a minute with no network.
+end. The 516 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept
@@ -85,16 +85,19 @@ cannot, because it depends on how this package reads your library:
 |---|---|
 | `liked_genres` | Genres across your liked songs, with counts |
 | `search_liked` | Liked songs by genre, artist, title or year, with BPM and key where known |
-| `create_playlist` | Create a playlist from chosen tracks, sequenced by key and tempo |
+| `create_playlist` | Create a private playlist from chosen tracks, sequenced by key and tempo |
 | `list_playlists`, `get_playlist` | Read your playlists |
-| `deduplicate_playlist` | Remove repeated tracks |
+| `deduplicate_playlist` | Remove repeated tracks from one of your own playlists |
 | `plan_catalogue_preview` | The genre catalogue `curate plan` would show |
 | `audience_stats` | Follower counts for the account and each owned playlist |
 | `top_tracks`, `recently_played` | Listening history |
 
 So "make me a 25-track late-night jazz fusion playlist from my liked songs"
 becomes three calls: learn the genres, pick the tracks, create it sequenced.
-Playlists are created private unless asked otherwise. The bulk writers
+Playlists are always created private, write tools only touch playlists you
+own, and every id is checked to be a Spotify id before it reaches a request:
+playlist and track text comes from other people, so a model reading it should
+not be one step away from publishing anything. The bulk writers
 (`curate forge`, `reflow`, `retire`) are not exposed: they are only correct
 with the sizes a catalogue was forged with, which belongs in a script.
 
