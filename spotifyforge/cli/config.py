@@ -23,7 +23,7 @@ config_app = typer.Typer(
     no_args_is_help=True,
 )
 
-_SECRET_FIELDS = {"spotify_client_id", "spotify_client_secret", "secret_key"}
+_SECRET_FIELDS = {"spotify_client_id", "spotify_client_secret", "pexels_api_key"}
 
 
 @config_app.command("show")

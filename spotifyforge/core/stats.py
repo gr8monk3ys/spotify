@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import tekore as tk
 
+from spotifyforge.core.clock import utc_now
 from spotifyforge.core.playlist_manager import PlaylistManager
-from spotifyforge.models.models import utc_now
 
 if TYPE_CHECKING:
     from pathlib import Path

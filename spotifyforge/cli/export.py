@@ -39,10 +39,10 @@ def export_library(
     consumer mistakes them for music you have heard.
     """
     from spotifyforge.core.audio_features import load_cached_features
+    from spotifyforge.core.clock import utc_now
     from spotifyforge.core.curation import CurationEngine
     from spotifyforge.core.expansion import load_expansions
     from spotifyforge.core.export import build_library_export, write_export
-    from spotifyforge.models.models import utc_now
 
     # Known locally — asking Spotify who we are just to stamp provenance
     # would be a round trip for a string already on disk.

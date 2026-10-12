@@ -1,8 +1,7 @@
 """Central playlist management service for SpotifyForge.
 
-Provides high-level operations for creating, syncing, and manipulating
-Spotify playlists while keeping the local database in sync.  All public
-methods use Tekore's async API and handle chunking, pagination, and error
+Provides high-level operations for creating and manipulating Spotify
+playlists.  All public methods use Tekore's async API and handle chunking, pagination, and error
 recovery internally so callers never have to worry about Spotify rate
 limits or page sizes.
 """
@@ -12,14 +11,10 @@ from __future__ import annotations
 import html
 import logging
 from collections.abc import Sequence
-from datetime import datetime
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import tekore as tk
-from sqlmodel import select
-
-from spotifyforge.db.engine import get_async_session
-from spotifyforge.models.models import Playlist, PlaylistTrack, Track, utc_now
 
 if TYPE_CHECKING:
     from tekore import Spotify
@@ -28,6 +23,15 @@ logger = logging.getLogger(__name__)
 
 # Spotify imposes a maximum of 100 track URIs per add/remove request.
 _CHUNK_SIZE = 100
+
+
+@dataclass(frozen=True)
+class CreatedPlaylist:
+    """What Spotify handed back for a playlist this package just created."""
+
+    spotify_id: str
+    name: str
+    snapshot_id: str
 
 
 class PlaylistManager:
@@ -137,157 +141,23 @@ class PlaylistManager:
         return {"meta": meta, "tracks": tracks}
 
     # ------------------------------------------------------------------
-    # Sync
-    # ------------------------------------------------------------------
-
-    async def sync_playlist(self, playlist_id: str, owner_id: int) -> Playlist:
-        """Fetch a playlist from Spotify and upsert it into the local DB.
-
-        All tracks are resolved and stored; the local ``PlaylistTrack``
-        association rows are rebuilt so they mirror Spotify's ordering.
-        The row is scoped to *owner_id*, so two local users tracking the
-        same Spotify playlist each get their own row.
-
-        Returns the local :class:`Playlist` row after sync.
-        """
-        try:
-            sp_playlist = await self._sp.playlist(playlist_id)
-        except tk.HTTPError as exc:
-            logger.error("Failed to fetch playlist %s from Spotify: %s", playlist_id, exc)
-            raise
-
-        # Gather every track via auto-pagination.
-        all_tracks = await self.get_playlist_tracks(playlist_id)
-
-        async with get_async_session() as session:
-            # Upsert the playlist row.
-            result = await session.execute(
-                select(Playlist).where(
-                    Playlist.spotify_id == playlist_id,
-                    Playlist.owner_id == owner_id,
-                )
-            )
-            db_playlist: Playlist | None = result.scalars().first()
-
-            if db_playlist is None:
-                db_playlist = Playlist(
-                    spotify_id=sp_playlist.id,
-                    name=sp_playlist.name,
-                    description=sp_playlist.description or "",
-                    public=sp_playlist.public if sp_playlist.public is not None else True,
-                    collaborative=sp_playlist.collaborative,
-                    snapshot_id=sp_playlist.snapshot_id,
-                    track_count=sp_playlist.tracks.total,
-                    last_synced_at=utc_now(),
-                    owner_id=owner_id,
-                )
-                session.add(db_playlist)
-            else:
-                db_playlist.name = sp_playlist.name
-                db_playlist.description = sp_playlist.description or ""
-                db_playlist.public = sp_playlist.public if sp_playlist.public is not None else True
-                db_playlist.collaborative = sp_playlist.collaborative
-                db_playlist.snapshot_id = sp_playlist.snapshot_id
-                db_playlist.track_count = sp_playlist.tracks.total
-                db_playlist.last_synced_at = utc_now()
-                db_playlist.updated_at = utc_now()
-                session.add(db_playlist)
-
-            await session.flush()
-
-            # Ensure we have the playlist's PK.
-            await session.refresh(db_playlist)
-            playlist_pk: int = db_playlist.id  # type: ignore[assignment]
-
-            # Remove old association rows for this playlist.
-            old_assocs = await session.execute(
-                select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist_pk)
-            )
-            for old_row in old_assocs.scalars().all():
-                await session.delete(old_row)
-            await session.flush()
-
-            # Upsert tracks and rebuild association rows.
-            for position, item in enumerate(all_tracks):
-                track_obj = item.track
-                if track_obj is None or track_obj.id is None:
-                    # Local or unavailable tracks are skipped.
-                    continue
-
-                track_result = await session.execute(
-                    select(Track).where(Track.spotify_id == track_obj.id)
-                )
-                db_track: Track | None = track_result.scalars().first()
-
-                artist_names = [a.name for a in track_obj.artists] if track_obj.artists else []
-
-                if db_track is None:
-                    db_track = Track(
-                        spotify_id=track_obj.id,
-                        name=track_obj.name,
-                        artist_names=artist_names,
-                        album_name=track_obj.album.name if track_obj.album else None,
-                        album_id=track_obj.album.id if track_obj.album else None,
-                        duration_ms=track_obj.duration_ms,
-                        popularity=track_obj.popularity,
-                        isrc=extract_isrc(track_obj),
-                    )
-                    session.add(db_track)
-                    await session.flush()
-                    await session.refresh(db_track)
-                else:
-                    db_track.name = track_obj.name
-                    db_track.artist_names = artist_names
-                    db_track.album_name = track_obj.album.name if track_obj.album else None
-                    db_track.duration_ms = track_obj.duration_ms
-                    db_track.popularity = track_obj.popularity
-                    db_track.cached_at = utc_now()
-                    session.add(db_track)
-                    await session.flush()
-
-                # Both branches leave a persisted row, so the database has assigned its id.
-                assert db_track.id is not None
-                assoc = PlaylistTrack(
-                    playlist_id=playlist_pk,
-                    track_id=db_track.id,
-                    position=position,
-                    added_at=_parse_added_at(item),
-                    added_by=_extract_added_by(item),
-                )
-                session.add(assoc)
-
-            await session.commit()
-            await session.refresh(db_playlist)
-
-        logger.info(
-            "Synced playlist %s (%s) — %d tracks",
-            db_playlist.name,
-            playlist_id,
-            db_playlist.track_count,
-        )
-        return db_playlist
-
-    # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
 
     async def create_playlist(
         self,
         name: str,
-        owner_id: int,
         description: str = "",
         public: bool = True,
         collaborative: bool = False,
-    ) -> Playlist:
-        """Create a new playlist on Spotify and persist it locally.
+    ) -> CreatedPlaylist:
+        """Create a new playlist on Spotify.
 
         The current user's Spotify ID is resolved automatically from the
         authenticated client. Spotify's create endpoint has no
         ``collaborative`` flag, so collaborative playlists are created
         private and then flipped via ``playlist_change_details`` (Spotify
         requires collaborative playlists to be non-public).
-
-        Returns the newly created local :class:`Playlist` row.
         """
         try:
             user = await self._sp.current_user()
@@ -303,42 +173,25 @@ class PlaylistManager:
             logger.error("Failed to create playlist on Spotify: %s", exc)
             raise
 
-        async with get_async_session() as session:
-            db_playlist = Playlist(
-                spotify_id=sp_playlist.id,
-                name=sp_playlist.name,
-                description=description,
-                public=False if collaborative else public,
-                collaborative=collaborative,
-                snapshot_id=sp_playlist.snapshot_id,
-                track_count=0,
-                last_synced_at=utc_now(),
-                owner_id=owner_id,
-            )
-            session.add(db_playlist)
-            await session.commit()
-            await session.refresh(db_playlist)
-
         logger.info("Created playlist '%s' (%s)", name, sp_playlist.id)
-        return db_playlist
+        return CreatedPlaylist(
+            spotify_id=sp_playlist.id, name=sp_playlist.name, snapshot_id=sp_playlist.snapshot_id
+        )
 
     async def create_playlist_with_tracks(
         self,
         name: str,
-        owner_id: int,
         tracks: Sequence[Any],
         description: str = "",
         public: bool = True,
-    ) -> Playlist:
+    ) -> CreatedPlaylist:
         """Create a playlist and fill it with *tracks* (tekore track objects).
 
         The composed flow behind genre playlists, time capsules, and any
         other "build a list from discovered tracks" feature — one place
         for the create-then-add sequence and the local-track filtering.
         """
-        playlist = await self.create_playlist(
-            name=name, owner_id=owner_id, description=description, public=public
-        )
+        playlist = await self.create_playlist(name=name, description=description, public=public)
         uris = [t.uri for t in tracks if t.uri]
         if uris:
             await self.add_tracks(playlist.spotify_id, uris)
@@ -588,25 +441,3 @@ def extract_isrc(track: Any) -> str | None:
     if isinstance(external, dict):
         return external.get("isrc")
     return getattr(external, "isrc", None)
-
-
-def _parse_added_at(item: Any) -> datetime | None:
-    """Parse the ``added_at`` timestamp from a Tekore playlist item."""
-    try:
-        if item.added_at is not None:
-            if isinstance(item.added_at, datetime):
-                return item.added_at
-            return datetime.fromisoformat(str(item.added_at).replace("Z", "+00:00"))
-    except (AttributeError, ValueError):
-        pass
-    return None
-
-
-def _extract_added_by(item: Any) -> str | None:
-    """Extract the Spotify user ID of whoever added this track."""
-    try:
-        if item.added_by and hasattr(item.added_by, "id"):
-            return item.added_by.id
-    except AttributeError:
-        pass
-    return None

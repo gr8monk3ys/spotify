@@ -13,10 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import tekore as tk
-from sqlmodel import Session, select
 
 from spotifyforge.core.playlist_manager import _CHUNK_SIZE, PlaylistManager
-from spotifyforge.models.models import Playlist, PlaylistTrack, Track, User
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -25,18 +23,6 @@ from spotifyforge.models.models import Playlist, PlaylistTrack, Track, User
 
 def _uri(track_id: str) -> str:
     return f"spotify:track:{track_id}"
-
-
-def _create_db_user(spotify_id: str = "user1") -> int:
-    """Insert a local User row (isolated_db must be active) and return its PK."""
-    from spotifyforge.db.engine import get_engine
-
-    with Session(get_engine()) as session:
-        user = User(spotify_id=spotify_id)
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-        return user.id
 
 
 def _requests_for(fake, method: str, path: str) -> list[tuple[str, str]]:
@@ -433,162 +419,44 @@ class TestReorderTracks:
 
 
 # ===================================================================
-# create_playlist (writes to the real DB — isolated_db)
+# create_playlist
 # ===================================================================
 
 
 class TestCreatePlaylist:
-    async def test_creates_on_spotify_and_locally(self, isolated_db, fake_spotify, client_for):
+    async def test_creates_on_spotify(self, fake_spotify, client_for):
         fake_spotify.add_user("user1")
-        owner_pk = _create_db_user("user1")
         manager = PlaylistManager(client_for())
 
-        row = await manager.create_playlist(
-            name="Fresh Cuts", owner_id=owner_pk, description="new stuff", public=True
+        created = await manager.create_playlist(
+            name="Fresh Cuts", description="new stuff", public=True
         )
 
-        # Created on (fake) Spotify...
-        assert row.spotify_id in fake_spotify.playlists
-        meta = fake_spotify.playlists[row.spotify_id]
+        assert created.spotify_id in fake_spotify.playlists
+        meta = fake_spotify.playlists[created.spotify_id]
         assert meta["name"] == "Fresh Cuts"
         assert meta["description"] == "new stuff"
         assert meta["public"] is True
-        # ...and persisted locally, scoped to the owner.
-        assert row.id is not None
-        assert row.owner_id == owner_pk
-        assert row.name == "Fresh Cuts"
-        assert row.public is True
-        assert row.collaborative is False
-        assert row.track_count == 0
+        assert created.name == "Fresh Cuts"
 
-    async def test_collaborative_created_private_then_flipped(
-        self, isolated_db, fake_spotify, client_for
-    ):
+    async def test_collaborative_created_private_then_flipped(self, fake_spotify, client_for):
         """Spotify requires collaborative playlists to be non-public; the
         create endpoint has no collaborative flag so it is set via a
         follow-up playlist_change_details call."""
         fake_spotify.add_user("user1")
-        owner_pk = _create_db_user("user1")
         manager = PlaylistManager(client_for())
 
-        row = await manager.create_playlist(
-            name="Shared", owner_id=owner_pk, public=True, collaborative=True
-        )
+        created = await manager.create_playlist(name="Shared", public=True, collaborative=True)
 
-        meta = fake_spotify.playlists[row.spotify_id]
+        meta = fake_spotify.playlists[created.spotify_id]
         assert meta["public"] is False  # forced private
         assert meta["collaborative"] is True  # flipped by the PUT
-        assert row.public is False
-        assert row.collaborative is True
 
-    async def test_api_error_propagates_and_writes_nothing(
-        self, isolated_db, mock_manager, mock_spotify
-    ):
-        from spotifyforge.db.engine import get_engine
-
+    async def test_api_error_propagates(self, mock_manager, mock_spotify):
         mock_spotify.current_user.side_effect = _http_error()
 
         with pytest.raises(tk.HTTPError):
-            await mock_manager.create_playlist(name="Fail", owner_id=1)
-
-        with Session(get_engine()) as session:
-            assert session.exec(select(Playlist)).all() == []
-
-
-# ===================================================================
-# sync_playlist (writes to the real DB — isolated_db)
-# ===================================================================
-
-
-class TestSyncPlaylist:
-    async def test_sync_mirrors_spotify_including_duplicates(
-        self, isolated_db, fake_spotify, client_for
-    ):
-        from spotifyforge.db.engine import get_engine
-
-        fake_spotify.add_user("user1")
-        owner_pk = _create_db_user("user1")
-        fake_spotify.add_track("t1", name="One")
-        fake_spotify.add_track("t2", name="Two")
-        fake_spotify.add_playlist("pl", name="Sync Me", track_ids=["t1", "t2", "t1"])
-        manager = PlaylistManager(client_for())
-
-        row = await manager.sync_playlist("pl", owner_id=owner_pk)
-
-        assert row.owner_id == owner_pk
-        assert row.name == "Sync Me"
-        assert row.track_count == 3
-        assert row.snapshot_id == fake_spotify.playlists["pl"]["snapshot_id"]
-        assert row.last_synced_at is not None
-
-        with Session(get_engine()) as session:
-            assocs = session.exec(
-                select(PlaylistTrack)
-                .where(PlaylistTrack.playlist_id == row.id)
-                .order_by(PlaylistTrack.position)
-            ).all()
-            assert [a.position for a in assocs] == [0, 1, 2]
-            tracks_by_pk = {t.id: t.spotify_id for t in session.exec(select(Track)).all()}
-            # The duplicate is mirrored: same track at positions 0 and 2.
-            assert [tracks_by_pk[a.track_id] for a in assocs] == ["t1", "t2", "t1"]
-            assert len(tracks_by_pk) == 2  # tracks table itself is deduped
-            assert all(a.added_by == "user1" for a in assocs)
-            assert all(a.added_at is not None for a in assocs)
-
-    async def test_resync_updates_in_place(self, isolated_db, fake_spotify, client_for):
-        from spotifyforge.db.engine import get_engine
-
-        fake_spotify.add_user("user1")
-        owner_pk = _create_db_user("user1")
-        fake_spotify.add_track("t1")
-        fake_spotify.add_track("t2")
-        fake_spotify.add_playlist("pl", track_ids=["t1"])
-        manager = PlaylistManager(client_for())
-
-        first = await manager.sync_playlist("pl", owner_id=owner_pk)
-        fake_spotify.playlist_tracks["pl"] = ["t2", "t1"]
-        fake_spotify.playlists["pl"]["name"] = "Renamed"
-        second = await manager.sync_playlist("pl", owner_id=owner_pk)
-
-        assert second.id == first.id  # updated, not duplicated
-        assert second.name == "Renamed"
-        assert second.track_count == 2
-
-        with Session(get_engine()) as session:
-            rows = session.exec(select(Playlist)).all()
-            assert len(rows) == 1
-            assocs = session.exec(
-                select(PlaylistTrack)
-                .where(PlaylistTrack.playlist_id == second.id)
-                .order_by(PlaylistTrack.position)
-            ).all()
-            assert len(assocs) == 2
-
-    async def test_same_playlist_two_owners_get_two_rows(
-        self, isolated_db, fake_spotify, client_for
-    ):
-        from spotifyforge.db.engine import get_engine
-
-        fake_spotify.add_user("user1")
-        fake_spotify.add_user("user2")
-        owner1 = _create_db_user("user1")
-        owner2 = _create_db_user("user2")
-        fake_spotify.add_track("t1")
-        fake_spotify.add_playlist("pl", track_ids=["t1"])
-
-        row1 = await PlaylistManager(client_for("user1")).sync_playlist("pl", owner_id=owner1)
-        row2 = await PlaylistManager(client_for("user2")).sync_playlist("pl", owner_id=owner2)
-
-        assert row1.id != row2.id
-        with Session(get_engine()) as session:
-            rows = session.exec(select(Playlist).where(Playlist.spotify_id == "pl")).all()
-            assert {r.owner_id for r in rows} == {owner1, owner2}
-
-    async def test_api_error_propagates(self, mock_manager, mock_spotify):
-        mock_spotify.playlist.side_effect = _http_error()
-
-        with pytest.raises(tk.HTTPError):
-            await mock_manager.sync_playlist("pl1", owner_id=1)
+            await mock_manager.create_playlist(name="Fail")
 
 
 class TestTimeoutRetryingSender:

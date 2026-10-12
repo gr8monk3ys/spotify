@@ -12,7 +12,6 @@ from collections import Counter
 from dataclasses import replace
 
 import pytest
-from sqlmodel import Session, select
 
 from spotifyforge.core.audio_features import AudioFeature
 from spotifyforge.core.curation import (
@@ -28,7 +27,6 @@ from spotifyforge.core.curation import (
     reflow,
     writable_specs,
 )
-from spotifyforge.models.models import Playlist
 
 
 def _ct(
@@ -494,25 +492,14 @@ def test_flow_preserves_track_set_and_handles_tiny_lists():
 # ---------------------------------------------------------------------------
 
 
-async def test_forged_playlist_lands_on_spotify_and_in_db(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_forged_playlist_lands_on_spotify(fake_spotify, client_for):
     from spotifyforge.core.playlist_manager import PlaylistManager
-    from spotifyforge.db.engine import get_engine
-    from spotifyforge.models.models import User
 
     fake_spotify.add_user("user1")
     for i in range(20):
         fake_spotify.add_track(f"t{i}", artist_id=f"art{i % 4}", artist_name=f"Artist {i % 4}")
         fake_spotify.save_track("user1", f"t{i}")
         fake_spotify.set_artist_genres(f"art{i % 4}", ["coldwave"])
-
-    with Session(get_engine()) as session:
-        user = User(spotify_id="user1")
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-        owner_id = user.id
 
     sp = client_for("user1")
     engine = CurationEngine(sp)
@@ -523,7 +510,6 @@ async def test_forged_playlist_lands_on_spotify_and_in_db(
     spec = specs[0]
     playlist = await PlaylistManager(sp).create_playlist_with_tracks(
         name=spec.title,
-        owner_id=owner_id,
         tracks=spec.tracks,
         description=spec.description,
     )
@@ -531,12 +517,7 @@ async def test_forged_playlist_lands_on_spotify_and_in_db(
     # On the fake Spotify: playlist exists with all 20 tracks in spec order.
     assert fake_spotify.playlists[playlist.spotify_id]["name"] == spec.title
     assert fake_spotify.playlist_tracks[playlist.spotify_id] == [t.id for t in spec.tracks]
-
-    # In the local DB: the Playlist row was persisted.
-    with Session(get_engine()) as session:
-        row = session.exec(select(Playlist).where(Playlist.spotify_id == playlist.spotify_id)).one()
-        assert row.name == spec.title
-        assert row.owner_id == owner_id
+    assert playlist.name == spec.title
 
 
 # ---------------------------------------------------------------------------
@@ -620,24 +601,21 @@ async def test_plan_splits_a_large_genre_by_decade(fake_spotify, client_for):
     assert all(len(s.tracks) <= 30 for s in plan.specs if s.decade)
 
 
-async def test_forge_next_is_resumable_and_skips_existing(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_forge_next_is_resumable_and_skips_existing(fake_spotify, client_for):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
     assert len(plan.specs) >= 2
 
-    created, pending = await forge_next(manager, owner_id, plan.specs, limit=1, delay=0)
+    created, pending = await forge_next(manager, plan.specs, limit=1, delay=0)
     assert len(created) == 1
     assert pending == len(plan.specs)
 
     # Second run must not recreate the first playlist.
-    created2, pending2 = await forge_next(manager, owner_id, plan.specs, limit=1, delay=0)
+    created2, pending2 = await forge_next(manager, plan.specs, limit=1, delay=0)
     assert len(created2) == 1
     assert pending2 == len(plan.specs) - 1
     assert created2[0][0].title != created[0][0].title
@@ -646,35 +624,29 @@ async def test_forge_next_is_resumable_and_skips_existing(
     assert len(names) == len(set(names))  # no duplicates created
 
 
-async def test_forge_next_reports_nothing_pending_when_drained(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_forge_next_reports_nothing_pending_when_drained(fake_spotify, client_for):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
 
-    await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
-    created, pending = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    await forge_next(manager, plan.specs, limit=99, delay=0)
+    created, pending = await forge_next(manager, plan.specs, limit=99, delay=0)
 
     assert created == []
     assert pending == 0
 
 
-async def test_reflow_rewrites_a_scrambled_playlist_in_place(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_reflow_rewrites_a_scrambled_playlist_in_place(fake_spotify, client_for):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
-    created, _ = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    created, _ = await forge_next(manager, plan.specs, limit=99, delay=0)
 
     spec, playlist = created[0]
     wanted = [t.id for t in spec.tracks]
@@ -690,33 +662,27 @@ async def test_reflow_rewrites_a_scrambled_playlist_in_place(
     assert playlist.spotify_id in fake_spotify.playlists
 
 
-async def test_reflow_is_a_no_op_when_order_already_matches(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_reflow_is_a_no_op_when_order_already_matches(fake_spotify, client_for):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
-    await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    await forge_next(manager, plan.specs, limit=99, delay=0)
 
     assert await reflow(manager, sp, plan.specs, delay=0) == ([], [])
 
 
-async def test_reflow_handles_playlists_longer_than_one_request(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_reflow_handles_playlists_longer_than_one_request(fake_spotify, client_for):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     # 150 tracks in one genre exceeds the 100-URI replace limit.
     _seed_library(fake_spotify, genres=("coldwave",), count=150)
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10, max_size=200))
-    created, _ = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    created, _ = await forge_next(manager, plan.specs, limit=99, delay=0)
 
     spec, playlist = created[0]
     assert len(spec.tracks) > 100
@@ -726,20 +692,17 @@ async def test_reflow_handles_playlists_longer_than_one_request(
     assert fake_spotify.playlist_tracks[playlist.spotify_id] == [t.id for t in spec.tracks]
 
 
-async def test_reflow_keeps_going_when_one_playlist_fails(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_reflow_keeps_going_when_one_playlist_fails(fake_spotify, client_for):
     """A timeout on one playlist must not discard hundreds of others."""
     import httpx
 
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
-    created, _ = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    created, _ = await forge_next(manager, plan.specs, limit=99, delay=0)
     assert len(created) >= 2
 
     for _, playlist in created:
@@ -974,17 +937,14 @@ def test_description_stays_within_spotify_limit():
     assert len(spec.description) <= 300
 
 
-async def test_apply_descriptions_updates_stale_text_and_skips_current(
-    fake_spotify, client_for, isolated_db, db_user
-):
+async def test_apply_descriptions_updates_stale_text_and_skips_current(fake_spotify, client_for):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_library(fake_spotify, count=40)
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
     plan = await plan_catalogue(sp, CurationOptions(min_size=10))
-    created, _ = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    created, _ = await forge_next(manager, plan.specs, limit=99, delay=0)
 
     # Freshly forged playlists already carry the wanted text — even once
     # Spotify hands it back HTML-escaped, as it does live.

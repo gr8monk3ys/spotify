@@ -44,8 +44,7 @@ if TYPE_CHECKING:
 
     from tekore import Spotify
 
-    from spotifyforge.core.playlist_manager import PlaylistManager
-    from spotifyforge.models.models import Playlist
+    from spotifyforge.core.playlist_manager import CreatedPlaylist, PlaylistManager
 
 logger = logging.getLogger(__name__)
 
@@ -1202,12 +1201,11 @@ async def plan_catalogue(
 
 async def forge_next(
     manager: PlaylistManager,
-    owner_id: int,
     specs: list[PlaylistSpec],
     limit: int,
     public: bool = True,
     delay: float = _FORGE_DELAY,
-) -> tuple[list[tuple[PlaylistSpec, Playlist]], int]:
+) -> tuple[list[tuple[PlaylistSpec, CreatedPlaylist]], int]:
     """Create up to *limit* specs that are not on the account yet.
 
     Returns the created pairs and how many specs were still pending
@@ -1217,11 +1215,10 @@ async def forge_next(
     existing = {p["name"] for p in await manager.get_user_playlists()}
     pending = [s for s in specs if s.title not in existing]
 
-    created: list[tuple[PlaylistSpec, Playlist]] = []
+    created: list[tuple[PlaylistSpec, CreatedPlaylist]] = []
     for spec in pending[:limit]:
         playlist = await manager.create_playlist_with_tracks(
             name=spec.title,
-            owner_id=owner_id,
             tracks=spec.tracks,
             description=spec.description,
             public=public,

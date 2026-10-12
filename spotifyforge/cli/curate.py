@@ -8,7 +8,6 @@ from rich.panel import Panel
 from rich.table import Table
 
 from spotifyforge.cli._shared import (
-    _db_user_id,
     _error_panel,
     _run,
     _run_spotify,
@@ -182,16 +181,13 @@ def curate_forge(
     from spotifyforge.core.curation import forge_next, writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
 
-    owner_id = _db_user_id()
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
 
     async def _forge(sp):
         plan = await _plan(sp, opts, features)
         specs = writable_specs(plan.specs, min_size)
-        created, pending = await forge_next(
-            PlaylistManager(sp), owner_id, specs, limit, public=not private
-        )
+        created, pending = await forge_next(PlaylistManager(sp), specs, limit, public=not private)
         return created, pending, len(specs)
 
     created, pending, total = _run_spotify(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -15,7 +14,6 @@ from rich.panel import Panel
 from rich.table import Table
 
 from spotifyforge.cli._shared import (
-    _db_user_id,
     _error_panel,
     _run_spotify,
     console,
@@ -135,13 +133,11 @@ def playlist_create(
     """Create a new Spotify playlist."""
     from spotifyforge.core.playlist_manager import PlaylistManager
 
-    owner_id = _db_user_id()
-
     playlist = _run_spotify(
         "Creating playlist...",
         "Failed to create playlist",
         lambda sp: PlaylistManager(sp).create_playlist(
-            name=name, owner_id=owner_id, description=description, public=public
+            name=name, description=description, public=public
         ),
     )
 
@@ -153,33 +149,6 @@ def playlist_create(
             f"  Visibility:  {'Public' if public else 'Private'}\n"
             f"  Description: {description or '(none)'}",
             title="New Playlist",
-            border_style="green",
-            expand=False,
-        )
-    )
-
-
-@playlist_app.command("sync")
-def playlist_sync(
-    playlist_id: str = typer.Argument(..., help="Spotify playlist ID to sync."),
-) -> None:
-    """Sync a playlist to the local cache database."""
-    from spotifyforge.core.playlist_manager import PlaylistManager
-
-    owner_id = _db_user_id()
-    playlist = _run_spotify(
-        "Syncing playlist...",
-        "Sync failed",
-        lambda sp: PlaylistManager(sp).sync_playlist(playlist_id, owner_id=owner_id),
-    )
-
-    console.print(
-        Panel(
-            f"[green]Playlist synced to local cache.[/green]\n\n"
-            f"  Playlist: [bold]{playlist.name}[/bold]\n"
-            f"  Tracks synced: {playlist.track_count}\n"
-            f"  Last synced: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            title="Sync Complete",
             border_style="green",
             expand=False,
         )
@@ -269,7 +238,9 @@ def playlist_export(
 
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(export_data, encoding="utf-8")
+        # newline="": the csv module already wrote CRLF row endings; text mode
+        # on Windows would double the CR and leave a blank line between rows.
+        output.write_text(export_data, encoding="utf-8", newline="")
         console.print(f"[green]Exported {len(tracks)} tracks to[/green] [bold]{output}[/bold]")
     else:
         console.print(export_data)

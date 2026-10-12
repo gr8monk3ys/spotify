@@ -313,37 +313,3 @@ class DiscoveryEngine:
         tracks = await self.get_user_top_tracks(time_range=time_range, limit=50)
         logger.info("Built time capsule (%s): %d tracks", time_range, len(tracks))
         return tracks
-
-
-# ---------------------------------------------------------------------------
-# Serialisers shared by the web routes and CLI
-# ---------------------------------------------------------------------------
-
-
-def track_to_dict(track: Any) -> dict[str, Any]:
-    """Convert a Tekore ``FullTrack`` to a plain dict for API responses."""
-    from datetime import UTC, datetime
-
-    return {
-        "id": 0,
-        "spotify_id": track.id or "",
-        "name": track.name or "",
-        "artist_names": [a.name for a in track.artists] if track.artists else [],
-        "album_name": track.album.name if track.album else None,
-        "album_id": track.album.id if track.album else None,
-        "duration_ms": track.duration_ms or 0,
-        "popularity": track.popularity,
-        "isrc": None,
-        "cached_at": datetime.now(UTC).isoformat(),
-    }
-
-
-def artist_to_dict(artist: Any) -> dict[str, Any]:
-    """Convert a Tekore ``FullArtist`` to a plain dict for API responses."""
-    return {
-        "id": artist.id or "",
-        "name": artist.name or "",
-        "genres": list(artist.genres) if artist.genres else [],
-        "popularity": artist.popularity,
-        "followers": artist.followers.total if artist.followers else 0,
-    }

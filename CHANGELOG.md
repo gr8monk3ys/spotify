@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* **mcp:** `spotifyforge mcp` serves the curation core to MCP clients over stdio
+
+### Removed
+
+* the FastAPI server, the APScheduler service and `schedule` commands, the
+  SQLite database with its Alembic migrations, and the Docker files. Nothing
+  in the CLI read the database back; tokens were already in the OS keyring.
+  `playlist sync` (which only filled that database) is gone with it.
+* settings `SECRET_KEY`, `ENVIRONMENT`, `DB_PATH`, `DATABASE_URL`, `WEB_HOST`,
+  `WEB_PORT` and `SCHEDULER_ENABLED`. They are ignored if still present in
+  `.env`. `DATA_DIR` (default `~/.spotifyforge`) replaces the parent of
+  `DB_PATH` as the home of the JSON sidecars.
+
+### Bug Fixes
+
+* **playlist:** `export --format csv -o FILE` wrote a blank line between rows on Windows
+
 ## 0.1.0 (2026-08-19)
 
 

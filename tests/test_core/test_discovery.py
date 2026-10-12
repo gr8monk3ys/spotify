@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import tekore as tk
 
-from spotifyforge.core.discovery import DiscoveryEngine, artist_to_dict, track_to_dict
+from spotifyforge.core.discovery import DiscoveryEngine
 
 # ---------------------------------------------------------------------------
 # Helpers -- lightweight stand-ins for Tekore response objects
@@ -793,72 +793,6 @@ class TestBuildTimeCapsule:
 
         with pytest.raises(tk.HTTPError):
             await engine.build_time_capsule()
-
-
-# ===================================================================
-# Serializers (module-level, shared by web routes and CLI)
-# ===================================================================
-
-
-class TestSerializers:
-    """track_to_dict / artist_to_dict convert Tekore models to plain dicts."""
-
-    def test_track_to_dict_full(self):
-        track = SimpleNamespace(
-            id="t1",
-            name="Song",
-            artists=[SimpleNamespace(name="A"), SimpleNamespace(name="B")],
-            album=SimpleNamespace(id="alb1", name="Album"),
-            duration_ms=210_000,
-            popularity=63,
-        )
-        result = track_to_dict(track)
-        assert result["spotify_id"] == "t1"
-        assert result["name"] == "Song"
-        assert result["artist_names"] == ["A", "B"]
-        assert result["album_name"] == "Album"
-        assert result["album_id"] == "alb1"
-        assert result["duration_ms"] == 210_000
-        assert result["popularity"] == 63
-        assert result["isrc"] is None
-        assert isinstance(result["cached_at"], str)
-
-    def test_track_to_dict_handles_missing_fields(self):
-        track = SimpleNamespace(
-            id=None, name=None, artists=None, album=None, duration_ms=None, popularity=None
-        )
-        result = track_to_dict(track)
-        assert result["spotify_id"] == ""
-        assert result["name"] == ""
-        assert result["artist_names"] == []
-        assert result["album_name"] is None
-        assert result["album_id"] is None
-        assert result["duration_ms"] == 0
-
-    def test_artist_to_dict_full(self):
-        artist = SimpleNamespace(
-            id="a1",
-            name="Artist",
-            genres=["jazz", "bop"],
-            popularity=71,
-            followers=SimpleNamespace(total=1234),
-        )
-        result = artist_to_dict(artist)
-        assert result == {
-            "id": "a1",
-            "name": "Artist",
-            "genres": ["jazz", "bop"],
-            "popularity": 71,
-            "followers": 1234,
-        }
-
-    def test_artist_to_dict_handles_missing_fields(self):
-        artist = SimpleNamespace(id=None, name=None, genres=None, popularity=None, followers=None)
-        result = artist_to_dict(artist)
-        assert result["id"] == ""
-        assert result["name"] == ""
-        assert result["genres"] == []
-        assert result["followers"] == 0
 
 
 # ===================================================================

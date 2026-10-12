@@ -228,7 +228,7 @@ def test_write_export_keeps_a_legacy_sidecar_for_old_readers(monkeypatch, tmp_pa
 
     monkeypatch.setenv("MUSIC_DIR", str(tmp_path / "music"))
     fresh = Settings()
-    fresh.db_path = tmp_path / "cfg" / "app.db"
+    fresh.data_dir = tmp_path / "cfg"
     monkeypatch.setattr("spotifyforge.config.settings", fresh)
 
     target = export.write_export(_build([_track("t1")]))
