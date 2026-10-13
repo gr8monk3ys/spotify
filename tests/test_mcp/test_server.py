@@ -219,9 +219,13 @@ async def test_list_and_get_playlist(logged_in):
     fake.add_user("other")
     fake.add_track("t1", name="Song A")
     fake.add_playlist("mine", name="Mine", track_ids=["t1"])
+    fake.add_playlist("theirs", owner="other", name="Followed")
+    fake.follow_playlist("user1", "theirs")
 
     listed = await _ok("list_playlists")
     assert [p["id"] for p in listed["playlists"]] == ["mine"]
+    everything = await _ok("list_playlists", owned_only=False)
+    assert {p["id"] for p in everything["playlists"]} == {"mine", "theirs"}
 
     got = await _ok("get_playlist", playlist_id="mine")
     assert got["name"] == "Mine"

@@ -203,6 +203,7 @@ async def test_write_never_touches_someone_elses_playlist_of_the_same_name(
     fake.add_track("t1")
     fake.add_track("theirs")
     fake.add_playlist("followed", owner="other", name="Soundtracks", track_ids=["theirs"])
+    fake.follow_playlist("user1", "followed")
 
     created = await write_playlist(client_for(), "Soundtracks", "desc", ["spotify:track:t1"])
 

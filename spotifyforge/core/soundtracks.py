@@ -194,12 +194,7 @@ async def write_playlist(sp: Spotify, name: str, description: str, uris: list[st
     playlist keeps its URL as the film list grows. New playlists are private.
     """
     manager = PlaylistManager(sp)
-    me = await sp.current_user()
-    mine = [
-        p
-        for p in await manager.get_user_playlists()
-        if p["name"] == name and p["owner_id"] == me.id
-    ]
+    mine = [p for p in await manager.get_owned_playlists() if p["name"] == name]
     if not mine:
         created = await manager.create_playlist(name=name, description=description, public=False)
         await manager.add_tracks(created.spotify_id, uris)

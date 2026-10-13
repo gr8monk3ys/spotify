@@ -85,6 +85,9 @@ class FakeSpotify:
         self.artist_names: dict[str, str] = {}
         self.followed_artists: dict[str, set[str]] = {}  # user -> artist ids
         self.saved_albums: dict[str, list[str]] = {}  # user -> saved album ids
+        # user -> playlists they follow but do not own; Spotify lists these
+        # alongside the user's own, which is why callers must check the owner.
+        self.followed_playlists: dict[str, list[str]] = {}
         # user -> (played_at ISO, track id, context URI or None), in any order
         self.recent_plays: dict[str, list[tuple[str, str, str | None]]] = {}
 
@@ -224,6 +227,10 @@ class FakeSpotify:
     def play(self, user_id: str, track_id: str, played_at: str, context: str | None = None) -> None:
         """Record that *user_id* played *track_id* at *played_at* (ISO 8601)."""
         self.recent_plays.setdefault(user_id, []).append((played_at, track_id, context))
+
+    def follow_playlist(self, user_id: str, playlist_id: str) -> None:
+        """Make *user_id* follow a playlist someone else owns."""
+        self.followed_playlists.setdefault(user_id, []).append(playlist_id)
 
     def set_artist_genres(self, artist_id: str, genres: list[str]) -> None:
         """Set the genre list returned for *artist_id* by ``GET /v1/artists``."""
@@ -412,6 +419,7 @@ class FakeSpotify:
                 self.playlists[pid]["description"] = body.get("description", "")
                 return httpx.Response(201, json=self._playlist_payload(pid))
             owned = [p for p, m in self.playlists.items() if m["owner"] == user_id]
+            owned += [p for p in self.followed_playlists.get(user_id, []) if p in self.playlists]
             items = [self._simple_playlist_payload(p) for p in owned[offset : offset + limit]]
             return httpx.Response(
                 200,

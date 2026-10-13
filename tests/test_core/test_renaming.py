@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from spotifyforge.core.curation import CurationTrack, legacy_title, title_for
 from spotifyforge.core.playlist_manager import PlaylistManager
 from spotifyforge.core.renaming import (
+    LiveContentsError,
     Rename,
     apply_renames,
     match_by_contents,
     migrate_cover_picks,
     plan_renames,
+    read_live_contents,
 )
 
 
@@ -308,3 +312,42 @@ async def test_other_peoples_playlists_are_never_touched(fake_spotify, client_fo
     assert renamed == []
     assert failed == ["strictly techno"]
     assert fake_spotify.playlists["pl9"]["name"] == "strictly techno"
+
+
+# ---------------------------------------------------------------------------
+# Reading the live catalogue (what migrate matches against)
+# ---------------------------------------------------------------------------
+
+
+async def test_live_contents_are_read_for_owned_playlists_only(fake_spotify, client_for):
+    fake = fake_spotify
+    fake.add_user("user1")
+    fake.add_user("other")
+    for track_id in ("t1", "t2", "t3"):
+        fake.add_track(track_id)
+    fake.add_playlist("mine", name="coldwave", track_ids=["t1", "t2"])
+    fake.add_playlist("empty", name="new and empty", track_ids=[])
+    fake.add_playlist("theirs", owner="other", name="followed", track_ids=["t3"])
+    fake.follow_playlist("user1", "theirs")
+
+    live = await read_live_contents(PlaylistManager(client_for()))
+
+    assert live == {"coldwave": {"t1", "t2"}, "new and empty": set()}
+
+
+async def test_reading_every_playlist_as_empty_is_an_error_not_a_clean_catalogue(
+    fake_spotify, client_for
+):
+    fake = fake_spotify
+    fake.add_user("user1")
+    fake.add_playlist("a", name="one", track_ids=[])
+    fake.add_playlist("b", name="two", track_ids=[])
+
+    with pytest.raises(LiveContentsError, match="Read no tracks from any of 2"):
+        await read_live_contents(PlaylistManager(client_for()))
+
+
+async def test_an_account_with_no_playlists_reads_as_empty(fake_spotify, client_for):
+    fake_spotify.add_user("user1")
+
+    assert await read_live_contents(PlaylistManager(client_for())) == {}

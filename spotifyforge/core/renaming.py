@@ -162,6 +162,41 @@ def migrate_cover_picks(renames: list[Rename], path: Path | None = None) -> int:
     return moved
 
 
+class LiveContentsError(RuntimeError):
+    """The live playlists could not be read well enough to match against."""
+
+
+async def read_live_contents(manager: PlaylistManager) -> dict[str, set[str]]:
+    """Title -> track ids for every playlist the user owns.
+
+    This is what :func:`match_by_contents` decides every match on, so a
+    bad read must not pass for a clean catalogue. Reading every owned
+    playlist as empty would report "nothing to rename" with total
+    confidence; that case is raised instead.
+    """
+    from functools import partial
+
+    from spotifyforge.core.curation import gather_bounded
+
+    owned = await manager.get_owned_playlists()
+
+    async def contents(playlist: dict[str, Any]) -> tuple[str, set[str]]:
+        # get_playlist_tracks yields PlaylistTrack wrappers, not tracks;
+        # reading .id off the wrapper silently gives None for every row,
+        # which matches nothing and reports a confident zero.
+        items = await manager.get_playlist_tracks(playlist["id"])
+        held = {i.track.id for i in items if i.track is not None and i.track.id is not None}
+        return playlist["name"], held
+
+    live = dict(await gather_bounded([partial(contents, p) for p in owned]))
+    if owned and not any(live.values()):
+        raise LiveContentsError(
+            f"Read no tracks from any of {len(owned)} owned playlists; "
+            "refusing to report a migration based on that."
+        )
+    return live
+
+
 async def apply_renames(
     manager: PlaylistManager,
     spotify: Spotify,
@@ -175,11 +210,9 @@ async def apply_renames(
     ones already carrying their new name (a re-run after an interrupted
     one), and the titles that could not be found or written.
     """
-    owned: dict[str, dict[str, Any]] = {}
-    me = await spotify.current_user()
-    for playlist in await manager.get_user_playlists():
-        if playlist["owner_id"] == me.id:
-            owned[playlist["name"]] = playlist
+    owned: dict[str, dict[str, Any]] = {
+        playlist["name"]: playlist for playlist in await manager.get_owned_playlists()
+    }
 
     renamed: list[Rename] = []
     already: list[str] = []

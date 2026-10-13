@@ -100,6 +100,17 @@ class PlaylistManager:
 
         return playlists
 
+    async def get_owned_playlists(self) -> list[dict[str, Any]]:
+        """The playlists the current user owns, in the shape of :meth:`get_user_playlists`.
+
+        Everything that writes to, counts or retires playlists wants this
+        rather than the full listing: a playlist the user merely follows
+        is someone else's, and treating it as theirs is how a followed
+        playlist gets renamed, measured or unfollowed by mistake.
+        """
+        me = await self._sp.current_user()
+        return [p for p in await self.get_user_playlists() if p["owner_id"] == me.id]
+
     async def get_playlist_details(self, playlist_id: str) -> dict[str, Any]:
         """Fetch a single playlist with its tracks from Spotify.
 
