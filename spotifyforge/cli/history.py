@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import typer
 from rich import box
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -90,14 +91,16 @@ def history_show(
     tracks.add_column("Plays", justify="right")
     tracks.add_column("Track", no_wrap=True, max_width=45)
     tracks.add_column("Artist", style="green", no_wrap=True, max_width=30)
+    # Titles and artist names are other people's text: escaped, so one
+    # containing [link=...] or [red] is printed, not interpreted.
     for name, artists, count in summary.top_tracks:
-        tracks.add_row(str(count), name, artists)
+        tracks.add_row(str(count), escape(name), escape(artists))
     console.print(tracks)
 
     artists_table = Table(box=box.SIMPLE, header_style="bold cyan", title="Top artists")
     artists_table.add_column("Plays", justify="right")
     artists_table.add_column("Artist", style="green")
     for artist, count in summary.top_artists:
-        artists_table.add_row(str(count), artist)
+        artists_table.add_row(str(count), escape(artist))
     console.print(artists_table)
     console.print(f"[dim]{history_path()}[/dim]")

@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 538 tests run in under a minute with no network.
+end. The 539 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept

@@ -483,7 +483,9 @@ async def recently_played(limit: int = 50) -> dict[str, Any]:
     }
 
 
-@server.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+# No request is made, but what comes back is still track and artist text
+# written by other people, so it carries the same open-world hint as the rest.
+@server.tool(annotations=_READ_ONLY)
 async def listening_history(days: int = 30, top: int = 20) -> dict[str, Any]:
     """What the user actually played over the last `days` days, counted.
 

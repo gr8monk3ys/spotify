@@ -550,6 +550,23 @@ class TestHistory:
         assert "Night Drive" in result.output
         assert "Alpha" in result.output
 
+    def test_show_prints_markup_in_a_track_name_literally(self, cli_env):
+        from datetime import UTC, datetime, timedelta
+
+        fake = cli_env
+        fake.add_track(
+            "t1", name="[link=https://evil.example]Free[/link]", artist_name="[red]X[/red]"
+        )
+        _login(fake)
+        fake.play("user1", "t1", (datetime.now(UTC) - timedelta(minutes=5)).isoformat())
+        runner.invoke(app, ["history", "sync"])
+
+        result = runner.invoke(app, ["history", "show", "--days", "1"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "[link=https://evil.example]Free[/link]" in result.output
+        assert "[red]X[/red]" in result.output
+
     def test_show_with_no_history_says_how_to_start(self, cli_env):
         result = runner.invoke(app, ["history", "show"])
         assert result.exit_code == 0

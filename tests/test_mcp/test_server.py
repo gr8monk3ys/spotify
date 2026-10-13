@@ -56,6 +56,8 @@ async def test_lists_the_tools_with_read_only_hints():
         tools
     )
     assert tools["search_liked"].annotations.read_only_hint is True
+    # Every tool returns text written by other people, local log included.
+    assert all(tool.annotations.open_world_hint is not False for tool in tools.values())
     assert tools["create_playlist"].annotations.read_only_hint is False
     # The bulk catalogue writers stay in the CLI.
     assert not {"forge", "reflow", "retire"} & set(tools)
