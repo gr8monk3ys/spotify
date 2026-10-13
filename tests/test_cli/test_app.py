@@ -477,6 +477,43 @@ class TestCurateStats:
         assert "Quiet Corner" in second.output
 
 
+class TestCurateGenres:
+    def test_reports_what_the_fallback_classified(self, cli_env, monkeypatch):
+        """MusicBrainz itself is faked one level down (test_genre_fallback);
+        here the lookup is stubbed so the command's own counting is what runs."""
+        from spotifyforge.core import genre_fallback
+
+        fake = cli_env
+        fake.add_track("t1", artist_id="tagged", artist_name="Tagged", album_id="alb1")
+        fake.add_track("t2", artist_id="blank", artist_name="Blank", album_id="alb2")
+        fake.add_track("t3", artist_id="lost", artist_name="Lost", album_id="alb3")
+        fake.set_artist_genres("tagged", ["dream pop"])
+        _login(fake)
+        for track_id in ("t1", "t2", "t3"):
+            fake.save_track("user1", track_id)
+
+        async def fake_fetch(tracks, cache, client=None, progress=None):
+            cache.put("blank", ["dream pop", "seen live"], "mb-1")
+            cache.put("lost", [], None)
+            cache.save()
+            return genre_fallback.FetchReport(artists_asked=2, artists_tagged=1)
+
+        monkeypatch.setattr(genre_fallback, "fetch_artist_tags", fake_fetch)
+
+        result = runner.invoke(app, ["curate", "genres"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "Songs without a genre:      2 of 3" in result.output
+        assert "Songs this run classified:  1" in result.output
+        assert "Still without a genre:      1" in result.output
+        assert "dream pop (1)" in result.output
+
+        # The cache it wrote is what planning now reads.
+        plan = runner.invoke(app, ["curate", "plan", "--min-size", "2"])
+        assert plan.exit_code == 0, plan.stderr
+        assert "dream pop" in plan.output
+
+
 class TestCurateFeatures:
     def test_looks_up_pinned_expansion_isrcs_too(self, cli_env, monkeypatch):
         from spotifyforge.core.curation import CurationTrack

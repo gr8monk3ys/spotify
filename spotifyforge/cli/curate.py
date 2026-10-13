@@ -875,6 +875,71 @@ def curate_stats() -> None:
     console.print(f"[dim]History: {path}[/dim]")
 
 
+@curate_app.command("genres")
+def curate_genres(max_tracks: int | None = _MAX_TRACKS) -> None:
+    """Fill in genres for artists Spotify has not tagged, from MusicBrainz.
+
+    Spotify tags genres on artists and leaves many blank, so their songs
+    can only land in a "beyond genre" playlist. This looks each of those
+    artists up on MusicBrainz by the ISRC of one of your liked songs,
+    and caches their tags. A tag counts as a genre only if it is already
+    a genre elsewhere in your library, so newly classified songs join
+    playlists that exist.
+
+    It only fills the cache. The songs move the next time you run
+    [bold]curate plan[/bold] / [bold]reflow[/bold].
+    """
+    from collections import Counter
+
+    from spotifyforge.core.curation import CurationEngine, dedupe_versions
+    from spotifyforge.core.genre_fallback import (
+        TagCache,
+        apply_fallback,
+        cache_path,
+        fetch_artist_tags,
+        untagged_artists,
+    )
+
+    async def _read(sp):
+        engine = CurationEngine(sp)
+        return dedupe_versions(await engine.enrich_genres(await engine.fetch_liked(max_tracks)))
+
+    tracks = _run_spotify("Reading your liked songs...", "Failed to read library", _read)
+    blank_before = [t for t in tracks if not t.genres]
+    cache = TagCache()
+    due = sum(1 for artist in untagged_artists(blank_before) if cache.due(artist))
+
+    from rich.progress import Progress
+
+    with Progress(transient=True) as progress:
+        task = progress.add_task("Asking MusicBrainz...", total=due or 1)
+        report = _run(
+            fetch_artist_tags(blank_before, cache, progress=lambda n: progress.advance(task, n))
+        )
+
+    after = apply_fallback(tracks, cache.tags())
+    placed = [t for t in after if t.genres and t.id in {b.id for b in blank_before}]
+    gained = Counter(genre for t in placed for genre in t.genres)
+
+    body = (
+        f"Songs without a genre:      [bold]{len(blank_before)}[/bold] of {len(tracks)}\n"
+        f"Artists asked about:        [bold]{report.artists_asked}[/bold] "
+        f"({report.artists_tagged} had tags)\n"
+        f"Songs this run classified:  [bold]{len(placed)}[/bold]\n"
+        f"Still without a genre:      [bold]{len(blank_before) - len(placed)}[/bold]"
+    )
+    if gained:
+        top = ", ".join(f"{genre} ({count})" for genre, count in gained.most_common(8))
+        body += f"\nMost common:                {top}"
+    console.print(Panel(body, title="Genre fallback", border_style="cyan", expand=False))
+    console.print(f"[dim]Cache: {cache_path()}[/dim]")
+    if placed:
+        console.print(
+            "Run [bold]spotifyforge curate plan[/bold] to see where they land; "
+            "[bold]reflow[/bold] moves them."
+        )
+
+
 @curate_app.command("features")
 def curate_features(
     deep: bool = typer.Option(

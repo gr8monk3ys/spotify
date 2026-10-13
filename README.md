@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 539 tests run in under a minute with no network.
+end. The 552 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept
@@ -28,6 +28,15 @@ from Deezer and AcousticBrainz, looked up by ISRC (`core/audio_features.py`).
 On my library that covered key for 52% of recordings, enough for 97 of the
 221 playlists to be sequenced by Camelot-wheel key distance; the rest fall
 back to a popularity arc. Same-artist separation always outranks harmony.
+
+Spotify also leaves a lot of artists with no genres at all: 753 of my 2,662
+unique liked songs had nowhere to go but a "beyond genre" playlist.
+`curate genres` asks MusicBrainz about those artists (`core/genre_fallback.py`),
+finding each one by the ISRC of a liked song rather than by name, so "Part
+Time" never inherits the tags of some other act called Part Time. A tag is
+only accepted as a genre if Spotify already uses it elsewhere in the library,
+which keeps one vocabulary and filters out "seen live". That placed 424 of
+the 753; the other 329 stay unclassified rather than guessed.
 
 ## Install
 
@@ -51,6 +60,7 @@ Tokens go to the OS keyring.
 spotifyforge curate plan                 # preview the catalogue; writes nothing
 spotifyforge curate forge --limit 25     # create the next 25; re-run to continue
 spotifyforge curate features             # fetch tempo/key by ISRC, cached on disk
+spotifyforge curate genres               # genres for artists Spotify left untagged
 spotifyforge curate reflow --harmonic    # re-sequence in place, URLs preserved
 spotifyforge curate curators             # people whose public playlists overlap yours
 
