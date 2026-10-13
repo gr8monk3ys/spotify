@@ -8,6 +8,8 @@
 * **history:** `history sync` appends recent plays to a local log, `history show`
   and the `listening_history` MCP tool summarise it
 * **auth:** concurrent processes take a lock before refreshing the shared token
+* **curate:** `curate genres` fills in genres for artists Spotify has not tagged,
+  from MusicBrainz tags looked up by ISRC
 
 ### Removed
 

@@ -15,6 +15,19 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolated_data_dir(tmp_path, monkeypatch):
+    """Point every test at a throwaway data directory.
+
+    Core code reads its on-disk caches from ``settings.data_dir``. Without
+    this, a test run on a machine where the tool is in real use would read
+    (and could write) the developer's own ``~/.spotifyforge``.
+    """
+    from spotifyforge.config import settings
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+
+
 @pytest.fixture()
 def fake_spotify():
     """An in-memory Spotify backend, installed as the tekore sender seam.
@@ -73,13 +86,12 @@ def memory_token_store() -> MemoryTokenStore:
 
 
 @pytest.fixture()
-def app_env(fake_spotify, tmp_path, monkeypatch):
+def app_env(fake_spotify, monkeypatch):
     """Full app environment: fake Spotify, credentials, throwaway data dir.
 
     SpotifyAuth builds a fresh ``Settings()`` (env vars cover it); the
     settings singleton covers every other code path. ``data_dir`` is
-    redirected so sidecars and the logged-in-user marker never touch the
-    real ``~/.spotifyforge``.
+    already redirected for every test (``_isolated_data_dir``).
     """
     monkeypatch.setenv("SPOTIFYFORGE_SPOTIFY_CLIENT_ID", "test-client-id")
     monkeypatch.setenv("SPOTIFYFORGE_SPOTIFY_CLIENT_SECRET", "test-client-secret")
@@ -87,5 +99,4 @@ def app_env(fake_spotify, tmp_path, monkeypatch):
 
     monkeypatch.setattr(settings, "spotify_client_id", "test-client-id")
     monkeypatch.setattr(settings, "spotify_client_secret", "test-client-secret")
-    monkeypatch.setattr(settings, "data_dir", tmp_path)
     return fake_spotify

@@ -37,6 +37,7 @@ import httpx
 import tekore as tk
 
 from spotifyforge.core.audio_features import AudioFeature, key_distance
+from spotifyforge.core.genre_fallback import apply_fallback, load_fallback_tags
 from spotifyforge.core.playlist_manager import extract_isrc
 
 if TYPE_CHECKING:
@@ -254,6 +255,11 @@ class CurationEngine:
             replace(t, genres=genres_by_artist.get(t.artist_ids[0], ()) if t.artist_ids else ())
             for t in tracks
         ]
+        # Artists Spotify left blank take genres from the on-disk MusicBrainz
+        # cache, when `curate genres` has filled one. Applied here, at the
+        # single place genres are attached, so the plan, the export and the
+        # MCP tools cannot disagree about what a song is.
+        enriched = apply_fallback(enriched, load_fallback_tags())
         logger.info(
             "Enriched %d tracks from %d artists (%d without genres)",
             len(enriched),
