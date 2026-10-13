@@ -27,6 +27,7 @@ from collections import Counter
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Literal
 
 import httpx
@@ -38,6 +39,7 @@ from mcp.types import ToolAnnotations
 from spotifyforge.auth import session
 from spotifyforge.auth.oauth import AuthenticationError
 from spotifyforge.core.audio_features import AudioFeature, camelot, load_cached_features
+from spotifyforge.core.clock import utc_now
 from spotifyforge.core.curation import (
     CurationEngine,
     CurationOptions,
@@ -48,6 +50,7 @@ from spotifyforge.core.curation import (
 )
 from spotifyforge.core.discovery import DiscoveryEngine
 from spotifyforge.core.expansion import load_expansions
+from spotifyforge.core.history import load_plays, summarise
 from spotifyforge.core.playlist_manager import PlaylistManager
 from spotifyforge.core.stats import growth_since, load_previous, take_snapshot
 
@@ -477,4 +480,42 @@ async def recently_played(limit: int = 50) -> dict[str, Any]:
             {**_spotify_track_dict(item.track), "played_at": item.played_at.isoformat()}
             for item in items
         ]
+    }
+
+
+# No request is made, but what comes back is still track and artist text
+# written by other people, so it carries the same open-world hint as the rest.
+@server.tool(annotations=_READ_ONLY)
+async def listening_history(days: int = 30, top: int = 20) -> dict[str, Any]:
+    """What the user actually played over the last `days` days, counted.
+
+    Read from the local log that `spotifyforge history sync` keeps; no
+    Spotify request is made. Spotify itself only remembers the last 50
+    plays, so the log only reaches back to when that command started being
+    run on a schedule: check `first` before calling a period quiet.
+    top_contexts are the playlist, album or artist URIs things were played
+    from.
+    """
+    plays = load_plays(since=utc_now() - timedelta(days=max(1, days)))
+    if not plays:
+        return {
+            "plays": 0,
+            "note": (
+                "No plays are logged for this period. The log is filled by "
+                "`spotifyforge history sync`, which has to run about hourly."
+            ),
+        }
+    summary = summarise(plays, top=max(1, min(top, 100)))
+    return {
+        "plays": summary.plays,
+        "minutes": summary.minutes,
+        "distinct_tracks": summary.distinct_tracks,
+        "first": summary.first,
+        "last": summary.last,
+        "top_tracks": [
+            {"name": name, "artists": artists, "plays": count}
+            for name, artists, count in summary.top_tracks
+        ],
+        "top_artists": [{"artist": a, "plays": count} for a, count in summary.top_artists],
+        "top_contexts": [{"uri": uri, "plays": count} for uri, count in summary.top_contexts],
     }

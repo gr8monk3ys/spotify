@@ -521,6 +521,64 @@ class TestCurateFeatures:
 
 
 # ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+
+
+class TestHistory:
+    def test_sync_then_show(self, cli_env, tmp_path):
+        from datetime import UTC, datetime, timedelta
+
+        fake = cli_env
+        fake.add_track("t1", name="Night Drive", artist_name="Alpha")
+        _login(fake)
+        now = datetime.now(UTC)
+        for minutes in (30, 20):
+            fake.play("user1", "t1", (now - timedelta(minutes=minutes)).isoformat())
+
+        result = runner.invoke(app, ["history", "sync"])
+        assert result.exit_code == 0, result.stderr
+        assert "Added 2 play(s)" in result.output
+        assert (tmp_path / "listening_history.jsonl").exists()
+
+        # Nothing new: a second run adds nothing and loses nothing.
+        result = runner.invoke(app, ["history", "sync"])
+        assert "Added 0 play(s); the history now holds 2" in result.output
+
+        result = runner.invoke(app, ["history", "show", "--days", "1"])
+        assert result.exit_code == 0, result.stderr
+        assert "Night Drive" in result.output
+        assert "Alpha" in result.output
+
+    def test_show_prints_markup_in_a_track_name_literally(self, cli_env):
+        from datetime import UTC, datetime, timedelta
+
+        fake = cli_env
+        fake.add_track(
+            "t1", name="[link=https://evil.example]Free[/link]", artist_name="[red]X[/red]"
+        )
+        _login(fake)
+        fake.play("user1", "t1", (datetime.now(UTC) - timedelta(minutes=5)).isoformat())
+        runner.invoke(app, ["history", "sync"])
+
+        result = runner.invoke(app, ["history", "show", "--days", "1"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "[link=https://evil.example]Free[/link]" in result.output
+        assert "[red]X[/red]" in result.output
+
+    def test_show_with_no_history_says_how_to_start(self, cli_env):
+        result = runner.invoke(app, ["history", "show"])
+        assert result.exit_code == 0
+        assert "history sync" in result.output
+
+    def test_sync_requires_login(self, cli_env):
+        result = runner.invoke(app, ["history", "sync"])
+        assert result.exit_code == 1
+        assert "Not logged in" in result.stderr
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
