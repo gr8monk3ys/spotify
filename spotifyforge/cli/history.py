@@ -51,6 +51,79 @@ def history_sync() -> None:
     console.print(f"[dim]{result.path}[/dim]")
 
 
+@history_app.command("playlists")
+def history_playlists(
+    days: int | None = typer.Option(
+        None, "--days", "-d", min=1, help="Only the last N days (default: the whole log)."
+    ),
+) -> None:
+    """Which of your own playlists you actually play.
+
+    Counts the plays in the local log by where they were started from
+    and lists your playlists that were played, and how many never were.
+    It changes nothing. A play counts for a playlist only when it was
+    started from that playlist.
+    """
+    from spotifyforge.core.clock import utc_now
+    from spotifyforge.core.history import MIN_DAYS_TO_JUDGE, load_plays, playlist_usage
+    from spotifyforge.core.playlist_manager import PlaylistManager
+
+    plays = load_plays(since=utc_now() - timedelta(days=days) if days else None)
+    if not plays:
+        console.print(
+            Panel(
+                "No plays recorded yet.\n"
+                "Run [bold]spotifyforge history sync[/bold] on a schedule to start the log.",
+                title="Playlist usage",
+                border_style="yellow",
+                expand=False,
+            )
+        )
+        return
+
+    async def _owned(sp):
+        me = await sp.current_user()
+        return {
+            p["id"]: p["name"]
+            for p in await PlaylistManager(sp).get_user_playlists()
+            if p["owner_id"] == me.id
+        }
+
+    owned = _run_spotify("Reading your playlists...", "Failed to read playlists", _owned)
+    usage = playlist_usage(plays, owned)
+
+    console.print(
+        Panel(
+            f"Plays logged:            [bold]{usage.plays}[/bold] over "
+            f"[bold]{usage.days_covered}[/bold] day(s)\n"
+            f"From your own playlists: [bold]{usage.from_own_playlists}[/bold]\n"
+            f"From other playlists:    [bold]{usage.from_other_playlists}[/bold] "
+            "(followed, or made by Spotify)\n"
+            f"From albums:             [bold]{usage.from_albums}[/bold]\n"
+            f"From artist pages:       [bold]{usage.from_artists}[/bold]\n"
+            f"Elsewhere:               [bold]{usage.from_elsewhere}[/bold] "
+            "(liked songs, search, queue)\n"
+            f"Your playlists played:   [bold]{len(usage.played)}[/bold] of {len(owned)}",
+            title="Playlist usage",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    if usage.played:
+        table = Table(box=box.SIMPLE, header_style="bold cyan", title="Your playlists, by plays")
+        table.add_column("Plays", justify="right")
+        table.add_column("Playlist")
+        for _pid, name, count in usage.played:
+            table.add_row(str(count), escape(name))
+        console.print(table)
+    if not usage.long_enough_to_judge:
+        console.print(
+            f"[yellow]The log covers {usage.days_covered} day(s).[/yellow] Under "
+            f"{MIN_DAYS_TO_JUDGE}, an unplayed playlist mostly means the log is new, "
+            "not that the playlist is unused."
+        )
+
+
 @history_app.command("show")
 def history_show(
     days: int = typer.Option(30, "--days", "-d", min=1, help="How far back to look."),

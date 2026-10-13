@@ -604,6 +604,28 @@ class TestHistory:
         assert "[link=https://evil.example]Free[/link]" in result.output
         assert "[red]X[/red]" in result.output
 
+    def test_playlists_reports_usage_and_warns_while_the_log_is_young(self, cli_env):
+        from datetime import UTC, datetime, timedelta
+
+        fake = cli_env
+        fake.add_track("t1")
+        _login(fake)
+        fake.add_playlist("mine1", name="Late Set", track_ids=["t1"])
+        fake.add_playlist("mine2", name="Never Opened", track_ids=["t1"])
+        now = datetime.now(UTC)
+        fake.play("user1", "t1", (now - timedelta(minutes=9)).isoformat(), "spotify:playlist:mine1")
+        fake.play("user1", "t1", (now - timedelta(minutes=5)).isoformat(), "spotify:playlist:zzz")
+        runner.invoke(app, ["history", "sync"])
+
+        result = runner.invoke(app, ["history", "playlists"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "From your own playlists: 1" in result.output
+        assert "From other playlists:    1" in result.output
+        assert "Your playlists played:   1 of 2" in result.output
+        assert "Late Set" in result.output
+        assert "The log covers 1 day(s)" in result.output
+
     def test_show_with_no_history_says_how_to_start(self, cli_env):
         result = runner.invoke(app, ["history", "show"])
         assert result.exit_code == 0

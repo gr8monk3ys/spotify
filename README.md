@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 579 tests run in under a minute with no network.
+end. The 583 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept
@@ -71,6 +71,7 @@ spotifyforge discover deep-cuts <artist_id> --threshold 25
 
 spotifyforge history sync                # append recent plays to a local log (run hourly)
 spotifyforge history show --days 30      # what you actually played
+spotifyforge history playlists           # which of your own playlists you play
 
 # Other platforms (shared files in MUSIC_DIR, default ~/.music)
 spotifyforge export library                         # Write ~/.music/music-library.json for discogs
@@ -120,6 +121,7 @@ cannot, because it depends on how this package reads your library:
 | `audience_stats` | Follower counts for the account and each owned playlist |
 | `top_tracks`, `recently_played` | What Spotify itself reports |
 | `listening_history` | Plays counted from the local log `history sync` keeps |
+| `playlist_usage_report` | Which of your own playlists were played, and how many never were |
 
 So "make me a 25-track late-night jazz fusion playlist from my liked songs"
 becomes three calls: learn the genres, pick the tracks, create it sequenced.
