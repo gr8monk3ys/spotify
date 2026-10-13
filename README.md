@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 552 tests run in under a minute with no network.
+end. The 579 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept
@@ -76,6 +76,8 @@ spotifyforge history show --days 30      # what you actually played
 spotifyforge export library                         # Write ~/.music/music-library.json for discogs
 spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
 spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
+spotifyforge library soundtracks                    # Dry run: soundtracks of films rated 4.5+ on Letterboxd
+spotifyforge library soundtracks --apply            # Write them to one private playlist
 ```
 
 Groups: `auth`, `playlist`, `discover`, `curate`, `history`, `export`, `library`,

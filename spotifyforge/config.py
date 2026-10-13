@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 
+from media_core.paths import movies_dir as _default_movies_dir
 from media_core.paths import music_dir as _default_music_dir
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -37,6 +38,8 @@ class Settings(BaseSettings):
 
     # Shared interchange directory (music-library.json, discogs.json).
     music_dir: Path = Field(default_factory=_default_music_dir)
+    # Where the letterboxd repo writes letterboxd.json (MOVIES_DIR, ~/.movies).
+    movies_dir: Path = Field(default_factory=_default_movies_dir)
 
     # Logging
     log_level: str = "INFO"
@@ -48,6 +51,7 @@ class Settings(BaseSettings):
     def _expand_paths(self) -> "Settings":
         self.data_dir = self.data_dir.expanduser()
         self.music_dir = self.music_dir.expanduser()
+        self.movies_dir = self.movies_dir.expanduser()
         return self
 
 

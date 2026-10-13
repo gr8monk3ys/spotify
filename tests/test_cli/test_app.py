@@ -839,3 +839,71 @@ class TestLibrarySave:
 
         assert result.exit_code == 0, result.stderr
         assert "In Utero" in result.output
+
+
+class TestLibrarySoundtracks:
+    @pytest.fixture()
+    def films(self, cli_env, tmp_path):
+        """Two favourites, one with a soundtrack on Spotify and one without."""
+        fake = cli_env
+        fake.add_album(
+            "ost", "Aftersun (Original Motion Picture Soundtrack)", release_date="2023-01-01"
+        )
+        for track_id in ("o1", "o2", "o3"):
+            fake.add_track(track_id, album_id="ost")
+        fake.album_tracks["ost"] = ["o1", "o2", "o3"]
+        path = tmp_path / "letterboxd.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "letterboxd/1",
+                    "generated_at": "2026-08-30T00:00:00+00:00",
+                    "username": "someone",
+                    "films": [
+                        {"title": "Aftersun", "year": 2022, "rating": 4.5},
+                        {"title": "[red]Obscure[/red]", "year": 1970, "rating": 5.0},
+                        {"title": "Merely Fine", "year": 2020, "rating": 3.0},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        _login(fake)
+        return path
+
+    def test_dry_run_lists_matches_and_writes_nothing(self, cli_env, films):
+        result = runner.invoke(app, ["library", "soundtracks", "--file", str(films)])
+
+        assert result.exit_code == 0, result.stderr
+        # The table wraps at the test terminal's 80 columns, so assert on pieces.
+        assert "Aftersun (2022)" in result.output
+        assert "Artist One" in result.output
+        assert "[red]Obscure[/red]" in result.output  # printed, not interpreted
+        assert "Merely Fine" not in result.output
+        assert "1 of 2 films" in result.output
+        assert cli_env.playlists == {}
+
+    def test_apply_writes_one_private_playlist_and_updates_it_in_place(self, cli_env, films):
+        fake = cli_env
+        args = ["library", "soundtracks", "--file", str(films), "--apply"]
+
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.stderr
+        assert "Created" in result.output
+        ((pid, meta),) = fake.playlists.items()
+        assert meta["name"] == "Soundtracks: films I rated 4.5+"
+        assert meta["public"] is False
+        assert fake.playlist_tracks[pid] == ["o1", "o2"]
+
+        result = runner.invoke(app, [*args, "--per-film", "3"])
+        assert "Updated" in result.output
+        assert len(fake.playlists) == 1
+        assert fake.playlist_tracks[pid] == ["o1", "o2", "o3"]
+
+    def test_missing_file_exits_2(self, cli_env, tmp_path):
+        _login(cli_env)
+        result = runner.invoke(
+            app, ["library", "soundtracks", "--file", str(tmp_path / "missing.json")]
+        )
+        assert result.exit_code == 2
+        assert "letterboxd export" in result.stderr
