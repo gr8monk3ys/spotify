@@ -5,6 +5,9 @@
 ### Features
 
 * **mcp:** `spotifyforge mcp` serves the curation core to MCP clients over stdio
+* **history:** `history sync` appends recent plays to a local log, `history show`
+  and the `listening_history` MCP tool summarise it
+* **auth:** concurrent processes take a lock before refreshing the shared token
 
 ### Removed
 

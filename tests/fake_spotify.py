@@ -85,6 +85,8 @@ class FakeSpotify:
         self.artist_names: dict[str, str] = {}
         self.followed_artists: dict[str, set[str]] = {}  # user -> artist ids
         self.saved_albums: dict[str, list[str]] = {}  # user -> saved album ids
+        # user -> (played_at ISO, track id, context URI or None), in any order
+        self.recent_plays: dict[str, list[tuple[str, str, str | None]]] = {}
 
         self.valid_tokens: set[str] = set()
         self.valid_codes: dict[str, str] = {}  # auth code -> spotify user id
@@ -218,6 +220,10 @@ class FakeSpotify:
     def save_track(self, user_id: str, track_id: str) -> None:
         """Add *track_id* to *user_id*'s liked songs."""
         self.saved_tracks.setdefault(user_id, []).append(track_id)
+
+    def play(self, user_id: str, track_id: str, played_at: str, context: str | None = None) -> None:
+        """Record that *user_id* played *track_id* at *played_at* (ISO 8601)."""
+        self.recent_plays.setdefault(user_id, []).append((played_at, track_id, context))
 
     def set_artist_genres(self, artist_id: str, genres: list[str]) -> None:
         """Set the genre list returned for *artist_id* by ``GET /v1/artists``."""
@@ -558,6 +564,36 @@ class FakeSpotify:
                         "cursors": {"after": None},
                         "total": len(items),
                     }
+                },
+            )
+
+        if path == "/v1/me/player/recently-played":
+            # Newest first, and never more than the window: the real API
+            # forgets everything older, which is the behaviour under test.
+            plays = sorted(self.recent_plays.get(me, []), reverse=True)[: min(limit, 50)]
+            items = [
+                {
+                    "track": self.tracks[track_id],
+                    "played_at": played_at,
+                    "context": None
+                    if context is None
+                    else {
+                        "type": context.split(":")[1],
+                        "href": f"{API}/x",
+                        "external_urls": {},
+                        "uri": context,
+                    },
+                }
+                for played_at, track_id, context in plays
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "href": f"{API}/me/player/recently-played",
+                    "items": items,
+                    "limit": limit,
+                    "next": None,
+                    "cursors": None,
                 },
             )
 

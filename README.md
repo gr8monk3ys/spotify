@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 516 tests run in under a minute with no network.
+end. The 538 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept
@@ -59,13 +59,17 @@ spotifyforge playlist deduplicate <playlist_id>
 spotifyforge playlist export <playlist_id> -f csv -o tracks.csv
 spotifyforge discover deep-cuts <artist_id> --threshold 25
 
+spotifyforge history sync                # append recent plays to a local log (run hourly)
+spotifyforge history show --days 30      # what you actually played
+
 # Other platforms (shared files in MUSIC_DIR, default ~/.music)
 spotifyforge export library                         # Write ~/.music/music-library.json for discogs
 spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
 spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
 ```
 
-Groups: `auth`, `playlist`, `discover`, `curate`, `export`, `library`, `config`;
+Groups: `auth`, `playlist`, `discover`, `curate`, `history`, `export`, `library`,
+`config`;
 `spotifyforge <group> --help` lists the rest. `curate curators` is read-only
 on purpose: auto-following listeners for follow-backs is the engagement
 pattern Spotify's rules prohibit. `curate follow-artists` does follow, but
@@ -74,6 +78,18 @@ until you pass `--apply`.
 
 There is no scheduler. To run something on a timer, call the CLI from cron or
 Task Scheduler; the bulk `curate` commands skip work already done.
+
+`history sync` is the one command that has to be on a timer. Spotify remembers
+only your last 50 plays and offers no way to get older ones back, so the log
+in `~/.spotifyforge/listening_history.jsonl` is the only history there is.
+Fifty plays is about two and a half hours of music; hourly is enough:
+
+```cron
+0 * * * *  cd /path/to/spotify && uv run spotifyforge history sync
+```
+
+A run that finds all 50 plays are new says so, because it cannot know whether
+a 51st was missed.
 
 ## MCP server
 
@@ -90,7 +106,8 @@ cannot, because it depends on how this package reads your library:
 | `deduplicate_playlist` | Remove repeated tracks from one of your own playlists |
 | `plan_catalogue_preview` | The genre catalogue `curate plan` would show |
 | `audience_stats` | Follower counts for the account and each owned playlist |
-| `top_tracks`, `recently_played` | Listening history |
+| `top_tracks`, `recently_played` | What Spotify itself reports |
+| `listening_history` | Plays counted from the local log `history sync` keeps |
 
 So "make me a 25-track late-night jazz fusion playlist from my liked songs"
 becomes three calls: learn the genres, pick the tracks, create it sequenced.

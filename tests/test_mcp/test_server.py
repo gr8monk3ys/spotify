@@ -308,3 +308,44 @@ async def test_top_tracks(logged_in):
     assert out["tracks"] == [
         {"id": "t1", "name": "Most Played", "artists": ["Artist One"], "album": "Album One"}
     ]
+
+
+async def test_listening_history_reads_the_local_log_without_calling_spotify(logged_in, tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from spotifyforge.core.history import sync_history
+
+    fake = logged_in
+    fake.add_track("t1", name="Night Drive", artist_name="Alpha")
+    now = datetime.now(UTC)
+    fake.play("user1", "t1", (now - timedelta(hours=2)).isoformat(), "spotify:playlist:pl1")
+    fake.play("user1", "t1", (now - timedelta(hours=1)).isoformat(), "spotify:playlist:pl1")
+    client = fake.async_client("user1")
+    await sync_history(client)
+    await client.close()
+    before = len(fake.requests)
+
+    out = await _ok("listening_history", days=7)
+
+    assert len(fake.requests) == before
+    assert out["plays"] == 2
+    assert out["top_tracks"] == [{"name": "Night Drive", "artists": "Alpha", "plays": 2}]
+    assert out["top_contexts"] == [{"uri": "spotify:playlist:pl1", "plays": 2}]
+
+
+async def test_listening_history_with_no_log_says_how_it_gets_filled(logged_in):
+    out = await _ok("listening_history")
+
+    assert out["plays"] == 0
+    assert "history sync" in out["note"]
+
+
+async def test_recently_played(logged_in):
+    fake = logged_in
+    fake.add_track("t1", name="Just Now")
+    fake.play("user1", "t1", "2026-10-01T12:00:00Z")
+
+    out = await _ok("recently_played", limit=5)
+
+    assert [p["name"] for p in out["plays"]] == ["Just Now"]
+    assert out["plays"][0]["played_at"].startswith("2026-10-01T12:00:00")

@@ -18,7 +18,16 @@ from __future__ import annotations
 
 import typer
 
-from spotifyforge.cli import auth, config, curate, discover, export, library, playlist
+from spotifyforge.cli import (
+    auth,
+    config,
+    curate,
+    discover,
+    export,
+    history,
+    library,
+    playlist,
+)
 from spotifyforge.cli._shared import _version_callback
 
 # ---------------------------------------------------------------------------
@@ -65,6 +74,7 @@ app.add_typer(discover.discover_app)
 app.add_typer(curate.curate_app)
 app.add_typer(export.export_app)
 app.add_typer(library.library_app)
+app.add_typer(history.history_app)
 app.add_typer(config.config_app)
 
 
