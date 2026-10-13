@@ -10,6 +10,8 @@
 * **auth:** concurrent processes take a lock before refreshing the shared token
 * **curate:** `curate genres` fills in genres for artists Spotify has not tagged,
   from MusicBrainz tags looked up by ISRC
+* **library:** `library soundtracks` builds a playlist from the soundtracks of the
+  films rated highest in the Letterboxd export
 
 ### Removed
 
