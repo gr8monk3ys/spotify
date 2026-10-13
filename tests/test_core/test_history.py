@@ -7,7 +7,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from spotifyforge.core.history import WINDOW, load_plays, summarise, sync_history
+from spotifyforge.core.history import (
+    WINDOW,
+    load_plays,
+    playlist_usage,
+    summarise,
+    sync_history,
+)
 
 START = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 
@@ -146,3 +152,47 @@ async def test_summarise_counts_tracks_artists_and_contexts(fake, client_for, tm
     assert summary.top_artists == [("Alpha", 2), ("Beta", 1)]
     assert summary.top_contexts == [("spotify:playlist:pl1", 2)]
     assert summary.first == START.isoformat()
+
+
+async def test_playlist_usage_counts_only_plays_started_from_the_playlist(
+    fake, client_for, tmp_path
+):
+    path = tmp_path / "history.jsonl"
+    fake.play("user1", "t1", _at(0), context="spotify:playlist:mine1")
+    fake.play("user1", "t1", _at(5), context="spotify:playlist:mine1")
+    fake.play("user1", "t2", _at(10), context="spotify:playlist:dailymix")
+    fake.play("user1", "t2", _at(15), context="spotify:album:alb")
+    fake.play("user1", "t2", _at(20), context="spotify:artist:art")
+    fake.play("user1", "t1", _at(25))  # liked songs: no context
+    await sync_history(client_for(), path)
+
+    usage = playlist_usage(load_plays(path), {"mine1": "Late Set", "mine2": "Never Opened"})
+
+    assert usage.plays == 6
+    assert usage.from_own_playlists == 2
+    assert usage.from_other_playlists == 1
+    assert (usage.from_albums, usage.from_artists, usage.from_elsewhere) == (1, 1, 1)
+    assert usage.played == [("mine1", "Late Set", 2)]
+    assert usage.unplayed == [("mine2", "Never Opened")]
+    assert usage.days_covered == 1
+    assert usage.long_enough_to_judge is False
+
+
+def test_playlist_usage_needs_four_weeks_before_unplayed_means_anything():
+    from spotifyforge.core.history import Play
+
+    def play(day: int) -> Play:
+        return Play(
+            played_at=(START + timedelta(days=day)).isoformat(),
+            track_id="t",
+            name="t",
+            artists=("a",),
+            artist_ids=("a",),
+            album="",
+            album_id=None,
+            duration_ms=1,
+        )
+
+    assert playlist_usage([play(0), play(26)], {}).long_enough_to_judge is False
+    assert playlist_usage([play(0), play(27)], {}).long_enough_to_judge is True
+    assert playlist_usage([], {"p": "x"}).unplayed == [("p", "x")]

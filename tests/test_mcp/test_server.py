@@ -351,3 +351,30 @@ async def test_recently_played(logged_in):
 
     assert [p["name"] for p in out["plays"]] == ["Just Now"]
     assert out["plays"][0]["played_at"].startswith("2026-10-01T12:00:00")
+
+
+async def test_playlist_usage_report(logged_in):
+    from datetime import UTC, datetime, timedelta
+
+    from spotifyforge.core.history import sync_history
+
+    fake = logged_in
+    fake.add_track("t1")
+    fake.add_playlist("mine1", name="Late Set", track_ids=["t1"])
+    fake.add_playlist("mine2", name="Never Opened", track_ids=["t1"])
+    fake.play(
+        "user1",
+        "t1",
+        (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+        "spotify:playlist:mine1",
+    )
+    client = fake.async_client("user1")
+    await sync_history(client)
+    await client.close()
+
+    out = await _ok("playlist_usage_report")
+
+    assert out["sources"]["own_playlists"] == 1
+    assert out["played"] == [{"id": "mine1", "name": "Late Set", "plays": 1}]
+    assert out["unplayed"] == [{"id": "mine2", "name": "Never Opened"}]
+    assert out["long_enough_to_judge"] is False

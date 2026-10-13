@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -175,4 +176,73 @@ def summarise(plays: list[Play], top: int = 10) -> Summary:
         top_tracks=[(*label[tid], n) for tid, n in by_track.most_common(top)],
         top_artists=by_artist.most_common(top),
         top_contexts=by_context.most_common(top),
+    )
+
+
+# Below this many days of history, "never played" mostly means "not yet".
+MIN_DAYS_TO_JUDGE = 28
+
+
+@dataclass(frozen=True)
+class PlaylistUsage:
+    """Where the plays in a period came from, against the playlists you own."""
+
+    plays: int
+    days_covered: int
+    first: str | None
+    last: str | None
+    from_own_playlists: int
+    from_other_playlists: int  # followed, editorial, or made for you by Spotify
+    from_albums: int
+    from_artists: int
+    from_elsewhere: int  # liked songs, search, queue: Spotify reports no context
+    played: list[tuple[str, str, int]]  # (playlist id, name, plays), most played first
+    unplayed: list[tuple[str, str]]  # (playlist id, name)
+
+    @property
+    def long_enough_to_judge(self) -> bool:
+        return self.days_covered >= MIN_DAYS_TO_JUDGE
+
+
+def playlist_usage(plays: list[Play], owned: Mapping[str, str]) -> PlaylistUsage:
+    """Count *plays* by source and split *owned* (id -> name) into played and not.
+
+    A play counts for a playlist only when Spotify says it was started
+    from that playlist. A song that sits in one of your playlists but was
+    played from Liked Songs is not evidence the playlist is used.
+    """
+    by_playlist: Counter[str] = Counter()
+    kinds: Counter[str] = Counter()
+    for play in plays:
+        parts = (play.context or "").split(":")
+        kind = parts[1] if len(parts) == 3 and parts[0] == "spotify" else "none"
+        if kind == "playlist":
+            by_playlist[parts[2]] += 1
+            kind = "own" if parts[2] in owned else "other"
+        kinds[kind] += 1
+
+    played = sorted(
+        ((pid, owned[pid], count) for pid, count in by_playlist.items() if pid in owned),
+        key=lambda row: (-row[2], row[1]),
+    )
+    span = (plays[-1].at - plays[0].at).days + 1 if plays else 0
+    return PlaylistUsage(
+        plays=len(plays),
+        days_covered=span,
+        first=plays[0].played_at if plays else None,
+        last=plays[-1].played_at if plays else None,
+        from_own_playlists=kinds["own"],
+        from_other_playlists=kinds["other"],
+        from_albums=kinds["album"],
+        from_artists=kinds["artist"],
+        from_elsewhere=len(plays)
+        - kinds["own"]
+        - kinds["other"]
+        - kinds["album"]
+        - kinds["artist"],
+        played=played,
+        unplayed=sorted(
+            ((pid, name) for pid, name in owned.items() if pid not in by_playlist),
+            key=lambda row: row[1],
+        ),
     )

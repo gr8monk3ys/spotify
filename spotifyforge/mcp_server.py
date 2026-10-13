@@ -50,7 +50,7 @@ from spotifyforge.core.curation import (
 )
 from spotifyforge.core.discovery import DiscoveryEngine
 from spotifyforge.core.expansion import load_expansions
-from spotifyforge.core.history import load_plays, summarise
+from spotifyforge.core.history import MIN_DAYS_TO_JUDGE, load_plays, playlist_usage, summarise
 from spotifyforge.core.playlist_manager import PlaylistManager
 from spotifyforge.core.stats import growth_since, load_previous, take_snapshot
 
@@ -518,4 +518,44 @@ async def listening_history(days: int = 30, top: int = 20) -> dict[str, Any]:
         ],
         "top_artists": [{"artist": a, "plays": count} for a, count in summary.top_artists],
         "top_contexts": [{"uri": uri, "plays": count} for uri, count in summary.top_contexts],
+    }
+
+
+@server.tool(annotations=_READ_ONLY)
+async def playlist_usage_report(days: int | None = None) -> dict[str, Any]:
+    """Which of the user's own playlists they actually play, from the local log.
+
+    A play counts for a playlist only when it was started from that
+    playlist. `unplayed_count` is how many owned playlists had no plays at
+    all; `unplayed` lists up to 50 of them. When `long_enough_to_judge` is
+    false the log is too new for an unplayed playlist to mean anything, and
+    that must be said before suggesting any playlist be retired.
+    """
+    plays = load_plays(since=utc_now() - timedelta(days=days) if days else None)
+    async with _spotify() as sp:
+        me = await sp.current_user()
+        owned = {
+            p["id"]: p["name"]
+            for p in await PlaylistManager(sp).get_user_playlists()
+            if p["owner_id"] == me.id
+        }
+    usage = playlist_usage(plays, owned)
+    return {
+        "plays": usage.plays,
+        "days_covered": usage.days_covered,
+        "long_enough_to_judge": usage.long_enough_to_judge,
+        "min_days_to_judge": MIN_DAYS_TO_JUDGE,
+        "first": usage.first,
+        "last": usage.last,
+        "sources": {
+            "own_playlists": usage.from_own_playlists,
+            "other_playlists": usage.from_other_playlists,
+            "albums": usage.from_albums,
+            "artist_pages": usage.from_artists,
+            "elsewhere": usage.from_elsewhere,
+        },
+        "owned_playlists": len(owned),
+        "played": [{"id": pid, "name": name, "plays": n} for pid, name, n in usage.played],
+        "unplayed_count": len(usage.unplayed),
+        "unplayed": [{"id": pid, "name": name} for pid, name in usage.unplayed[:50]],
     }

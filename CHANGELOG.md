@@ -12,6 +12,8 @@
   from MusicBrainz tags looked up by ISRC
 * **library:** `library soundtracks` builds a playlist from the soundtracks of the
   films rated highest in the Letterboxd export
+* **history:** `history playlists` and the `playlist_usage_report` MCP tool show
+  which owned playlists are actually played
 
 ### Removed
 
