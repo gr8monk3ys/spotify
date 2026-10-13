@@ -16,3 +16,9 @@ venv/
 .claude/settings.local.json
 .DS_Store
 .remember/
+# Design working files: sketches and review captures hold a rendering of one
+# person's real library, which the taste page keeps local by default.
+.impeccable/mocks/
+.impeccable/review/
+taste.html
+.impeccable/questions/

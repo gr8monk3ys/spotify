@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 587 tests run in under a minute with no network.
+end. The 600 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept
@@ -75,6 +75,7 @@ spotifyforge history playlists           # which of your own playlists you play
 
 # Other platforms (shared files in MUSIC_DIR, default ~/.music)
 spotifyforge export library                         # Write ~/.music/music-library.json for discogs
+spotifyforge export page --out taste.html           # One self-contained HTML page of your library
 spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
 spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
 spotifyforge library soundtracks                    # Dry run: soundtracks of films rated 4.5+ on Letterboxd
@@ -103,6 +104,17 @@ Fifty plays is about two and a half hours of music; hourly is enough:
 
 A run that finds all 50 plays are new says so, because it cannot know whether
 a 51st was missed.
+
+## The page
+
+`export page` writes your library as a single HTML file: a table of your
+busiest genres against the decades the songs came out, then the artists and
+albums you have liked most of, and a note on how it was counted. It is a
+summary, with no track list and no play history. The file fetches nothing when
+opened (its three fonts are embedded), so it works from disk, by email or on
+any host, in light and dark and on a phone. The command only writes the file;
+publishing it is up to you. The look follows my own site's design system; see
+`DESIGN.md`.
 
 ## MCP server
 

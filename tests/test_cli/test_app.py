@@ -929,3 +929,38 @@ class TestLibrarySoundtracks:
         )
         assert result.exit_code == 2
         assert "letterboxd export" in result.stderr
+
+
+class TestExportPage:
+    def test_writes_one_html_file_and_publishes_nothing(self, cli_env, tmp_path):
+        fake = cli_env
+        for i in range(4):
+            fake.add_track(f"t{i}", artist_id="a1", artist_name="Quiet One", album_id="alb1")
+            fake.save_track("user1", f"t{i}")
+        fake.set_artist_genres("a1", ["dream pop"])
+        _login(fake)
+        out = tmp_path / "site" / "taste.html"
+        before = len(fake.requests)
+
+        result = runner.invoke(app, ["export", "page", "--out", str(out), "--name", "Someone"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "Nothing was published" in result.output
+        html = out.read_text(encoding="utf-8")
+        assert "Someone’s library, by genre and decade" in html
+        assert "dream pop" in html
+        assert "Quiet One" in html
+        # Reads only: the library walk and the profile, never a write.
+        assert {method for method, _ in fake.requests[before:]} == {"GET"}
+
+    def test_defaults_to_the_spotify_display_name(self, cli_env, tmp_path):
+        fake = cli_env
+        fake.add_track("t1")
+        fake.save_track("user1", "t1")
+        _login(fake)
+        out = tmp_path / "taste.html"
+
+        result = runner.invoke(app, ["export", "page", "--out", str(out)])
+
+        assert result.exit_code == 0, result.stderr
+        assert "Test User’s library" in out.read_text(encoding="utf-8")

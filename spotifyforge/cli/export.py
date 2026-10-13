@@ -76,3 +76,49 @@ def export_library(
         )
     )
     console.print(f"[dim]{target}[/dim]")
+
+
+@export_app.command("page")
+def export_page(
+    out: Path = typer.Option(Path("taste.html"), "--out", "-o", help="Where to write the page."),
+    name: str | None = typer.Option(
+        None, "--name", help="Whose library it is (default: your Spotify display name)."
+    ),
+    max_tracks: int | None = _MAX_TRACKS,
+) -> None:
+    """Write your library as one self-contained HTML page.
+
+    A timetable of your genres against the decades the songs came out,
+    plus the artists and albums you have liked most of. It is a summary:
+    counts only, no track list and no play history. The file fetches
+    nothing when opened, so it works from disk, by email, or on any
+    host. This command only writes the file; it publishes nothing.
+    """
+    from spotifyforge.core.clock import utc_now
+    from spotifyforge.core.curation import CurationEngine, dedupe_versions
+    from spotifyforge.core.taste_page import build_page_data, render_page
+
+    async def _read(sp):
+        engine = CurationEngine(sp)
+        tracks = dedupe_versions(await engine.enrich_genres(await engine.fetch_liked(max_tracks)))
+        me = await sp.current_user()
+        return tracks, me.display_name or me.id
+
+    tracks, display_name = _run_spotify(
+        "Reading your liked songs...", "Failed to read library", _read
+    )
+    data = build_page_data(tracks, name or display_name, utc_now().date())
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_page(data), encoding="utf-8", newline="\n")
+
+    console.print(
+        Panel(
+            f"[green]Wrote the page[/green] for {data.songs} songs across "
+            f"{data.genres} genres ({len(data.lines)} shown).\n"
+            "Nothing was published; the file is yours to open or host.",
+            title="Taste page",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]{out.resolve()}[/dim]")

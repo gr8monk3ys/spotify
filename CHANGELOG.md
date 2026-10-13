@@ -14,6 +14,7 @@
   films rated highest in the Letterboxd export
 * **history:** `history playlists` and the `playlist_usage_report` MCP tool show
   which owned playlists are actually played
+* **export:** `export page` writes the library as one self-contained HTML page
 
 ### Removed
 
