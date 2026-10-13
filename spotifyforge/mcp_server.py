@@ -288,10 +288,10 @@ async def list_playlists(owned_only: bool = True) -> dict[str, Any]:
     With owned_only=false, playlists the user merely follows are included.
     """
     async with _spotify() as sp:
-        me = await sp.current_user()
-        playlists = await PlaylistManager(sp).get_user_playlists()
-    if owned_only:
-        playlists = [p for p in playlists if p["owner_id"] == me.id]
+        manager = PlaylistManager(sp)
+        playlists = await (
+            manager.get_owned_playlists() if owned_only else manager.get_user_playlists()
+        )
     return {"count": len(playlists), "playlists": playlists}
 
 
@@ -533,12 +533,7 @@ async def playlist_usage_report(days: int | None = None) -> dict[str, Any]:
     """
     plays = load_plays(since=utc_now() - timedelta(days=days) if days else None)
     async with _spotify() as sp:
-        me = await sp.current_user()
-        owned = {
-            p["id"]: p["name"]
-            for p in await PlaylistManager(sp).get_user_playlists()
-            if p["owner_id"] == me.id
-        }
+        owned = {p["id"]: p["name"] for p in await PlaylistManager(sp).get_owned_playlists()}
     usage = playlist_usage(plays, owned)
     return {
         "plays": usage.plays,

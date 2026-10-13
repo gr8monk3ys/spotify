@@ -423,6 +423,19 @@ class TestReorderTracks:
 # ===================================================================
 
 
+class TestOwnedPlaylists:
+    async def test_followed_playlists_are_left_out(self, fake_spotify, client_for):
+        fake_spotify.add_user("user1")
+        fake_spotify.add_user("other")
+        fake_spotify.add_playlist("mine", name="Mine")
+        fake_spotify.add_playlist("theirs", owner="other", name="Followed")
+        fake_spotify.follow_playlist("user1", "theirs")
+        manager = PlaylistManager(client_for())
+
+        assert {p["id"] for p in await manager.get_user_playlists()} == {"mine", "theirs"}
+        assert [p["id"] for p in await manager.get_owned_playlists()] == ["mine"]
+
+
 class TestCreatePlaylist:
     async def test_creates_on_spotify(self, fake_spotify, client_for):
         fake_spotify.add_user("user1")

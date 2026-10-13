@@ -84,9 +84,7 @@ async def take_snapshot(spotify: Spotify) -> Snapshot:
     reappear later as a fake follower drop.
     """
     me = await spotify.current_user()
-    owned = [
-        p for p in await PlaylistManager(spotify).get_user_playlists() if p["owner_id"] == me.id
-    ]
+    owned = await PlaylistManager(spotify).get_owned_playlists()
 
     semaphore = asyncio.Semaphore(_CONCURRENCY)
 

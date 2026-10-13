@@ -507,10 +507,7 @@ def _photo_covers(
     async def _photo(sp):
         plan = await _plan(sp, opts)
         vibe_by_title = {s.title: s.genre_label for s in writable_specs(plan.specs, min_size)}
-        me = await sp.current_user()
-        owned = [
-            p for p in await PlaylistManager(sp).get_user_playlists() if p["owner_id"] == me.id
-        ]
+        owned = await PlaylistManager(sp).get_owned_playlists()
         # Forged playlists search by genre; personal ones by their name.
         targets = [(p["name"], p["id"], vibe_by_title.get(p["name"], p["name"])) for p in owned]
         if reroll is not None:
@@ -1095,10 +1092,7 @@ def curate_retire(
 
     async def _retire(sp):
         plan = await _plan(sp, opts, features)
-        me = await sp.current_user()
-        owned = [
-            p for p in await PlaylistManager(sp).get_user_playlists() if p["owner_id"] == me.id
-        ]
+        owned = await PlaylistManager(sp).get_owned_playlists()
         live = {p["name"]: p.get("description") or "" for p in owned}
         ids_by_name = {p["name"]: p["id"] for p in owned}
 
@@ -1175,11 +1169,9 @@ def curate_migrate(
 
     Shows the mapping and stops unless [bold]--apply[/bold] is passed.
     """
-    from functools import partial
-
-    from spotifyforge.core.curation import gather_bounded, writable_specs
+    from spotifyforge.core.curation import writable_specs
     from spotifyforge.core.playlist_manager import PlaylistManager
-    from spotifyforge.core.renaming import apply_renames, match_by_contents
+    from spotifyforge.core.renaming import apply_renames, match_by_contents, read_live_contents
 
     opts = _curation_options(min_size, max_size, max_tracks, exclusive)
     features = _features_or_warn(harmonic)
@@ -1187,26 +1179,7 @@ def curate_migrate(
     async def _migrate(sp):
         plan = await _plan(sp, opts, features)
         manager = PlaylistManager(sp)
-        me = await sp.current_user()
-        owned = [p for p in await manager.get_user_playlists() if p["owner_id"] == me.id]
-
-        async def _contents(playlist):
-            # playlist_items yields PlaylistTrack wrappers, not tracks;
-            # reading .id off the wrapper silently gives None for every
-            # row, which matches nothing and reports a confident zero.
-            items = await manager.get_playlist_tracks(playlist["id"])
-            held = {i.track.id for i in items if i.track is not None and i.track.id is not None}
-            return playlist["name"], held
-
-        live = dict(await gather_bounded([partial(_contents, p) for p in owned]))
-        if owned and not any(live.values()):
-            # Every match is decided by these sets. Reading them all as
-            # empty is a bug, and it fails as "nothing to rename" —
-            # indistinguishable from a clean catalogue.
-            raise RuntimeError(
-                f"Read no tracks from any of {len(owned)} owned playlists; "
-                "refusing to report a migration based on that."
-            )
+        live = await read_live_contents(manager)
         renames, unmatched = match_by_contents(writable_specs(plan.specs, min_size), live)
         if not apply:
             return renames, unmatched, [], [], False

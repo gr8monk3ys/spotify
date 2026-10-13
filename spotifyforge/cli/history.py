@@ -82,12 +82,7 @@ def history_playlists(
         return
 
     async def _owned(sp):
-        me = await sp.current_user()
-        return {
-            p["id"]: p["name"]
-            for p in await PlaylistManager(sp).get_user_playlists()
-            if p["owner_id"] == me.id
-        }
+        return {p["id"]: p["name"] for p in await PlaylistManager(sp).get_owned_playlists()}
 
     owned = _run_spotify("Reading your playlists...", "Failed to read playlists", _owned)
     usage = playlist_usage(plays, owned)
