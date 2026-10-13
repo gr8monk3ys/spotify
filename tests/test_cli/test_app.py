@@ -12,8 +12,8 @@ Test doubles are limited to the process boundary:
 * the CSRF state generator returns a fixed value so the test can build
   the pasted redirect URL for ``auth login``.
 
-Everything else — OAuth code exchange, token storage/refresh, DB rows,
-playlist sync, discovery, scheduling — is the production code path.
+Everything else — OAuth code exchange, token storage/refresh, playlist
+writes, discovery, curation — is the production code path.
 """
 
 from __future__ import annotations
@@ -21,12 +21,9 @@ from __future__ import annotations
 import json
 
 import pytest
-from sqlmodel import Session, select
 from typer.testing import CliRunner
 
 from spotifyforge.cli.app import app
-from spotifyforge.db.engine import get_engine
-from spotifyforge.models.models import JobType, Playlist, ScheduledJob, User
 
 runner = CliRunner()
 
@@ -43,14 +40,10 @@ REDIRECT = "http://localhost:8000/api/auth/callback"
 def cli_env(app_env, tmp_path, monkeypatch, memory_token_store):
     """Full CLI environment: root app_env plus in-memory keyring.
 
-    ``settings.db_path`` is redirected into ``tmp_path`` so the CLI's
-    ``current_user`` pointer file lands in the test sandbox (isolated_db
-    only patches ``database_url``).
+    ``app_env`` already redirects ``settings.data_dir`` into ``tmp_path``,
+    so the CLI's ``current_user`` pointer file lands in the test sandbox.
     """
     from spotifyforge.auth import oauth
-    from spotifyforge.config import settings
-
-    monkeypatch.setattr(settings, "db_path", tmp_path / "app.db")
 
     # Keyring -> in-memory store (persists across commands within a test).
     monkeypatch.setattr(oauth, "KeyringTokenStore", lambda: memory_token_store)
@@ -115,17 +108,6 @@ class TestAuthLogin:
         # The token landed in the (in-memory) keyring and is valid.
         token = memory_token_store.load_token("user1")
         assert token.access_token in fake.valid_tokens
-
-        # The local DB row exists with encrypted tokens (for scheduled jobs).
-        with Session(get_engine()) as session:
-            user = session.exec(select(User).where(User.spotify_id == "user1")).first()
-            assert user is not None
-            assert user.display_name == "Test User"
-            assert user.is_premium is True
-            assert user.access_token_enc
-            assert user.refresh_token_enc
-            # Tokens are stored encrypted, never plaintext.
-            assert token.access_token not in user.access_token_enc
 
     def test_login_rejects_state_mismatch(self, cli_env, tmp_path):
         fake = cli_env
@@ -207,15 +189,12 @@ class TestRequiresLogin:
             ["playlist", "list"],
             ["playlist", "show", "pl1"],
             ["playlist", "create", "New List"],
-            ["playlist", "sync", "pl1"],
             ["playlist", "deduplicate", "pl1"],
             ["playlist", "export", "pl1"],
             ["discover", "top-tracks"],
             ["discover", "deep-cuts", "art1"],
             ["discover", "genre", "indie-rock"],
             ["discover", "time-capsule"],
-            ["schedule", "list"],
-            ["schedule", "remove", "1"],
         ],
     )
     def test_command_without_login_exits_1(self, cli_env, args):
@@ -274,7 +253,7 @@ class TestPlaylistShow:
 
 
 class TestPlaylistCreate:
-    def test_creates_on_spotify_and_locally(self, cli_env):
+    def test_creates_on_spotify(self, cli_env):
         fake = cli_env
         _login(fake)
 
@@ -286,43 +265,9 @@ class TestPlaylistCreate:
         assert "Playlist created!" in result.output
         assert "My Mix" in result.output
 
-        # Created on (fake) Spotify...
         created = [p for p in fake.playlists.values() if p["name"] == "My Mix"]
         assert len(created) == 1
         assert created[0]["public"] is False
-
-        # ...and persisted locally, owned by the logged-in user.
-        with Session(get_engine()) as session:
-            row = session.exec(select(Playlist).where(Playlist.name == "My Mix")).first()
-            assert row is not None
-            assert row.spotify_id == created[0]["id"]
-            user = session.exec(select(User).where(User.spotify_id == "user1")).first()
-            assert row.owner_id == user.id
-
-
-class TestPlaylistSync:
-    def test_sync_caches_tracks(self, cli_env):
-        fake = cli_env
-        fake.add_track("t1", name="Song A")
-        fake.add_track("t2", name="Song B")
-        fake.add_playlist("pl1", name="Roadtrip", track_ids=["t1", "t2"])
-        _login(fake)
-
-        result = runner.invoke(app, ["playlist", "sync", "pl1"])
-        assert result.exit_code == 0, result.stderr
-        assert "Playlist synced" in result.output
-        assert "Tracks synced: 2" in result.output
-
-        with Session(get_engine()) as session:
-            row = session.exec(select(Playlist).where(Playlist.spotify_id == "pl1")).first()
-            assert row is not None
-            assert row.track_count == 2
-
-    def test_sync_missing_playlist_exits_1(self, cli_env):
-        _login(cli_env)
-        result = runner.invoke(app, ["playlist", "sync", "ghost"])
-        assert result.exit_code == 1
-        assert "Sync failed" in result.stderr
 
 
 class TestPlaylistDeduplicate:
@@ -510,173 +455,6 @@ class TestDiscoverTimeCapsule:
 
 
 # ---------------------------------------------------------------------------
-# Schedule
-# ---------------------------------------------------------------------------
-
-
-class TestScheduleAdd:
-    def test_add_sync_job_autosyncs_playlist(self, cli_env):
-        fake = cli_env
-        fake.add_track("t1")
-        fake.add_playlist("schedpl", name="Nightly", track_ids=["t1"])
-        _login(fake)
-
-        result = runner.invoke(
-            app,
-            [
-                "schedule",
-                "add",
-                "--name",
-                "nightly sync",
-                "--type",
-                "sync",
-                "--cron",
-                "0 3 * * *",
-                "--playlist",
-                "schedpl",
-            ],
-        )
-        assert result.exit_code == 0, result.stderr
-        assert "Job scheduled successfully!" in result.output
-
-        with Session(get_engine()) as session:
-            job = session.exec(select(ScheduledJob)).first()
-            assert job is not None
-            assert job.name == "nightly sync"
-            assert job.job_type == JobType.sync
-            assert job.cron_expression == "0 3 * * *"
-            assert job.enabled is True
-            # The playlist FK points at the auto-synced local row.
-            pl = session.get(Playlist, job.playlist_id)
-            assert pl.spotify_id == "schedpl"
-
-    def test_add_time_capsule_needs_no_playlist(self, cli_env):
-        _login(cli_env)
-        result = runner.invoke(
-            app,
-            [
-                "schedule",
-                "add",
-                "--name",
-                "monthly capsule",
-                "--type",
-                "time_capsule",
-                "--cron",
-                "0 8 1 * *",
-                "--time-range",
-                "short_term",
-            ],
-        )
-        assert result.exit_code == 0, result.stderr
-        with Session(get_engine()) as session:
-            job = session.exec(select(ScheduledJob)).first()
-            assert job.job_type == JobType.time_capsule
-            assert job.playlist_id is None
-            assert job.config == {"time_range": "short_term"}
-
-    def test_bad_cron_exits_1(self, cli_env):
-        result = runner.invoke(
-            app,
-            ["schedule", "add", "-n", "x", "-t", "sync", "-c", "not a cron", "-p", "pl1"],
-        )
-        assert result.exit_code == 1
-        assert "Invalid cron expression" in result.stderr
-
-    def test_unknown_type_exits_1(self, cli_env):
-        result = runner.invoke(
-            app,
-            ["schedule", "add", "-n", "x", "-t", "explode", "-c", "0 3 * * *"],
-        )
-        assert result.exit_code == 1
-        assert "Unknown job type" in result.stderr
-
-    def test_sync_requires_playlist(self, cli_env):
-        result = runner.invoke(app, ["schedule", "add", "-n", "x", "-t", "sync", "-c", "0 3 * * *"])
-        assert result.exit_code == 1
-        assert "requires --playlist" in result.stderr
-
-    def test_genre_refresh_requires_genre(self, cli_env):
-        result = runner.invoke(
-            app,
-            [
-                "schedule",
-                "add",
-                "-n",
-                "x",
-                "-t",
-                "genre_refresh",
-                "-c",
-                "0 3 * * *",
-                "-p",
-                "pl1",
-            ],
-        )
-        assert result.exit_code == 1
-        assert "require --genre" in result.stderr
-
-
-class TestScheduleListRemove:
-    def _add_job(self, fake) -> int:
-        fake.add_track("t1")
-        fake.add_playlist("schedpl", name="Nightly", track_ids=["t1"])
-        result = runner.invoke(
-            app,
-            [
-                "schedule",
-                "add",
-                "-n",
-                "nightly sync",
-                "-t",
-                "sync",
-                "-c",
-                "0 3 * * *",
-                "-p",
-                "schedpl",
-            ],
-        )
-        assert result.exit_code == 0, result.stderr
-        with Session(get_engine()) as session:
-            return session.exec(select(ScheduledJob)).first().id
-
-    def test_list_empty(self, cli_env):
-        _login(cli_env)
-        result = runner.invoke(app, ["schedule", "list"])
-        assert result.exit_code == 0, result.stderr
-        assert "No scheduled jobs" in result.output
-
-    def test_list_shows_jobs(self, cli_env):
-        fake = cli_env
-        _login(fake)
-        self._add_job(fake)
-
-        result = runner.invoke(app, ["schedule", "list"])
-        assert result.exit_code == 0, result.stderr
-        assert "nightly sync" in result.output
-        assert "sync" in result.output
-        assert "0 3 * * *" in result.output
-        assert "never" in result.output  # has not run yet
-        assert "Enabled" in result.output
-
-    def test_remove_job(self, cli_env):
-        fake = cli_env
-        _login(fake)
-        job_id = self._add_job(fake)
-
-        result = runner.invoke(app, ["schedule", "remove", str(job_id)])
-        assert result.exit_code == 0, result.stderr
-        assert "removed successfully" in result.output
-
-        with Session(get_engine()) as session:
-            assert session.get(ScheduledJob, job_id) is None
-
-    def test_remove_missing_job_exits_1(self, cli_env):
-        _login(cli_env)
-        result = runner.invoke(app, ["schedule", "remove", "999"])
-        assert result.exit_code == 1
-        assert "not found" in result.stderr
-
-
-# ---------------------------------------------------------------------------
 # Curate
 # ---------------------------------------------------------------------------
 
@@ -751,47 +529,47 @@ class TestConfigShow:
     def test_shows_settings_with_secrets_masked(self, cli_env, monkeypatch):
         from spotifyforge.config import settings
 
-        monkeypatch.setattr(settings, "secret_key", "supersecretkey123")
+        monkeypatch.setattr(settings, "pexels_api_key", "supersecretkey123")
 
         result = runner.invoke(app, ["config", "show"])
         assert result.exit_code == 0, result.stderr
         assert "spotify_client_id" in result.output
-        assert "secret_key" in result.output
+        assert "pexels_api_key" in result.output
         # Secrets never appear in cleartext; only ****<last4>.
         assert "supersecretkey123" not in result.output
         assert "****y123" in result.output
         assert "test-client-secret" not in result.output
         assert "****" in result.output
         # Non-secret values are shown as-is.
-        assert "development" in result.output
+        assert "INFO" in result.output
 
 
 class TestConfigSet:
     def test_writes_new_key_to_env_file(self, cli_env, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(app, ["config", "set", "web_port", "9090"])
+        result = runner.invoke(app, ["config", "set", "log_level", "WARNING"])
         assert result.exit_code == 0, result.stderr
         assert "Configuration updated" in result.output
-        assert "SPOTIFYFORGE_WEB_PORT=9090" in (tmp_path / ".env").read_text()
+        assert "SPOTIFYFORGE_LOG_LEVEL=WARNING" in (tmp_path / ".env").read_text()
 
     def test_updates_existing_key_in_place(self, cli_env, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        (tmp_path / ".env").write_text("SPOTIFYFORGE_WEB_PORT=8000\nSPOTIFYFORGE_LOG_LEVEL=DEBUG\n")
-        result = runner.invoke(app, ["config", "set", "web_port", "9090"])
+        (tmp_path / ".env").write_text("SPOTIFYFORGE_LOG_LEVEL=INFO\nSPOTIFYFORGE_MUSIC_DIR=/m\n")
+        result = runner.invoke(app, ["config", "set", "log_level", "WARNING"])
         assert result.exit_code == 0, result.stderr
         content = (tmp_path / ".env").read_text()
-        assert content.count("SPOTIFYFORGE_WEB_PORT") == 1
-        assert "SPOTIFYFORGE_WEB_PORT=9090" in content
-        assert "SPOTIFYFORGE_LOG_LEVEL=DEBUG" in content  # untouched
+        assert content.count("SPOTIFYFORGE_LOG_LEVEL") == 1
+        assert "SPOTIFYFORGE_LOG_LEVEL=WARNING" in content
+        assert "SPOTIFYFORGE_MUSIC_DIR=/m" in content  # untouched
 
     def test_secret_value_masked_in_output(self, cli_env, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(app, ["config", "set", "secret_key", "hunter2secret"])
+        result = runner.invoke(app, ["config", "set", "pexels_api_key", "hunter2secret"])
         assert result.exit_code == 0, result.stderr
         assert "hunter2secret" not in result.output
         assert "****" in result.output
         # But the real value is written to the file.
-        assert "SPOTIFYFORGE_SECRET_KEY=hunter2secret" in (tmp_path / ".env").read_text()
+        assert "SPOTIFYFORGE_PEXELS_API_KEY=hunter2secret" in (tmp_path / ".env").read_text()
 
     def test_unknown_key_exits_1(self, cli_env, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -807,39 +585,27 @@ class TestConfigSet:
 
 
 class TestEndToEndFlow:
-    def test_login_create_sync_schedule_logout(self, cli_env):
-        """One session: login -> create -> add tracks upstream -> sync ->
-        schedule -> logout, with state persisting between commands."""
+    def test_login_create_dedupe_logout(self, cli_env):
+        """One session: login -> create -> tracks land upstream ->
+        deduplicate -> logout, with state persisting between commands."""
         fake = cli_env
         _login(fake)
 
-        # Create a playlist through the CLI.
         result = runner.invoke(app, ["playlist", "create", "Flow List"])
         assert result.exit_code == 0, result.stderr
         pid = next(p for p, m in fake.playlists.items() if m["name"] == "Flow List")
 
-        # Tracks get added on Spotify (out of band), then we sync.
+        # Tracks get added on Spotify (out of band), one of them twice.
         fake.add_track("f1", name="Flow One")
-        fake.playlist_tracks[pid].append("f1")
-        result = runner.invoke(app, ["playlist", "sync", pid])
+        fake.playlist_tracks[pid].extend(["f1", "f1"])
+        result = runner.invoke(app, ["playlist", "deduplicate", pid])
         assert result.exit_code == 0, result.stderr
-        assert "Tracks synced: 1" in result.output
-
-        # Schedule a job against the (already cached) playlist.
-        result = runner.invoke(
-            app,
-            ["schedule", "add", "-n", "flow job", "-t", "sync", "-c", "0 3 * * *", "-p", pid],
-        )
-        assert result.exit_code == 0, result.stderr
-
-        result = runner.invoke(app, ["schedule", "list"])
-        assert "flow job" in result.output
-        assert "Flow List" in result.output
+        assert fake.playlist_tracks[pid] == ["f1"]
 
         # Logout ends the session.
         result = runner.invoke(app, ["auth", "logout"])
         assert result.exit_code == 0
-        result = runner.invoke(app, ["schedule", "list"])
+        result = runner.invoke(app, ["playlist", "list"])
         assert result.exit_code == 1
         assert "Not logged in" in result.stderr
 

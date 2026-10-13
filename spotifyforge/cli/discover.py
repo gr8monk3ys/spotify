@@ -11,7 +11,6 @@ from rich.panel import Panel
 from rich.table import Table
 
 from spotifyforge.cli._shared import (
-    _db_user_id,
     _run_spotify,
     console,
 )
@@ -179,13 +178,10 @@ def discover_genre(
     from spotifyforge.core.discovery import DiscoveryEngine
     from spotifyforge.core.playlist_manager import PlaylistManager
 
-    owner_id = _db_user_id()
-
     async def _build(sp):
         tracks = await DiscoveryEngine(sp).build_genre_playlist(genre=genre_name, limit=limit)
         playlist = await PlaylistManager(sp).create_playlist_with_tracks(
             name=name or f"SpotifyForge: {genre_name.title()}",
-            owner_id=owner_id,
             tracks=tracks,
             description=f"Genre playlist: {genre_name}",
         )
@@ -236,13 +232,10 @@ def discover_time_capsule(
     from spotifyforge.core.discovery import DiscoveryEngine
     from spotifyforge.core.playlist_manager import PlaylistManager
 
-    owner_id = _db_user_id()
-
     async def _build(sp):
         tracks = await DiscoveryEngine(sp).build_time_capsule(time_range=time_range.value)
         playlist = await PlaylistManager(sp).create_playlist_with_tracks(
             name=name or f"SpotifyForge: Time Capsule ({time_range.value})",
-            owner_id=owner_id,
             tracks=tracks,
             description=f"Time capsule playlist ({time_range.value})",
             public=False,

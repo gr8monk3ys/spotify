@@ -17,36 +17,26 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # ``extra="ignore"``: a ``.env`` written for an older version still carries
+    # keys this class no longer has (SECRET_KEY, DB_PATH, WEB_PORT, ...), and
+    # the default would refuse to start over them.
     model_config = SettingsConfigDict(
         env_prefix="SPOTIFYFORGE_",
         env_file=".env",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
-
-    # Environment
-    environment: str = "development"  # "development" or "production"
 
     # Spotify OAuth
     spotify_client_id: str = ""
     spotify_client_secret: str = ""
     spotify_redirect_uri: str = "http://localhost:8000/api/auth/callback"
 
-    # Security
-    secret_key: str = ""
+    # Local state: the logged-in user marker and the JSON sidecars.
+    data_dir: Path = Path.home() / ".spotifyforge"
 
-    # Database
-    db_path: Path = Path.home() / ".spotifyforge" / "spotifyforge.db"
-    database_url: str = ""  # If set, overrides db_path; use postgresql://... for production
-
-    # Shared interchange directory (music-library.json, discogs.json, rym.json).
+    # Shared interchange directory (music-library.json, discogs.json).
     music_dir: Path = Field(default_factory=_default_music_dir)
-
-    # Scheduling
-    scheduler_enabled: bool = True
-
-    # Web server
-    web_host: str = "127.0.0.1"
-    web_port: int = 8000
 
     # Logging
     log_level: str = "INFO"
@@ -55,28 +45,9 @@ class Settings(BaseSettings):
     pexels_api_key: str = ""
 
     @model_validator(mode="after")
-    def _validate_config(self) -> "Settings":
-        """Validate required settings and normalise paths.
-
-        Any environment other than the literal ``development`` is treated
-        as production-like: credentials and the secret key must be set
-        explicitly so nothing silently falls back to insecure defaults.
-        """
-        self.db_path = self.db_path.expanduser()
+    def _expand_paths(self) -> "Settings":
+        self.data_dir = self.data_dir.expanduser()
         self.music_dir = self.music_dir.expanduser()
-        if self.environment != "development":
-            missing = []
-            if not self.spotify_client_id:
-                missing.append("SPOTIFYFORGE_SPOTIFY_CLIENT_ID")
-            if not self.spotify_client_secret:
-                missing.append("SPOTIFYFORGE_SPOTIFY_CLIENT_SECRET")
-            if not self.secret_key:
-                missing.append("SPOTIFYFORGE_SECRET_KEY")
-            if missing:
-                raise ValueError(
-                    f"Environment {self.environment!r} requires these "
-                    f"environment variables: {', '.join(missing)}"
-                )
         return self
 
 
@@ -84,14 +55,8 @@ settings = Settings()
 
 
 def sidecar_path(name: str) -> Path:
-    """Where a local data file lives: beside the SQLite database.
-
-    Sidecars (the tempo/key cache, the stats history) deliberately follow
-    ``db_path`` even when ``database_url`` points the application at
-    another database entirely, so under Postgres they still land in the
-    local config directory rather than nowhere.
-    """
-    return settings.db_path.parent / name
+    """Where a local data file (tempo/key cache, stats history, pins) lives."""
+    return settings.data_dir / name
 
 
 def write_json_atomic(path: Path, data: object) -> None:

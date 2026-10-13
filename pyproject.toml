@@ -10,7 +10,7 @@ allow-direct-references = true
 [project]
 name = "spotifyforge"
 version = "0.1.0"
-description = "The all-in-one platform for serious Spotify playlist curators"
+description = "CLI and MCP server that turn Spotify liked songs into sequenced genre playlists"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -21,24 +21,15 @@ dependencies = [
     # change to which record matches which, and it should arrive deliberately.
     "media-core @ git+https://github.com/gr8monk3ys/media-core@v0.1.1",
     "tekore>=5.0,<7.0",
-    "sqlmodel>=0.0.14",
     "typer>=0.12",
     "rich>=13.0",
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.27",
-    "apscheduler>=3.10,<4.0",
     "httpx>=0.27",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "keyring>=25.0",
-    "cryptography>=42.0",
-    "aiosqlite>=0.20",
-    "alembic>=1.13",
     "pillow>=10.0",  # playlist cover art
-    # SQLAlchemy's async engine requires greenlet, but SQLAlchemy only
-    # declares it on some platforms — without this line, a clean install
-    # on macOS arm64 cannot boot the server.
-    "greenlet>=3.0",
+    # 2.x renamed FastMCP to MCPServer; mcp_server.py is written against that.
+    "mcp>=2.0,<3.0",
 ]
 
 [project.optional-dependencies]
@@ -46,7 +37,6 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
-    "vcrpy>=6.0",
     "ruff>=0.3",
     "mypy>=1.8",
 ]
@@ -62,20 +52,12 @@ line-length = 100
 select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# Alembic-generated migration files use long sa.Column() chains that are
-# intentionally kept on single lines for readability.
-"alembic/env.py" = ["E501"]
-"alembic/versions/*.py" = ["E501"]
-# Tests use PascalCase Mock* names (e.g. MockPM, MockScheduler) that mirror
-# the class they stand in for; renaming them to lowercase would hurt clarity.
+# Tests use PascalCase Mock* names (e.g. MockPM) that mirror the class they
+# stand in for; renaming them to lowercase would hurt clarity.
 # Inline test-data dicts are allowed to exceed the line limit for legibility.
 # E741: lambda `l` in sorted() key is a common idiom in tests.
 "tests/*.py" = ["N806", "E741", "E501"]
 "tests/**/*.py" = ["N806", "E741", "E501"]
-# web/app.py: constants defined inside a closure use UPPER_CASE intentionally;
-# the HTML template strings include long inline CSS that cannot be wrapped.
-# E402: deps re-export sits after create_app() to avoid a circular import.
-"spotifyforge/web/app.py" = ["N806", "E402", "E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -100,31 +82,25 @@ ignore_errors = true
 module = "conftest"
 ignore_errors = true
 
-# Untyped third-party libraries (tekore has no stubs; apscheduler's are
-# partial). First-party modules are all checked — no ignore_errors: the
-# blanket suppression previously hid every CLI/web/core interface-drift bug.
+# Untyped third-party libraries. First-party modules are all checked — no
+# ignore_errors: the blanket suppression previously hid every CLI/core
+# interface-drift bug.
 [[tool.mypy.overrides]]
-module = ["apscheduler.*", "keyring.*"]
+module = ["keyring.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = [
-    "spotifyforge.db.repositories",
-    "spotifyforge.db.engine",
     "spotifyforge.cli.*",
     "spotifyforge.core.playlist_manager",
-    "spotifyforge.core.scheduler",
     "spotifyforge.core.clients",
     "spotifyforge.core.discovery",
-    "spotifyforge.web.app",
-    "spotifyforge.web.deps",
-    "spotifyforge.web.routes",
 ]
-# Dynamic SQLAlchemy column attributes and untyped tekore/apscheduler calls
-# make full strictness impractical without stub packages. Crucially,
-# check_untyped_defs stays on: function *bodies* are still fully checked
-# (attr-defined / call-arg / return-value — the checks that catch interface
-# drift); only the annotate-every-signature requirements are relaxed.
+# Untyped tekore calls make full strictness impractical without stub
+# packages. Crucially, check_untyped_defs stays on: function *bodies* are
+# still fully checked (attr-defined / call-arg / return-value — the checks
+# that catch interface drift); only the annotate-every-signature
+# requirements are relaxed.
 disallow_untyped_calls = false
 disallow_untyped_defs = false
 disallow_incomplete_defs = false

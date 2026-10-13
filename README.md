@@ -15,7 +15,7 @@ in-memory Spotify Web API served through `httpx.MockTransport`, so the real
 tekore client builds every request and parses every response; nothing in
 `spotifyforge` is mocked. The fake rejects any bearer token it did not issue,
 which is what proves OAuth exchange, token refresh and storage work end to
-end. The 465 tests run in about 15 seconds with no network.
+end. The 516 tests run in under a minute with no network.
 `tests/test_core/test_curation.py` records the decisions that came out of
 real data: an ASCII-only title normaliser flattened every CASIOPEA title to
 `""` and merged the whole catalogue into one track, so CJK titles are kept
@@ -58,43 +58,71 @@ spotifyforge playlist list
 spotifyforge playlist deduplicate <playlist_id>
 spotifyforge playlist export <playlist_id> -f csv -o tracks.csv
 spotifyforge discover deep-cuts <artist_id> --threshold 25
-spotifyforge schedule add --name "Nightly dedup" --type deduplicate \
-    --playlist <playlist_id> --cron "0 0 * * *"
 
 # Other platforms (shared files in MUSIC_DIR, default ~/.music)
-spotifyforge export library                         # Write ~/.music/music-library.json for discogs + rym
+spotifyforge export library                         # Write ~/.music/music-library.json for discogs
 spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
 spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
-spotifyforge schedule run
 ```
 
-Groups: `auth`, `playlist`, `discover`, `curate`, `export`, `library`, `schedule`,
-`config`;
+Groups: `auth`, `playlist`, `discover`, `curate`, `export`, `library`, `config`;
 `spotifyforge <group> --help` lists the rest. `curate curators` is read-only
-on purpose: auto-following for follow-backs is the engagement pattern
-Spotify's rules prohibit, and `REQUIRED_SCOPES` deliberately omits
-`user-follow-modify`.
+on purpose: auto-following listeners for follow-backs is the engagement
+pattern Spotify's rules prohibit. `curate follow-artists` does follow, but
+only artists your own liked songs already point at, and it is a dry run
+until you pass `--apply`.
 
-There is also a FastAPI server (`uv run uvicorn spotifyforge.web.app:app`,
-Swagger at `/docs`) over the same core services, and `docker compose up`
-runs it with the scheduler.
+There is no scheduler. To run something on a timer, call the CLI from cron or
+Task Scheduler; the bulk `curate` commands skip work already done.
+
+## MCP server
+
+`spotifyforge mcp` serves the same core to an MCP client over stdio, using the
+login `auth login` already stored. It exposes what a generic Spotify server
+cannot, because it depends on how this package reads your library:
+
+| Tool | What it does |
+|---|---|
+| `liked_genres` | Genres across your liked songs, with counts |
+| `search_liked` | Liked songs by genre, artist, title or year, with BPM and key where known |
+| `create_playlist` | Create a private playlist from chosen tracks, sequenced by key and tempo |
+| `list_playlists`, `get_playlist` | Read your playlists |
+| `deduplicate_playlist` | Remove repeated tracks from one of your own playlists |
+| `plan_catalogue_preview` | The genre catalogue `curate plan` would show |
+| `audience_stats` | Follower counts for the account and each owned playlist |
+| `top_tracks`, `recently_played` | Listening history |
+
+So "make me a 25-track late-night jazz fusion playlist from my liked songs"
+becomes three calls: learn the genres, pick the tracks, create it sequenced.
+Playlists are always created private, write tools only touch playlists you
+own, and every id is checked to be a Spotify id before it reaches a request:
+playlist and track text comes from other people, so a model reading it should
+not be one step away from publishing anything. The bulk writers
+(`curate forge`, `reflow`, `retire`) are not exposed: they are only correct
+with the sizes a catalogue was forged with, which belongs in a script.
+
+Claude Code picks the server up from the `.mcp.json` in this repo. For any
+other client, the command is `uv run spotifyforge mcp` with this directory as
+the working directory (that is where `.env` is read from).
 
 ## Layout
 
 ```
 spotifyforge/
-├── cli/        Typer app; one module per command group, helpers in _shared.py
-├── core/       curation, audio_features, discovery, playlist_manager, scheduler
-├── auth/       Spotify OAuth (PKCE) and keyring token store
-├── db/, models/  SQLite via SQLModel; alembic/ holds migrations
-└── web/        FastAPI app and routes
+├── cli/           Typer app; one module per command group, helpers in _shared.py
+├── core/          curation, audio_features, discovery, playlist_manager, stats
+├── auth/          Spotify OAuth, keyring token store, the logged-in session
+└── mcp_server.py  the MCP tools, over the same core as the CLI
 tests/fake_spotify.py   the in-memory Spotify API the whole suite runs against
 ```
+
+There is no database. Tokens live in the OS keyring; everything else is a
+handful of JSON files in `~/.spotifyforge`.
 
 Settings are `SPOTIFYFORGE_*` environment variables or `.env`; see
 `.env.example` for the full list. `SPOTIFYFORGE_MUSIC_DIR` (or `MUSIC_DIR`,
 default `~/.music`) is the shared directory `export library` writes
-`music-library.json` to, read by the discogs and rym repos.
+`music-library.json` to, read by the discogs repo.
 
 ## Develop
 

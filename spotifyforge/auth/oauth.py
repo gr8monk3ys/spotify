@@ -1,10 +1,9 @@
 """OAuth authentication module for SpotifyForge.
 
 Wraps Tekore's OAuth 2.0 authorization-code flow with multi-account token
-storage and automatic refresh.  Two concrete token-store implementations are
-provided: one backed by the OS keyring (ideal for local CLI use) and one that
-persists Fernet-encrypted tokens in a database or file (suitable for server
-deployments).
+storage and automatic refresh.  Tokens are kept in the OS keyring
+(:class:`KeyringTokenStore`); :class:`TokenStore` is the seam tests use to
+swap in an in-memory store.
 """
 
 from __future__ import annotations
@@ -375,58 +374,3 @@ class SpotifyAuth:
             state=state,
         )
         return url
-
-
-# ---------------------------------------------------------------------------
-# Module-level convenience functions (used by web routes and web app)
-# ---------------------------------------------------------------------------
-
-
-def build_auth_url(state: str | None = None) -> str:
-    """Build a Spotify authorization URL.
-
-    If no state is provided, generates a CSRF token automatically.
-    """
-    if state is None:
-        state = generate_csrf_state()
-    auth = SpotifyAuth()
-    return auth.get_auth_url(state=state)
-
-
-async def exchange_code(code: str) -> dict[str, Any]:
-    """Exchange an authorization code for token info.
-
-    CSRF state validation is the caller's responsibility (the web callback
-    checks the state cookie before calling this).
-
-    Returns a dict with ``access_token``, ``refresh_token``, and
-    ``expires_at`` keys, compatible with what the web layer expects.
-    """
-    auth = SpotifyAuth(asynchronous=True)
-    try:
-        token: tekore.Token = await auth.credentials.request_user_token(code)
-    except Exception as exc:
-        raise AuthenticationError(f"Failed to exchange authorization code: {exc}") from exc
-
-    return _token_to_dict(token)
-
-
-async def get_spotify_user(access_token: str) -> dict[str, Any]:
-    """Module-level convenience for fetching the Spotify user profile.
-
-    Creates a Tekore async Spotify client with the given *access_token*,
-    calls ``/me``, and returns a dict with ``id``, ``display_name``,
-    ``email``, and ``product`` fields.
-    """
-    client = make_client(access_token, asynchronous=True)
-    try:
-        user = await client.current_user()
-    except Exception as exc:
-        raise AuthenticationError(f"Failed to fetch Spotify user profile: {exc}") from exc
-
-    return {
-        "id": user.id,
-        "display_name": user.display_name,
-        "email": getattr(user, "email", None),
-        "product": getattr(user, "product", None),
-    }

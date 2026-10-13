@@ -479,20 +479,19 @@ async def test_explore_skips_known_and_barren_genres(fake_spotify, client_for, t
     assert skipped == ["coldwave", "zeuhl", "gagaku"]
 
 
-async def test_explored_niche_gets_forged(fake_spotify, client_for, isolated_db, db_user, tmp_path):
+async def test_explored_niche_gets_forged(fake_spotify, client_for, tmp_path):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_coldwave(fake_spotify)
     _seed_zeuhl_candidates(fake_spotify)
     path = tmp_path / "expansions.json"
-    owner_id = db_user()
     sp = client_for("user1")
 
     plan = await plan_catalogue(sp, CurationOptions(min_size=6))
     await explore_niches(sp, plan.specs, ["zeuhl"], path=path)
     grown = await plan_catalogue(sp, CurationOptions(min_size=6), expansions=load_expansions(path))
 
-    created, _ = await forge_next(PlaylistManager(sp), owner_id, grown.specs, limit=99, delay=0)
+    created, _ = await forge_next(PlaylistManager(sp), grown.specs, limit=99, delay=0)
     titles = {spec.title for spec, _ in created}
     (zeuhl_spec,) = [s for s in grown.specs if s.genre == "zeuhl"]
     assert zeuhl_spec.title in titles
@@ -505,20 +504,17 @@ async def test_explored_niche_gets_forged(fake_spotify, client_for, isolated_db,
 # ---------------------------------------------------------------------------
 
 
-async def test_reflow_pushes_pins_and_keeps_them(
-    fake_spotify, client_for, isolated_db, db_user, tmp_path
-):
+async def test_reflow_pushes_pins_and_keeps_them(fake_spotify, client_for, tmp_path):
     from spotifyforge.core.playlist_manager import PlaylistManager
 
     _seed_coldwave(fake_spotify)
     _seed_candidates(fake_spotify)
     path = tmp_path / "expansions.json"
-    owner_id = db_user()
     sp = client_for("user1")
     manager = PlaylistManager(sp)
 
     plan = await plan_catalogue(sp, CurationOptions(min_size=6))
-    created, _ = await forge_next(manager, owner_id, plan.specs, limit=99, delay=0)
+    created, _ = await forge_next(manager, plan.specs, limit=99, delay=0)
     (spec, playlist) = created[0]
     assert len(fake_spotify.playlist_tracks[playlist.spotify_id]) == 8
 

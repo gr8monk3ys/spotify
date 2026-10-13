@@ -14,7 +14,6 @@ from spotifyforge.cli._shared import (
     _current_user_file,
     _error_panel,
     _make_auth,
-    _upsert_db_user,
     console,
 )
 
@@ -51,8 +50,6 @@ def auth_login(
 
     try:
         profile = auth.complete_login(redirect_url, expected_state=state)
-        token = auth.token_store.load_token(profile["user_id"])
-        _upsert_db_user(profile["user_id"], profile, token)
     except Exception as exc:
         _error_panel(f"Login failed: {exc}", title="Authentication Error")
 
