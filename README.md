@@ -79,6 +79,7 @@ spotifyforge playlist list
 spotifyforge playlist deduplicate <playlist_id>
 spotifyforge playlist export <playlist_id> -f csv -o tracks.csv
 spotifyforge discover deep-cuts <artist_id> --threshold 25
+spotifyforge discover shows --days 60    # concerts near home by artists you play (Ticketmaster)
 
 spotifyforge history sync                # append recent plays to a local log (run hourly)
 spotifyforge history show --days 30      # what you actually played
@@ -116,6 +117,15 @@ Fifty plays is about two and a half hours of music; hourly is enough:
 A run that finds all 50 plays are new says so, because it cannot know whether
 a 51st was missed.
 
+`discover shows` needs a free Ticketmaster key
+(`SPOTIFYFORGE_TICKETMASTER_API_KEY`, from developer.ticketmaster.com) and a
+home (`SPOTIFYFORGE_HOME_LOCATION`, "lat,long" or a city, with
+`SPOTIFYFORGE_HOME_RADIUS_MILES`). It checks your top artists over all three
+Spotify time ranges, plus anyone the local log shows you playing, and only
+takes a Ticketmaster act when it links to that Spotify artist or is the one
+act with that exact name. Name-only matches are flagged, and names several
+acts share are listed rather than guessed.
+
 ## The page
 
 `export page` writes your library as a single HTML file: a table of your
@@ -145,6 +155,7 @@ cannot, because it depends on how this package reads your library:
 | `top_tracks`, `recently_played` | What Spotify itself reports |
 | `listening_history` | Plays counted from the local log `history sync` keeps |
 | `playlist_usage_report` | Which of your own playlists were played, and how many never were |
+| `upcoming_shows` | Concerts near home by the artists you play most, from Ticketmaster |
 
 So "make me a 25-track late-night jazz fusion playlist from my liked songs"
 becomes three calls: learn the genres, pick the tracks, create it sequenced.

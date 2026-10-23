@@ -258,3 +258,119 @@ def discover_time_capsule(
             expand=False,
         )
     )
+
+
+@discover_app.command("shows")
+def discover_shows(
+    days: int = typer.Option(
+        90, "--days", "-d", min=1, max=365, help="How far ahead to look, in days."
+    ),
+    artists: int = typer.Option(
+        50,
+        "--artists",
+        "-a",
+        min=1,
+        max=150,
+        help="How many of your most-played artists to check (two requests each).",
+    ),
+    near: str | None = typer.Option(
+        None,
+        "--near",
+        help='Home for this run: "lat,long" or a city. Default: SPOTIFYFORGE_HOME_LOCATION.',
+    ),
+    radius: int | None = typer.Option(
+        None,
+        "--radius",
+        "-r",
+        min=1,
+        max=500,
+        help="Miles around a lat,long home. Default: SPOTIFYFORGE_HOME_RADIUS_MILES.",
+    ),
+) -> None:
+    """Upcoming shows near home by the artists you play most (via Ticketmaster).
+
+    Your artists are Spotify's top artists over all three time ranges,
+    plus anything the local listening log shows you playing. Read-only:
+    nothing is written to Spotify or kept on disk.
+    """
+    from rich.markup import escape
+    from rich.style import Style
+    from rich.text import Text
+
+    from spotifyforge.cli._shared import _error_panel
+    from spotifyforge.config import settings
+    from spotifyforge.core.shows import HOW_TO_GET_A_KEY, Home, upcoming_shows
+
+    if not settings.ticketmaster_api_key:
+        _error_panel(HOW_TO_GET_A_KEY, title="Ticketmaster key needed")
+    try:
+        home = Home.parse(near or settings.home_location, radius or settings.home_radius_miles)
+    except ValueError as exc:
+        _error_panel(escape(str(exc)), title="Home location needed")
+
+    report = _run_spotify(
+        f"Looking for shows {home.describe()}...",
+        "Failed to look up shows",
+        lambda sp: upcoming_shows(
+            sp, home, days, settings.ticketmaster_api_key, artist_limit=artists
+        ),
+    )
+
+    by_name = sum(1 for a in report.matched if a.confidence == "name")
+    console.print(
+        Panel(
+            f"[bold]{len(report.shows)}[/bold] show(s) {escape(home.describe())} "
+            f"in the next {days} days.\n"
+            f"Checked {report.artists_checked} of your artists: "
+            f"{len(report.matched)} found on Ticketmaster"
+            + (f" ({by_name} by name only)" if by_name else "")
+            + f", {len(report.ambiguous)} ambiguous, "
+            f"{len(report.not_on_ticketmaster)} not found. "
+            f"[dim]{report.requests} requests.[/dim]",
+            title="Shows",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+
+    if report.shows:
+        table = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan")
+        table.add_column("Date", style="cyan", no_wrap=True)
+        table.add_column("Artist", style="green", max_width=30)
+        table.add_column("Event", style="white", max_width=45)
+        table.add_column("Venue", style="dim", max_width=40)
+        table.add_column("Miles", justify="right", style="yellow")
+        for show in report.shows:
+            # Text cells are never parsed as markup, and the core has already
+            # stripped control characters, so an event or venue name cannot
+            # inject styling or a link of its own. show.url is only ever an
+            # https Ticketmaster/Live Nation page (core.shows.safe_event_url).
+            event = Text(show.name, style=Style(link=show.url) if show.url else "")
+            if show.status and show.status != "onsale":
+                event.append(f" ({show.status})", style="yellow")
+            where = ", ".join(p for p in (show.venue, show.city, show.region) if p)
+            artist = Text(", ".join(show.artists))
+            if show.confidence == "name":
+                artist.append(" *", style="yellow")
+            table.add_row(
+                Text(" ".join(p for p in (show.local_date, (show.local_time or "")[:5]) if p)),
+                artist,
+                event,
+                Text(where or "—"),
+                f"{show.distance_miles:.0f}" if show.distance_miles is not None else "—",
+            )
+        console.print(table)
+        if any(s.confidence == "name" for s in report.shows):
+            console.print(
+                "[yellow]*[/yellow] [dim]Matched by name only: Ticketmaster does not link "
+                "this act to the Spotify artist, so check it is the same one.[/dim]"
+            )
+
+    if report.ambiguous:
+        listed = ", ".join(f"{escape(name)} ({count})" for name, count in report.ambiguous)
+        console.print(f"[dim]Skipped, as several Ticketmaster acts share the name: {listed}.[/dim]")
+    if report.truncated:
+        console.print(
+            "[dim]More shows exist than were listed for: "
+            f"{escape(', '.join(report.truncated))}.[/dim]"
+        )

@@ -554,3 +554,71 @@ async def playlist_usage_report(days: int | None = None) -> dict[str, Any]:
         "unplayed_count": len(usage.unplayed),
         "unplayed": [{"id": pid, "name": name} for pid, name in usage.unplayed[:50]],
     }
+
+
+# ---------------------------------------------------------------------------
+# Shows
+# ---------------------------------------------------------------------------
+
+
+@server.tool(annotations=_READ_ONLY)
+async def upcoming_shows(
+    days: int = 90, near: str | None = None, radius_miles: int | None = None, artists: int = 50
+) -> dict[str, Any]:
+    """Upcoming concerts near the user by the artists they play most, from Ticketmaster.
+
+    `near` is "lat,long" or a city name and defaults to the user's configured
+    home. Each show's `confidence` is "linked" when Ticketmaster links the act
+    to the Spotify artist, or "name" when only the names match: say so for
+    those, since another act may share the name. `ambiguous` artists were
+    skipped because several acts share their name.
+    """
+    from spotifyforge.config import settings
+    from spotifyforge.core import shows
+
+    if not settings.ticketmaster_api_key:
+        raise ToolError(shows.HOW_TO_GET_A_KEY)
+    try:
+        home = shows.Home.parse(
+            near or settings.home_location, radius_miles or settings.home_radius_miles
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    async with _spotify() as sp:
+        try:
+            report = await shows.upcoming_shows(
+                sp,
+                home,
+                max(1, min(days, 365)),
+                settings.ticketmaster_api_key,
+                artist_limit=max(1, min(artists, 150)),
+            )
+        except shows.TicketmasterError as exc:
+            raise ToolError(str(exc)) from exc
+    return {
+        "where": report.home.describe(),
+        "days": report.days,
+        "artists_checked": report.artists_checked,
+        "shows": [
+            {
+                "date": s.local_date,
+                "time": s.local_time,
+                "artists": list(s.artists),
+                "confidence": s.confidence,
+                "event": s.name,
+                "venue": s.venue,
+                "city": s.city,
+                "region": s.region,
+                "country": s.country,
+                "distance_miles": None if s.distance_miles is None else round(s.distance_miles, 1),
+                "status": s.status,
+                "url": s.url,
+            }
+            for s in report.shows
+        ],
+        "matched": len(report.matched),
+        "matched_by_name_only": [a.artist.name for a in report.matched if a.confidence == "name"],
+        "ambiguous": [{"artist": name, "acts": n} for name, n in report.ambiguous],
+        "not_on_ticketmaster": report.not_on_ticketmaster,
+        "more_shows_than_listed": report.truncated,
+    }

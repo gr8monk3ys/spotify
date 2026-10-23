@@ -24,6 +24,8 @@ config_app = typer.Typer(
 )
 
 _SECRET_FIELDS = {"spotify_client_id", "spotify_client_secret", "pexels_api_key"}
+# Every third-party key is masked, including ones added after the line above.
+_SECRET_FIELDS |= {name for name in Settings.model_fields if name.endswith("_api_key")}
 
 
 @config_app.command("show")

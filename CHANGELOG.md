@@ -18,6 +18,8 @@
 * **curate:** `curate features` estimates tempo from Deezer previews for tracks no
   database has a BPM for (optional `tempo` extra); `--retry-misses` re-asks Deezer
   about misses its quota errors left in the cache
+* **discover:** `discover shows` and the `upcoming_shows` MCP tool list concerts
+  near home by the artists you play, from Ticketmaster's Discovery API
 
 ### Removed
 
