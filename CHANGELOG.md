@@ -17,6 +17,8 @@
 * **export:** `export page` writes the library as one self-contained HTML page
 * **history:** `history likes` and the `liked_vs_played_report` MCP tool list songs
   played but not liked, and liked songs in no top list and not in the log
+* **export:** `export wrapped` writes your own Wrapped from the listening log as one
+  self-contained local HTML page; `history sync` now records possible gaps beside the log
 
 ### Removed
 

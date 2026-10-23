@@ -1016,3 +1016,41 @@ class TestExportPage:
 
         assert result.exit_code == 0, result.stderr
         assert "Test User’s library" in out.read_text(encoding="utf-8")
+
+
+class TestExportWrapped:
+    def test_writes_the_log_as_a_local_page_reading_only(self, cli_env, tmp_path):
+        from datetime import UTC, datetime, timedelta
+
+        fake = cli_env
+        fake.add_track("t1", name="Night Drive", artist_name="Alpha")
+        _login(fake)
+        fake.add_playlist("mine", name="Late Set", track_ids=["t1"])
+        now = datetime.now(UTC)
+        for minutes in (30, 20):
+            fake.play(
+                "user1",
+                "t1",
+                (now - timedelta(minutes=minutes)).isoformat(),
+                "spotify:playlist:mine",
+            )
+        runner.invoke(app, ["history", "sync"])
+        out = tmp_path / "wrapped.html"
+        before = len(fake.requests)
+
+        result = runner.invoke(app, ["export", "wrapped", "--out", str(out)])
+
+        assert result.exit_code == 0, result.stderr
+        assert "nothing was published" in result.output
+        html = out.read_text(encoding="utf-8")
+        assert "Test User’s listening, <em>since" in html
+        assert "No gaps recorded" in html
+        assert "Night Drive" in html
+        assert "Late Set" in html
+        assert {method for method, _ in fake.requests[before:]} == {"GET"}
+
+    def test_the_default_output_name_is_ignored_by_git(self):
+        from pathlib import Path
+
+        ignored = (Path(__file__).parents[2] / ".gitignore").read_text(encoding="utf-8")
+        assert "wrapped.html" in ignored.splitlines()
