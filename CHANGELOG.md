@@ -16,7 +16,9 @@
   which owned playlists are actually played
 * **export:** `export page` writes the library as one self-contained HTML page
 * **history:** `history likes` and the `liked_vs_played_report` MCP tool list songs
-  played but not liked, and liked songs in no top list and not in the log
+  played but not liked, and liked songs in no top list and not in the log;
+  `--playlist` writes the oldest `--limit` (default 100) of the second list to a new
+  private playlist, and dates are shown on the local clock, as on the Wrapped page
 * **export:** `export wrapped` writes your own Wrapped from the listening log as one
   self-contained local HTML page; `history sync` now records possible gaps beside the log
 

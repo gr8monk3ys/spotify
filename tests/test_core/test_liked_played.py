@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, timedelta, timezone
 
 from spotifyforge.core.curation import CurationTrack
 from spotifyforge.core.history import Play
 from spotifyforge.core.liked_played import (
+    PLAYLIST_LIMIT,
     Heard,
     TopList,
     compare,
     liked_vs_played,
+    local_day,
     read_top_list,
     write_playlist,
 )
@@ -142,6 +144,24 @@ def test_the_wording_names_the_log_start_and_never_says_never():
     assert compare([], [], []).not_heard_wording == "not in your top lists (the log is empty)"
 
 
+def test_dates_are_read_on_the_local_clock_not_utc():
+    pacific = timezone(timedelta(hours=-7))
+
+    assert local_day("2026-10-10T03:00:00+00:00", pacific) == "2026-10-09"
+    assert local_day("2026-10-10T03:00:00+00:00", UTC) == "2026-10-10"
+
+
+def test_the_playlist_size_is_capped_and_says_so():
+    liked = [_liked(f"t{i:03d}") for i in range(150)]
+
+    report = compare(liked, [], [])
+
+    assert len(report.liked_not_heard) == 150
+    assert report.playlist_size() == PLAYLIST_LIMIT == 100
+    assert report.playlist_size(5) == 5
+    assert compare(liked[:3], [], []).playlist_size() == 3
+
+
 async def test_a_top_list_is_read_past_its_first_page(fake_spotify, client_for):
     fake = fake_spotify
     fake.add_user("user1")
@@ -184,3 +204,17 @@ async def test_end_to_end_against_the_fake_and_the_playlist_is_private(fake_spot
     assert meta["name"] == "Liked, not heard lately (2026-10-22)"
     assert "since 2026-10-10" in meta["description"]
     assert fake.playlist_tracks[created.spotify_id] == ["liked_older", "liked_quiet"]
+
+
+async def test_the_playlist_keeps_only_the_oldest_likes_up_to_the_limit(fake_spotify, client_for):
+    fake = fake_spotify
+    fake.add_user("user1")
+    for track_id in ("newest", "middle", "oldest"):
+        fake.add_track(track_id, name=track_id, artist_id=f"a_{track_id}")
+        fake.save_track("user1", track_id)
+
+    report = await liked_vs_played(client_for(), [])
+    created = await write_playlist(client_for(), report, date(2026, 10, 22), limit=2)
+
+    assert [t.track_id for t in report.liked_not_heard] == ["oldest", "middle", "newest"]
+    assert fake.playlist_tracks[created.spotify_id] == ["oldest", "middle"]

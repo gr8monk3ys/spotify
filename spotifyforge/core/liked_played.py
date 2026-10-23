@@ -33,7 +33,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, tzinfo
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +69,19 @@ TOP_HEAD = 50
 # time, so this bounds one list at a hundred requests.
 MAX_DEPTH = 5000
 _TOP_PAGE = 50
+# Songs written to the playlist, oldest likes first. The whole list ran to
+# 2,028 songs on this account, and a playlist that long is never played
+# through; a hundred is an evening's rediscovery.
+PLAYLIST_LIMIT = 100
+
+
+def local_day(played_at: str, tz: tzinfo | None = None) -> str:
+    """The ``YYYY-MM-DD`` an ISO timestamp falls on in *tz* (this machine's zone if ``None``).
+
+    The log stores UTC; the reader's day is the one that means something,
+    and the Wrapped page uses the same clock.
+    """
+    return datetime.fromisoformat(played_at).astimezone(tz).date().isoformat()
 
 
 @dataclass(frozen=True)
@@ -126,8 +139,17 @@ class LikedVsPlayed:
 
     @property
     def log_since(self) -> str | None:
-        """The day the log starts, ``YYYY-MM-DD``."""
-        return self.log_first[:10] if self.log_first else None
+        """The day the log starts, ``YYYY-MM-DD`` on this machine's clock."""
+        return local_day(self.log_first) if self.log_first else None
+
+    @property
+    def log_until(self) -> str | None:
+        """The day of the last logged play, on this machine's clock."""
+        return local_day(self.log_last) if self.log_last else None
+
+    def playlist_size(self, limit: int = PLAYLIST_LIMIT) -> int:
+        """How many songs ``--playlist`` would put in the playlist."""
+        return min(len(self.liked_not_heard), limit)
 
     @property
     def not_heard_wording(self) -> str:
@@ -300,11 +322,14 @@ def playlist_name(today: date) -> str:
     return f"Liked, not heard lately ({today.isoformat()})"
 
 
-async def write_playlist(sp: Spotify, report: LikedVsPlayed, today: date) -> CreatedPlaylist:
-    """Put the liked-but-not-heard list into a new private playlist, oldest like first.
+async def write_playlist(
+    sp: Spotify, report: LikedVsPlayed, today: date, limit: int = PLAYLIST_LIMIT
+) -> CreatedPlaylist:
+    """Put the first *limit* liked-but-not-heard songs into a new private playlist.
 
-    Always a new playlist: each one is a dated snapshot of what the
-    records said that day, not a list kept up to date.
+    Oldest likes first, so the cap keeps the longest forgotten. Always a
+    new playlist: each one is a dated snapshot of what the records said
+    that day, not a list kept up to date.
     """
     log = f"my listening log since {report.log_since}" if report.log_since else "my listening log"
     manager = PlaylistManager(sp)
@@ -316,5 +341,5 @@ async def write_playlist(sp: Spotify, report: LikedVsPlayed, today: date) -> Cre
         ),
         public=False,
     )
-    await manager.add_tracks(created.spotify_id, [t.uri for t in report.liked_not_heard])
+    await manager.add_tracks(created.spotify_id, [t.uri for t in report.liked_not_heard[:limit]])
     return created

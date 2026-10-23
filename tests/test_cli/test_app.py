@@ -688,6 +688,37 @@ class TestHistoryLikes:
         assert fake.playlist_tracks[pid] == ["quiet"]
         assert "(private) with 1 song(s)" in result.output
 
+    def test_playlist_limit_keeps_the_oldest_likes(self, library):
+        fake = library
+        fake.add_track("quieter", name="Quieter", artist_id="a4")
+        # The fake lists saves newest first in the order they were made, so
+        # this one reads as liked before "quiet".
+        fake.save_track("user1", "quieter")
+
+        result = runner.invoke(app, ["history", "likes", "--playlist", "--limit", "1"])
+
+        assert result.exit_code == 0, result.stderr
+        ((pid, _),) = fake.playlists.items()
+        assert fake.playlist_tracks[pid] == ["quieter"]
+        assert "(private) with 1 song(s)" in result.output
+        assert "The oldest 1 of 2 likes" in result.output
+
+    def test_log_dates_are_on_the_local_clock(self, library):
+        from datetime import datetime
+
+        from spotifyforge.core.history import load_plays
+
+        plays = load_plays()
+        first, last = (
+            datetime.fromisoformat(p.played_at).astimezone().date().isoformat()
+            for p in (plays[0], plays[-1])
+        )
+
+        result = runner.invoke(app, ["history", "likes"])
+
+        assert result.exit_code == 0, result.stderr
+        assert f"4 plays, {first} to {last}" in result.output
+
 
 # ---------------------------------------------------------------------------
 # Config

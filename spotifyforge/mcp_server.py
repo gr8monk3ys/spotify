@@ -51,7 +51,12 @@ from spotifyforge.core.curation import (
 from spotifyforge.core.discovery import DiscoveryEngine
 from spotifyforge.core.expansion import load_expansions
 from spotifyforge.core.history import MIN_DAYS_TO_JUDGE, load_plays, playlist_usage, summarise
-from spotifyforge.core.liked_played import RANGE_SPANS, TOP_HEAD, liked_vs_played
+from spotifyforge.core.liked_played import (
+    PLAYLIST_LIMIT,
+    RANGE_SPANS,
+    TOP_HEAD,
+    liked_vs_played,
+)
 from spotifyforge.core.playlist_manager import PlaylistManager
 from spotifyforge.core.stats import growth_since, load_previous, take_snapshot
 
@@ -567,7 +572,9 @@ async def liked_vs_played_report(min_plays: int = 3, limit: int = 50) -> dict[st
     list. liked_not_heard are liked songs in no top list and not in the log.
     That is not proof a song was never played: describe it with the
     `wording` field, never as "never played". Read-only; lists are cut to
-    `limit` rows, the counts are not.
+    `limit` rows, the counts are not. playlist_would_include is how many of
+    liked_not_heard (oldest likes first) the CLI's `--playlist` would write
+    at its default cap of playlist_limit.
     """
     plays = load_plays()
     async with _spotify() as sp:
@@ -595,6 +602,9 @@ async def liked_vs_played_report(min_plays: int = 3, limit: int = 50) -> dict[st
             for row in report.played_not_liked[:rows]
         ],
         "liked_not_heard_count": len(report.liked_not_heard),
+        # What `history likes --playlist` would write: the oldest likes, capped.
+        "playlist_limit": PLAYLIST_LIMIT,
+        "playlist_would_include": report.playlist_size(),
         "liked_not_heard": [
             {"id": t.track_id, "name": t.name, "artists": t.artists, "album": t.album}
             for t in report.liked_not_heard[:rows]

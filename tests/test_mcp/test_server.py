@@ -419,6 +419,8 @@ async def test_liked_vs_played_report_is_read_only_and_worded_honestly(logged_in
     ]
     assert [t["id"] for t in out["liked_not_heard"]] == ["quiet"]
     assert out["wording"].startswith("not in your top lists or your log since ")
+    assert out["playlist_limit"] == 100
+    assert out["playlist_would_include"] == 1
 
 
 async def test_liked_vs_played_report_is_annotated_read_only():

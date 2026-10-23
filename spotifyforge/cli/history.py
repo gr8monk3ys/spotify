@@ -190,6 +190,12 @@ def history_likes(
         "--playlist",
         help="Also write the liked-but-not-heard list to a new private playlist.",
     ),
+    limit: int = typer.Option(
+        100,
+        "--limit",
+        min=1,
+        help="Most songs --playlist writes, oldest likes first.",
+    ),
 ) -> None:
     """Songs you play but have not liked, and liked songs you no longer hear.
 
@@ -197,7 +203,8 @@ def history_likes(
     lists (about 4 weeks, 6 months and a year), read to their full depth.
     "Not heard lately" means in none of those: it is not proof a song was
     never played. Changes nothing unless you pass [bold]--playlist[/bold],
-    which creates one new private playlist.
+    which creates one new private playlist of the first [bold]--limit[/bold]
+    songs, oldest likes first. Dates are in this machine's time zone.
     """
     from spotifyforge.core.clock import utc_now
     from spotifyforge.core.history import load_plays
@@ -216,11 +223,8 @@ def history_likes(
         lambda sp: liked_vs_played(sp, plays, min_plays),
     )
 
-    if report.log_first and report.log_last:
-        log = (
-            f"[bold]{report.log_plays}[/bold] plays, {report.log_first[:10]} "
-            f"to {report.log_last[:10]}"
-        )
+    if report.log_since and report.log_until:
+        log = f"[bold]{report.log_plays}[/bold] plays, {report.log_since} to {report.log_until}"
     else:
         log = "[yellow]empty[/yellow] (run [bold]history sync[/bold] on a timer)"
     tops = " · ".join(f"{n:,} ({RANGE_SPANS[r]})" for r, n in report.top_lists)
@@ -274,16 +278,23 @@ def history_likes(
             "[yellow]Every liked song is in a top list or the log; no playlist made.[/yellow]"
         )
         return
-    today = utc_now().date()
+    today = utc_now().astimezone().date()  # the same clock as the dates above
+    size = report.playlist_size(limit)
     created = _run_spotify(
         f"Creating '{playlist_name(today)}'...",
         "Failed to create the playlist",
-        lambda sp: write_playlist(sp, report, today),
+        lambda sp: write_playlist(sp, report, today, limit),
+    )
+    capped = (
+        f"[dim]The oldest {size:,} of {len(report.liked_not_heard):,} likes; "
+        "raise --limit for more.[/dim]\n"
+        if size < len(report.liked_not_heard)
+        else ""
     )
     console.print(
         Panel(
             f"[green]Created[/green] [bold]{escape(created.name)}[/bold] (private) with "
-            f"{len(report.liked_not_heard):,} song(s).\n"
+            f"{size:,} song(s).\n{capped}"
             f"https://open.spotify.com/playlist/{created.spotify_id}",
             title="Playlist",
             border_style="green",
