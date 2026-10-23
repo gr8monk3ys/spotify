@@ -33,12 +33,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Tempo estimated locally from Deezer's 30-second previews, for tracks no
+# database has a BPM for. Optional because numpy is most of the install;
+# without it the preview provider says so and is skipped.
+tempo = [
+    "numpy>=1.26",
+    "soundfile>=0.12",  # bundles libsndfile, which decodes MP3; no ffmpeg
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "ruff>=0.3",
     "mypy>=1.8",
+    # So the tests exercise the estimator rather than skipping it.
+    "spotifyforge[tempo]",
 ]
 
 [project.scripts]
@@ -91,6 +100,16 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = ["keyring.*"]
 ignore_missing_imports = true
+
+# The optional tempo extra. soundfile ships no types, and numpy's stubs on
+# Python >= 3.12 use syntax mypy refuses under python_version = 3.11, so
+# which numpy the resolver picked would decide whether mypy passes. Both
+# are treated as Any; spotifyforge.core.tempo is small enough to read.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*", "soundfile"]
+ignore_missing_imports = true
+follow_imports = "skip"
+follow_imports_for_stubs = true
 
 [[tool.mypy.overrides]]
 module = [

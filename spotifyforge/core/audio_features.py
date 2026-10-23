@@ -11,6 +11,9 @@ identifier, and other music databases are keyed by it:
   recording, then reads AcousticBrainz's analysis of it, which has both
   key and BPM. Authoritative but slow: MusicBrainz asks for one request
   per second, so a full library is a background job, not a page load.
+* :class:`PreviewTempoProvider` — for what neither knows, downloads
+  Deezer's 30-second preview and estimates the BPM locally
+  (:mod:`spotifyforge.core.tempo`). Needs the optional ``tempo`` extra.
 
 Results are cached on disk by ISRC (checkpointed as it goes, so an
 interrupted run keeps its work), and the slow walk happens once. Coverage
@@ -26,14 +29,14 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
 from spotifyforge import __version__
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,16 @@ _MUSICBRAINZ_INTERVAL = 1.05
 # turns a whole library from minutes into hours.
 _MB_BATCH = 25
 _AB_BATCH = 25
+
+# Deezer allows 50 requests per 5 seconds and answers the 51st with HTTP
+# 200 and an error body, which reads exactly like "no BPM" unless checked.
+_DEEZER_INTERVAL = 0.11
+_DEEZER_QUOTA_ERROR = 4
+_DEEZER_ATTEMPTS = 3
+_DEEZER_QUOTA_PAUSE = 5.0
+
+# Previews are ~0.5 MB; anything far larger is not a 30-second clip.
+_MAX_PREVIEW_BYTES = 5_000_000
 
 # Write the cache to disk every this many lookups, so an interrupted run
 # keeps the work it has already paid for.
@@ -136,6 +149,26 @@ class FeatureCache:
         """Has *provider* already been asked about *isrc*?"""
         return provider in (self._data.get(isrc, {}).get("sources") or [])
 
+    def forget_tempo_misses(self, provider: str) -> int:
+        """Let *provider* be asked again about every entry still without a tempo.
+
+        For a provider whose earlier answers cannot be trusted as misses —
+        Deezer's quota error looked exactly like "no BPM" until it was
+        checked for, and runs before that check cached it as one.
+        """
+        forgotten = 0
+        for entry in self._data.values():
+            sources = entry.get("sources") or []
+            if entry.get("tempo") is None and provider in sources:
+                sources.remove(provider)
+                forgotten += 1
+        return forgotten
+
+    def tempo_source(self, isrc: str) -> str | None:
+        """The provider that supplied *isrc*'s tempo, where that was recorded."""
+        source = self._data.get(isrc, {}).get("tempo_from")
+        return source if isinstance(source, str) else None
+
     def all(self) -> dict[str, AudioFeature]:
         """Every cached reading, keyed by ISRC."""
         return {isrc: AudioFeature.from_raw(raw) for isrc, raw in self._data.items()}
@@ -148,6 +181,10 @@ class FeatureCache:
         playlist because two sources disagree by half a BPM.
         """
         entry = self._data.setdefault(isrc, {"sources": []})
+        if entry.get("tempo") is None and feature.tempo is not None:
+            # Which source a tempo came from, so an estimated one can be
+            # told apart from one a database measured.
+            entry["tempo_from"] = provider
         AudioFeature.from_raw(entry).merged_with(feature).write_into(entry)
         sources = entry.setdefault("sources", [])
         if provider not in sources:
@@ -189,32 +226,89 @@ class _RateLimiter:
             self._last = time.monotonic()
 
 
+class FeatureProvider(Protocol):
+    """A source of readings, asked only about ISRCs it has not been asked before."""
+
+    name: str
+
+    def stream(
+        self, client: httpx.AsyncClient, isrcs: Sequence[str]
+    ) -> AsyncIterator[tuple[str, AudioFeature]]: ...
+
+
+class _DeezerQuotaError(Exception):
+    """Deezer kept refusing for quota; the ISRC was not really asked."""
+
+
+async def _deezer_track(
+    client: httpx.AsyncClient, isrc: str, limiter: _RateLimiter
+) -> dict[str, Any] | None:
+    """Deezer's track payload for *isrc*, or ``None`` if it has none.
+
+    A quota error is waited out and retried rather than returned: it
+    arrives as HTTP 200, and caching it as a miss would mark a track
+    Deezer does know as one it does not, for good. Before this check,
+    a burst of four concurrent requests drew it on a quarter of them.
+    If it persists, :class:`_DeezerQuotaError` is raised and the caller
+    leaves the ISRC unrecorded, for the next run to ask again.
+    """
+    for attempt in range(_DEEZER_ATTEMPTS):
+        await limiter.wait()
+        response = await client.get(f"https://api.deezer.com/track/isrc:{isrc}")
+        if response.status_code != 200:
+            return None
+        body = response.json()
+        if not isinstance(body, dict):
+            return None
+        error = body.get("error")
+        if not error:
+            return body
+        if not isinstance(error, dict) or error.get("code") != _DEEZER_QUOTA_ERROR:
+            return None  # "no data": Deezer does not know this ISRC
+        logger.debug("deezer quota hit for %s (attempt %d)", isrc, attempt + 1)
+        await asyncio.sleep(_DEEZER_QUOTA_PAUSE)
+    raise _DeezerQuotaError(isrc)
+
+
+async def _yield_answered(
+    jobs: list[Awaitable[tuple[str, AudioFeature | None]]],
+) -> AsyncIterator[tuple[str, AudioFeature]]:
+    """Yield results as they finish, dropping ones that were never answered."""
+    for finished in asyncio.as_completed(jobs):
+        isrc, feature = await finished
+        if feature is not None:
+            yield isrc, feature
+
+
 class DeezerProvider:
     """BPM by ISRC from Deezer's public API. No key, no auth, quick."""
 
     name = "deezer"
     concurrency = 4
 
+    def __init__(self) -> None:
+        self._limiter = _RateLimiter(_DEEZER_INTERVAL)
+
     async def stream(
         self, client: httpx.AsyncClient, isrcs: Sequence[str]
     ) -> AsyncIterator[tuple[str, AudioFeature]]:
         semaphore = asyncio.Semaphore(self.concurrency)
 
-        async def one(isrc: str) -> tuple[str, AudioFeature]:
+        async def one(isrc: str) -> tuple[str, AudioFeature | None]:
             async with semaphore:
                 try:
-                    response = await client.get(f"https://api.deezer.com/track/isrc:{isrc}")
-                    if response.status_code != 200:
-                        return isrc, AudioFeature()
-                    bpm = response.json().get("bpm")
+                    body = await _deezer_track(client, isrc, self._limiter)
+                    bpm = (body or {}).get("bpm")
                     # Deezer reports 0 when it has not analysed the track.
                     return isrc, (AudioFeature(tempo=float(bpm)) if bpm else AudioFeature())
+                except _DeezerQuotaError:
+                    return isrc, None
                 except (httpx.HTTPError, ValueError, KeyError) as exc:
                     logger.debug("deezer failed for %s: %s", isrc, exc)
                     return isrc, AudioFeature()
 
-        for finished in asyncio.as_completed([one(i) for i in isrcs]):
-            yield await finished
+        async for answered in _yield_answered([one(i) for i in isrcs]):
+            yield answered
 
 
 class AcousticBrainzProvider:
@@ -302,6 +396,59 @@ class AcousticBrainzProvider:
         return out
 
 
+class PreviewTempoProvider:
+    """BPM estimated from Deezer's 30-second preview, for tracks nothing else knows.
+
+    Asked only about tracks still without a tempo once the databases have
+    had their turn (:attr:`gaps_only`), so an estimate never displaces a
+    measured value. The preview URL is signed and expires, which is why
+    it is fetched fresh with the track rather than kept.
+
+    Without the ``tempo`` extra this yields nothing at all — not even
+    misses — so installing the extra later picks up every track.
+    """
+
+    name = "preview"
+    gaps_only = True
+    concurrency = 4
+
+    def __init__(self) -> None:
+        self._limiter = _RateLimiter(_DEEZER_INTERVAL)
+
+    async def stream(
+        self, client: httpx.AsyncClient, isrcs: Sequence[str]
+    ) -> AsyncIterator[tuple[str, AudioFeature]]:
+        from spotifyforge.core import tempo
+
+        if not tempo.available():
+            logger.info("tempo extra not installed; skipping preview estimates")
+            return
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def one(isrc: str) -> tuple[str, AudioFeature | None]:
+            async with semaphore:
+                try:
+                    body = await _deezer_track(client, isrc, self._limiter)
+                    url = (body or {}).get("preview")
+                    if not url:
+                        return isrc, AudioFeature()
+                    response = await client.get(str(url))
+                    if response.status_code != 200 or len(response.content) > _MAX_PREVIEW_BYTES:
+                        return isrc, AudioFeature()
+                    # Decoding and the FFTs are CPU work; off the event
+                    # loop, the next downloads proceed meanwhile.
+                    bpm = await asyncio.to_thread(tempo.estimate_from_audio, response.content)
+                except _DeezerQuotaError:
+                    return isrc, None
+                except (httpx.HTTPError, ValueError, KeyError) as exc:
+                    logger.debug("preview failed for %s: %s", isrc, exc)
+                    return isrc, AudioFeature()
+                return isrc, (AudioFeature(tempo=round(bpm, 2)) if bpm else AudioFeature())
+
+        async for answered in _yield_answered([one(i) for i in isrcs]):
+            yield answered
+
+
 # ---------------------------------------------------------------------------
 # Enrichment
 # ---------------------------------------------------------------------------
@@ -309,7 +456,7 @@ class AcousticBrainzProvider:
 
 async def fetch_features(
     isrcs: Sequence[str],
-    providers: Sequence[DeezerProvider | AcousticBrainzProvider],
+    providers: Sequence[FeatureProvider],
     cache: FeatureCache,
     client: httpx.AsyncClient | None = None,
     progress: Callable[[], None] | None = None,
@@ -320,13 +467,21 @@ async def fetch_features(
     fast BPM-only source supplies tempo while a slower one supplies the
     key. Each provider is asked only about tracks it has not already been
     asked about, which makes repeat runs cheap and lets a later deep pass
-    top up entries an earlier quick pass created.
+    top up entries an earlier quick pass created. A provider marked
+    ``gaps_only`` is asked only about tracks still without a tempo.
     """
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=60, follow_redirects=True)
     try:
         for provider in providers:
-            pending = [i for i in isrcs if i and not cache.tried(i, provider.name)]
+            gaps_only = getattr(provider, "gaps_only", False)
+            pending = [
+                i
+                for i in isrcs
+                if i
+                and not cache.tried(i, provider.name)
+                and not (gaps_only and (cache.get(i) or AudioFeature()).tempo is not None)
+            ]
             logger.info("%s: %d ISRCs to look up", provider.name, len(pending))
             done = 0
             try:
@@ -413,25 +568,42 @@ async def gather_features(
     isrcs: Sequence[str],
     deep: bool = False,
     progress: Callable[[], None] | None = None,
+    estimate: bool = True,
+    retry_misses: bool = False,
 ) -> tuple[dict[str, AudioFeature], int]:
     """Fetch and cache tempo/key for *isrcs*, returning (features, learned).
 
     Deezer alone supplies tempo quickly. *deep* adds the
     MusicBrainz/AcousticBrainz walk, which is the only source of musical
-    key but is rate-limited to roughly one track per second.
+    key but is rate-limited to roughly one track per second. *estimate*
+    then fills the tempo gaps left from previews, when the ``tempo``
+    extra is installed. *retry_misses* asks Deezer again about every
+    track it had no tempo for.
     """
+    from spotifyforge.core import tempo
+
     cache = FeatureCache(feature_cache_path())
+    if retry_misses:
+        cache.forget_tempo_misses(DeezerProvider.name)
     wanted = sorted(set(isrcs))
     # Count recordings that actually gained data, not new cache rows: a
     # deep pass adds keys to entries a tempo pass already created, so
     # measuring the row count would report zero for a run that worked.
     before = {i: cache.get(i) for i in wanted}
-    providers: list[DeezerProvider | AcousticBrainzProvider] = [DeezerProvider()]
+    providers: list[FeatureProvider] = [DeezerProvider()]
     if deep:
         providers.append(AcousticBrainzProvider())
+    if estimate and tempo.available():
+        providers.append(PreviewTempoProvider())
     features = await fetch_features(wanted, providers, cache, progress=progress)
     learned = sum(1 for i in wanted if features.get(i) != before.get(i))
     return features, learned
+
+
+def estimated_tempo_count(isrcs: Sequence[str]) -> int:
+    """How many of *isrcs* have a tempo estimated from a preview, not measured."""
+    cache = FeatureCache(feature_cache_path())
+    return sum(1 for i in set(isrcs) if cache.tempo_source(i) == PreviewTempoProvider.name)
 
 
 def load_cached_features() -> dict[str, AudioFeature]:

@@ -543,7 +543,7 @@ class TestCurateFeatures:
 
         captured: dict[str, list[str]] = {}
 
-        async def fake_gather(isrcs, deep=False, progress=None):
+        async def fake_gather(isrcs, deep=False, progress=None, **_):
             captured["isrcs"] = list(isrcs)
             return {}, 0
 
@@ -555,6 +555,46 @@ class TestCurateFeatures:
         # lookup must cover both.
         assert "ISRCPINNED" in captured["isrcs"]
         assert "ISRCT1" in captured["isrcs"]
+
+    def test_points_at_the_tempo_extra_when_tempo_is_missing(self, cli_env, monkeypatch):
+        fake = cli_env
+        fake.add_track("t1")
+        fake.save_track("user1", "t1")
+        _login(fake)
+        captured: dict[str, object] = {}
+
+        async def fake_gather(isrcs, deep=False, progress=None, **kwargs):
+            captured.update(kwargs)
+            return {}, 0
+
+        monkeypatch.setattr("spotifyforge.core.audio_features.gather_features", fake_gather)
+        monkeypatch.setattr("spotifyforge.core.tempo.available", lambda: False)
+
+        result = runner.invoke(app, ["curate", "features", "--retry-misses"])
+        assert result.exit_code == 0, result.stderr
+        assert captured["retry_misses"] is True
+        assert "spotifyforge[tempo]" in result.output
+
+    def test_reports_how_many_tempos_were_estimated(self, cli_env, monkeypatch):
+        from spotifyforge.core.audio_features import AudioFeature, FeatureCache, feature_cache_path
+
+        fake = cli_env
+        fake.add_track("t1")
+        fake.save_track("user1", "t1")
+        _login(fake)
+        cache = FeatureCache(feature_cache_path())
+        cache.put("ISRCT1", AudioFeature(tempo=99.0), "preview")
+        cache.save()
+
+        async def fake_gather(isrcs, deep=False, progress=None, **_):
+            return {"ISRCT1": AudioFeature(tempo=99.0)}, 0
+
+        monkeypatch.setattr("spotifyforge.core.audio_features.gather_features", fake_gather)
+
+        result = runner.invoke(app, ["curate", "features"])
+        assert result.exit_code == 0, result.stderr
+        assert "1 estimated from previews" in result.output
+        assert "spotifyforge[tempo]" not in result.output
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ from spotifyforge.core.curation import (
     order_for_flow,
     plan_catalogue,
     reflow,
+    tempo_distance,
     writable_specs,
 )
 
@@ -779,6 +780,27 @@ def test_flow_prefers_close_tempo_when_keys_tie():
 
     ordered = order_for_flow(tracks, features)
     assert [t.id for t in ordered] == ["start", "near", "far"]
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "gap"),
+    [(120.0, 124.0, 4.0), (85.0, 170.0, 0.0), (172.0, 85.0, 2.0), (90.0, 135.0, 45.0)],
+)
+def test_tempo_distance_counts_half_and_double_time_as_one_pulse(a, b, gap):
+    assert tempo_distance(a, b) == pytest.approx(gap)
+    assert tempo_distance(b, a) == pytest.approx(gap)
+
+
+def test_flow_treats_double_time_as_a_near_tempo():
+    # Sources disagree on octaves; 87 vs a "doubled" 174 is the same groove.
+    tracks, features = [], {}
+    for tid, tempo, pop in [("start", 87.0, 99), ("double", 174.0, 10), ("other", 120.0, 60)]:
+        t = replace(_ct(tid, popularity=pop, artist=tid), isrc=tid)
+        tracks.append(t)
+        features[tid] = AudioFeature(tempo=tempo, key=9, mode=0)
+
+    ordered = order_for_flow(tracks, features)
+    assert [t.id for t in ordered] == ["start", "double", "other"]
 
 
 def test_harmonic_ordering_still_refuses_back_to_back_artists():

@@ -29,6 +29,17 @@ On my library that covered key for 52% of recordings, enough for 97 of the
 221 playlists to be sequenced by Camelot-wheel key distance; the rest fall
 back to a popularity arc. Same-artist separation always outranks harmony.
 
+Tempo had a bigger hole: only 62% of my 2,665 unique liked songs had a BPM.
+Deezer answers 0 for much of its recent catalogue, AcousticBrainz stopped
+collecting in 2022, and 172 tracks Deezer did know had been cached as misses
+because its quota error arrives as HTTP 200. With the optional `tempo` extra
+(`pip install 'spotifyforge[tempo]'`, numpy and soundfile), `curate features`
+estimates the rest from Deezer's 30-second previews (`core/tempo.py`); on 200
+held-out songs with a known BPM the estimate lands within 3 BPM 64.5% of the
+time and within an octave 79%. Coverage is now 96.8%, 728 of it estimated.
+Half and double time count as the same pulse when sequencing, since even
+Deezer and AcousticBrainz disagree by an octave on 8% of songs.
+
 Spotify also leaves a lot of artists with no genres at all: 753 of my 2,662
 unique liked songs had nowhere to go but a "beyond genre" playlist.
 `curate genres` asks MusicBrainz about those artists (`core/genre_fallback.py`),

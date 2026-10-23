@@ -15,6 +15,9 @@
 * **history:** `history playlists` and the `playlist_usage_report` MCP tool show
   which owned playlists are actually played
 * **export:** `export page` writes the library as one self-contained HTML page
+* **curate:** `curate features` estimates tempo from Deezer previews for tracks no
+  database has a BPM for (optional `tempo` extra); `--retry-misses` re-asks Deezer
+  about misses its quota errors left in the cache
 
 ### Removed
 
