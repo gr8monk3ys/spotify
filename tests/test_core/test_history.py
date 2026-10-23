@@ -9,6 +9,7 @@ import pytest
 
 from spotifyforge.core.history import (
     WINDOW,
+    load_gaps,
     load_plays,
     playlist_usage,
     summarise,
@@ -84,6 +85,10 @@ async def test_a_full_window_of_new_plays_is_reported_as_a_possible_gap(fake, cl
 
     assert result.added == WINDOW
     assert result.possible_gap is True
+    # Recorded beside the log, between the last play known and the oldest new one.
+    (gap,) = load_gaps(path)
+    assert gap.after.startswith("2026-10-01T12:00:00")
+    assert gap.before.startswith("2026-10-01T12:33:00")  # play 11: the first ten were forgotten
 
 
 async def test_a_full_window_on_the_very_first_sync_is_not_a_gap(fake, client_for, tmp_path):
@@ -94,6 +99,7 @@ async def test_a_full_window_on_the_very_first_sync_is_not_a_gap(fake, client_fo
 
     assert result.added == WINDOW
     assert result.possible_gap is False
+    assert load_gaps(tmp_path / "history.jsonl") == []
 
 
 async def test_a_torn_last_line_does_not_lose_the_history(fake, client_for, tmp_path):

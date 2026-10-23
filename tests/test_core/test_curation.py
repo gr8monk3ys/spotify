@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 from collections import Counter
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 
@@ -181,6 +182,34 @@ def test_dedupe_keeps_the_most_popular_version():
         _ct("loud", name="Bocanada - Remaster", popularity=88, artist="cerati"),
     ]
     assert [t.id for t in dedupe_versions(tracks)] == ["loud"]
+
+
+def test_dedupe_dates_the_kept_version_from_the_first_like():
+    # The newer version is kept for its popularity, but the song was liked
+    # in 2016: an import re-liking it in 2026 must not move it.
+    first = datetime(2016, 5, 26, tzinfo=UTC)
+    tracks = [
+        replace(_ct("old", name="Bocanada", popularity=12, artist="cerati"), added_at=first),
+        replace(
+            _ct("new", name="Bocanada - Remaster", popularity=88, artist="cerati"),
+            added_at=datetime(2026, 8, 14, tzinfo=UTC),
+        ),
+        replace(_ct("solo", name="Other"), added_at=None),
+    ]
+
+    kept = dedupe_versions(tracks)
+
+    assert [(t.id, t.added_at) for t in kept] == [("new", first), ("solo", None)]
+
+
+async def test_the_liked_date_is_carried_off_spotify(fake_spotify, client_for):
+    fake_spotify.add_user("user1")
+    fake_spotify.add_track("t1")
+    fake_spotify.save_track("user1", "t1")
+
+    tracks = await CurationEngine(client_for("user1")).fetch_liked()
+
+    assert tracks[0].added_at == datetime(2024, 1, 1, tzinfo=UTC)
 
 
 def test_dedupe_distinguishes_same_title_by_different_artists():

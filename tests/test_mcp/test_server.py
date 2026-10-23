@@ -153,6 +153,44 @@ async def test_liked_library_is_cached_until_refresh(logged_in):
     assert (await _ok("search_liked", refresh=True))["total_matches"] == 2
 
 
+async def test_records_vs_streams_reads_discogs_json_and_writes_nothing(
+    logged_in, tmp_path, monkeypatch
+):
+    import json
+
+    from spotifyforge.config import settings
+    from tests.test_core.test_library import FIXTURE
+
+    fake = logged_in
+    for i in range(3):
+        fake.add_track(f"u{i}", artist_name="Nirvana", album_name="In Utero (Deluxe Edition)")
+        fake.save_track("user1", f"u{i}")
+    monkeypatch.setattr(settings, "music_dir", tmp_path)
+    (tmp_path / "discogs.json").write_text(json.dumps(FIXTURE), encoding="utf-8")
+    before = len(fake.requests)
+
+    out = await _ok("records_vs_streams")
+
+    assert out["collection"] == {"records": 2, "matched": 1}
+    assert out["wantlist"] == {"records": 1, "matched": 0}
+    assert [r["title"] for r in out["owned_not_streamed"]] == ["Kid A"]
+    assert out["unmatched_count"] == 2
+    assert {method for method, _ in fake.requests[before:]} == {"GET"}
+
+
+async def test_records_vs_streams_without_the_export_names_the_command(
+    logged_in, tmp_path, monkeypatch
+):
+    from spotifyforge.config import settings
+
+    monkeypatch.setattr(settings, "music_dir", tmp_path)
+
+    result = await _call("records_vs_streams")
+
+    assert result.is_error
+    assert "discogs export" in result.content[0].text
+
+
 async def test_create_playlist_sequences_liked_tracks_and_is_private(logged_in):
     fake = logged_in
     # Three tracks by one artist and one by another: the arc ordering must
@@ -459,3 +497,49 @@ async def test_upcoming_shows_reports_shows_and_how_sure_each_match_is(logged_in
     assert show["distance_miles"] == 7.3
     assert show["url"] is None  # the model never sees a link that is not a ticket page
     assert out["matched_by_name_only"] == []
+
+
+async def test_liked_vs_played_report_is_read_only_and_worded_honestly(logged_in):
+    from datetime import UTC, datetime, timedelta
+
+    from spotifyforge.core.history import sync_history
+
+    fake = logged_in
+    _like(fake, "heard", artist="a1", genres=["jazz"], name="Heard")
+    _like(fake, "quiet", artist="a2", genres=["jazz"], name="Quiet")
+    fake.add_track("habit", name="Habit", artist_id="a3", artist_name="Gamma")
+    fake.top_tracks_by_range[("user1", "long_term")] = ["heard", "habit"]
+    now = datetime.now(UTC)
+    for hours in (3, 2, 1):
+        fake.play("user1", "habit", (now - timedelta(hours=hours)).isoformat())
+    client = fake.async_client("user1")
+    await sync_history(client)
+    await client.close()
+    before = len(fake.requests)
+
+    out = await _ok("liked_vs_played_report")
+
+    assert {method for method, _ in fake.requests[before:]} == {"GET"}
+    assert out["liked_songs"] == 2
+    assert out["log"]["plays"] == 3
+    assert [t["time_range"] for t in out["top_lists"]] == ["short_term", "medium_term", "long_term"]
+    assert out["played_not_liked"] == [
+        {
+            "id": "habit",
+            "name": "Habit",
+            "artists": "Gamma",
+            "log_plays": 3,
+            "top_ranks": {"long_term": 2},
+        }
+    ]
+    assert [t["id"] for t in out["liked_not_heard"]] == ["quiet"]
+    assert out["wording"].startswith("not in your top lists or your log since ")
+    assert out["playlist_limit"] == 100
+    assert out["playlist_would_include"] == 1
+
+
+async def test_liked_vs_played_report_is_annotated_read_only():
+    async with Client(server) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    assert tools["liked_vs_played_report"].annotations.read_only_hint is True

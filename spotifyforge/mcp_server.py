@@ -51,6 +51,12 @@ from spotifyforge.core.curation import (
 from spotifyforge.core.discovery import DiscoveryEngine
 from spotifyforge.core.expansion import load_expansions
 from spotifyforge.core.history import MIN_DAYS_TO_JUDGE, load_plays, playlist_usage, summarise
+from spotifyforge.core.liked_played import (
+    PLAYLIST_LIMIT,
+    RANGE_SPANS,
+    TOP_HEAD,
+    liked_vs_played,
+)
 from spotifyforge.core.playlist_manager import PlaylistManager
 from spotifyforge.core.stats import growth_since, load_previous, take_snapshot
 
@@ -274,6 +280,33 @@ async def search_liked(
         "total_matches": len(found),
         "tracks": [_liked_track_dict(t, features) for t in found[: max(1, min(limit, 200))]],
     }
+
+
+@server.tool(annotations=_READ_ONLY)
+async def records_vs_streams(top: int = 20, refresh: bool = False) -> dict[str, Any]:
+    """The user's Discogs shelves joined to their liked songs and play log.
+
+    Reads discogs.json from the music directory (written by `discogs
+    export`); nothing is written to Discogs or Spotify. wanted_and_loved is
+    the wantlist ranked by liked songs, then plays: what to buy first.
+    owned_not_streamed is the collection with no liked song or play. loved_unshelved
+    is liked albums (3+ liked songs) on neither shelf: wantlist candidates
+    to suggest, never to add. Matching is by artist and title with editions
+    collapsed, so check unmatched_examples before calling a record unplayed:
+    one whose artist has many artist_liked_songs is more likely a title the
+    join missed. Lists are cut to `top`; the *_count fields are the totals.
+    """
+    from spotifyforge.config import settings
+    from spotifyforge.core.library import LibraryFileError
+    from spotifyforge.core.records import join_records, read_discogs_shelves, report_dict
+
+    try:
+        records = read_discogs_shelves(settings.music_dir / "discogs.json")
+    except LibraryFileError as exc:
+        raise ToolError(str(exc)) from exc
+    async with _spotify() as sp:
+        tracks = await _liked(sp, refresh)
+    return report_dict(join_records(records, tracks, load_plays()), top=max(1, min(top, 200)))
 
 
 # ---------------------------------------------------------------------------
@@ -621,4 +654,54 @@ async def upcoming_shows(
         "ambiguous": [{"artist": name, "acts": n} for name, n in report.ambiguous],
         "not_on_ticketmaster": report.not_on_ticketmaster,
         "more_shows_than_listed": report.truncated,
+    }
+
+
+@server.tool(annotations=_READ_ONLY)
+async def liked_vs_played_report(min_plays: int = 3, limit: int = 50) -> dict[str, Any]:
+    """Songs the user plays but has not liked, and liked songs they no longer hear.
+
+    Compares the liked songs with the local log and Spotify's three top
+    lists, each read to its full depth. played_not_liked are candidates to
+    like: min_plays or more plays in the log, or a rank in the head of a top
+    list. liked_not_heard are liked songs in no top list and not in the log.
+    That is not proof a song was never played: describe it with the
+    `wording` field, never as "never played". Read-only; lists are cut to
+    `limit` rows, the counts are not. playlist_would_include is how many of
+    liked_not_heard (oldest likes first) the CLI's `--playlist` would write
+    at its default cap of playlist_limit.
+    """
+    plays = load_plays()
+    async with _spotify() as sp:
+        report = await liked_vs_played(sp, plays, max(1, min_plays))
+    rows = max(1, min(limit, 500))
+    return {
+        "liked_songs": report.liked,
+        "log": {"plays": report.log_plays, "first": report.log_first, "last": report.log_last},
+        "top_lists": [
+            {"time_range": r, "reaches_back": RANGE_SPANS[r], "tracks_read": n}
+            for r, n in report.top_lists
+        ],
+        "min_plays": report.min_plays,
+        "top_head": TOP_HEAD,
+        "wording": report.not_heard_wording,
+        "played_not_liked_count": len(report.played_not_liked),
+        "played_not_liked": [
+            {
+                "id": row.track_id,
+                "name": row.name,
+                "artists": row.artists,
+                "log_plays": row.plays,
+                "top_ranks": {r: rank for r, rank in row.top_ranks},
+            }
+            for row in report.played_not_liked[:rows]
+        ],
+        "liked_not_heard_count": len(report.liked_not_heard),
+        # What `history likes --playlist` would write: the oldest likes, capped.
+        "playlist_limit": PLAYLIST_LIMIT,
+        "playlist_would_include": report.playlist_size(),
+        "liked_not_heard": [
+            {"id": t.track_id, "name": t.name, "artists": t.artists, "album": t.album}
+            for t in report.liked_not_heard[:rows]
+        ],
     }

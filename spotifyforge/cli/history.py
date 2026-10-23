@@ -172,3 +172,132 @@ def history_show(
         artists_table.add_row(str(count), escape(artist))
     console.print(artists_table)
     console.print(f"[dim]{history_path()}[/dim]")
+
+
+def _ranks(top_ranks: tuple[tuple[str, int], ...]) -> str:
+    short = {"short_term": "4w", "medium_term": "6m", "long_term": "1y"}
+    return " · ".join(f"{short[r]} #{rank}" for r, rank in top_ranks) or "—"
+
+
+@history_app.command("likes")
+def history_likes(
+    min_plays: int = typer.Option(
+        3, "--min-plays", min=1, help="Plays in the log that make a song a candidate to like."
+    ),
+    show: int = typer.Option(20, "--show", "-n", min=0, help="Rows to print from each list."),
+    playlist: bool = typer.Option(
+        False,
+        "--playlist",
+        help="Also write the liked-but-not-heard list to a new private playlist.",
+    ),
+    limit: int = typer.Option(
+        100,
+        "--limit",
+        min=1,
+        help="Most songs --playlist writes, oldest likes first.",
+    ),
+) -> None:
+    """Songs you play but have not liked, and liked songs you no longer hear.
+
+    Compares your liked songs with the local log and Spotify's three top
+    lists (about 4 weeks, 6 months and a year), read to their full depth.
+    "Not heard lately" means in none of those: it is not proof a song was
+    never played. Changes nothing unless you pass [bold]--playlist[/bold],
+    which creates one new private playlist of the first [bold]--limit[/bold]
+    songs, oldest likes first. Dates are in this machine's time zone.
+    """
+    from spotifyforge.core.clock import utc_now
+    from spotifyforge.core.history import load_plays
+    from spotifyforge.core.liked_played import (
+        RANGE_SPANS,
+        TOP_HEAD,
+        liked_vs_played,
+        playlist_name,
+        write_playlist,
+    )
+
+    plays = load_plays()
+    report = _run_spotify(
+        "Reading your liked songs and top lists...",
+        "Failed to compare liked and played",
+        lambda sp: liked_vs_played(sp, plays, min_plays),
+    )
+
+    if report.log_since and report.log_until:
+        log = f"[bold]{report.log_plays}[/bold] plays, {report.log_since} to {report.log_until}"
+    else:
+        log = "[yellow]empty[/yellow] (run [bold]history sync[/bold] on a timer)"
+    tops = " · ".join(f"{n:,} ({RANGE_SPANS[r]})" for r, n in report.top_lists)
+    console.print(
+        Panel(
+            f"Liked songs:        [bold]{report.liked:,}[/bold]\n"
+            f"Log:                {log}\n"
+            f"Top lists read:     {tops}\n"
+            f"Played, not liked:  [bold]{len(report.played_not_liked)}[/bold] "
+            f"({report.min_plays}+ plays in the log, or a top {TOP_HEAD} rank)\n"
+            f"Liked, not heard:   [bold]{len(report.liked_not_heard):,}[/bold] "
+            f"({report.not_heard_wording})",
+            title="Liked vs played",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+
+    # Titles and artist names are other people's text: escaped throughout.
+    if report.played_not_liked and show:
+        table = Table(box=box.SIMPLE, header_style="bold cyan", title="Played, not liked")
+        table.add_column("Plays", justify="right")
+        table.add_column("Top rank")
+        table.add_column("Track", max_width=45)
+        table.add_column("Artist", style="green", max_width=30)
+        for row in report.played_not_liked[:show]:
+            table.add_row(
+                str(row.plays), _ranks(row.top_ranks), escape(row.name), escape(row.artists)
+            )
+        console.print(table)
+
+    if report.liked_not_heard and show:
+        table = Table(
+            box=box.SIMPLE,
+            header_style="bold cyan",
+            title=f"Liked, {report.not_heard_wording} (liked longest ago first)",
+        )
+        table.add_column("Track", max_width=45)
+        table.add_column("Artist", style="green", max_width=30)
+        table.add_column("Album", style="dim", max_width=30)
+        for item in report.liked_not_heard[:show]:
+            table.add_row(escape(item.name), escape(item.artists), escape(item.album))
+        console.print(table)
+        if len(report.liked_not_heard) > show:
+            console.print(f"[dim]…and {len(report.liked_not_heard) - show:,} more.[/dim]")
+
+    if not playlist:
+        return
+    if not report.liked_not_heard:
+        console.print(
+            "[yellow]Every liked song is in a top list or the log; no playlist made.[/yellow]"
+        )
+        return
+    today = utc_now().astimezone().date()  # the same clock as the dates above
+    size = report.playlist_size(limit)
+    created = _run_spotify(
+        f"Creating '{playlist_name(today)}'...",
+        "Failed to create the playlist",
+        lambda sp: write_playlist(sp, report, today, limit),
+    )
+    capped = (
+        f"[dim]The oldest {size:,} of {len(report.liked_not_heard):,} likes; "
+        "raise --limit for more.[/dim]\n"
+        if size < len(report.liked_not_heard)
+        else ""
+    )
+    console.print(
+        Panel(
+            f"[green]Created[/green] [bold]{escape(created.name)}[/bold] (private) with "
+            f"{size:,} song(s).\n{capped}"
+            f"https://open.spotify.com/playlist/{created.spotify_id}",
+            title="Playlist",
+            border_style="green",
+            expand=False,
+        )
+    )

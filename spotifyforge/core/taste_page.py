@@ -1,4 +1,5 @@
-"""The library as one page: genres against decades, then artists and albums.
+"""The library as one page: genres against decades and against the year
+they were liked, then artists and albums.
 
 ``export page`` writes a single HTML file that needs nothing else: no
 stylesheet, script, font or image is fetched, so it can be opened from
@@ -9,7 +10,8 @@ here rather than screenshotting a stats site.
 
 It is a summary by design. There is no track list and no play history
 in the file, only counts: how many songs sit on each genre in each
-decade, and which artists and albums they pile up on.
+decade, how many were liked in each year, and which artists and albums
+they pile up on.
 
 Every string that reaches the page came from Spotify or MusicBrainz,
 which is to say from strangers, and is escaped on the way in.
@@ -37,6 +39,22 @@ REPOSITORY_URL = "https://github.com/gr8monk3ys/spotify"
 # fills with singles that happen to share an album id.
 _MIN_ALBUM_SONGS = 3
 
+# A day on which at least this many songs, and this share of the library,
+# were liked is an import, not a day of listening. Measured on this library
+# on 2026-10-22: 1,588 of 3,041 liked songs carry 14 August 2026, and the
+# busiest ordinary day holds 66. Their liked date says when they were moved
+# in, not when they were first liked, so the liked-year table leaves them out.
+_BULK_DAY_SONGS = 100
+_BULK_DAY_SHARE = 0.05
+
+# A liked-year column needs this many songs; a sparser year joins the next
+# one. A share of a column (which is how a genre's year is chosen) means
+# little over a handful of songs, and the library has near-empty years.
+_MIN_YEAR_SONGS = 50
+
+# How many of its busiest genres each liked-year column puts in the table.
+_GENRES_PER_YEAR = 2
+
 
 @dataclass(frozen=True)
 class GenreLine:
@@ -48,6 +66,26 @@ class GenreLine:
     @property
     def peak_count(self) -> int:
         return self.by_decade[self.peak]
+
+
+@dataclass(frozen=True)
+class YearSpan:
+    """One liked-year column: a single year, or a run of sparse years."""
+
+    first: int
+    last: int
+
+
+@dataclass(frozen=True)
+class LikedLine:
+    name: str
+    total: int
+    by_year: tuple[int, ...]
+    # Index into the page's liked years: the column this genre is the
+    # largest share of, not the one with most songs. The library liked
+    # far more in some years than others, and raw counts would mark the
+    # busiest year on almost every row.
+    peak: int
 
 
 @dataclass(frozen=True)
@@ -82,6 +120,12 @@ class PageData:
     lines: tuple[GenreLine, ...]
     top_artists: tuple[ArtistRow, ...]
     top_albums: tuple[AlbumRow, ...]
+    # The same genres against the year each song was liked.
+    liked_years: tuple[YearSpan, ...] = ()
+    all_by_liked: tuple[int, ...] = ()
+    liked_lines: tuple[LikedLine, ...] = ()
+    bulk_days: tuple[tuple[date, int], ...] = ()  # (day, songs liked that day), left out
+    unliked: int = 0  # songs with no liked date at all
 
 
 def _decade(year: int | None) -> int | None:
@@ -158,6 +202,8 @@ def build_page_data(
     ]
     albums.sort(key=lambda row: (-row.liked, row.title.casefold()))
 
+    spans, all_by_liked, liked_lines, bulk_days = _by_year_liked(tracks)
+
     return PageData(
         owner=owner,
         compiled=compiled,
@@ -171,7 +217,79 @@ def build_page_data(
         lines=tuple(lines),
         top_artists=tuple(artists[:artist_count]),
         top_albums=tuple(albums[:album_count]),
+        liked_years=spans,
+        all_by_liked=all_by_liked,
+        liked_lines=liked_lines,
+        bulk_days=bulk_days,
+        unliked=sum(1 for t in tracks if t.added_at is None),
     )
+
+
+def _year_spans(counts: Counter[int]) -> tuple[YearSpan, ...]:
+    """Contiguous columns from the first year to the last, each holding at
+    least ``_MIN_YEAR_SONGS`` songs: a sparse year joins the years after it,
+    and a sparse tail joins the column before it."""
+    if not counts:
+        return ()
+    spans: list[YearSpan] = []
+    start, held = min(counts), 0
+    for year in range(min(counts), max(counts) + 1):
+        held += counts[year]
+        if held >= _MIN_YEAR_SONGS:
+            spans.append(YearSpan(start, year))
+            start, held = year + 1, 0
+    if start <= max(counts):
+        if spans:
+            spans[-1] = YearSpan(spans[-1].first, max(counts))
+        else:
+            spans.append(YearSpan(start, max(counts)))
+    return tuple(spans)
+
+
+def _by_year_liked(
+    tracks: Sequence[CurationTrack],
+) -> tuple[
+    tuple[YearSpan, ...], tuple[int, ...], tuple[LikedLine, ...], tuple[tuple[date, int], ...]
+]:
+    """Genres against the year their songs were liked, imports set aside.
+
+    The rows are not the decade table's. Each liked-year column puts
+    forward its own busiest genres, and the rows are ordered by the
+    column each genre is the largest share of, so reading down the table
+    is reading forward in time: what the library took up, and when.
+    """
+    days = Counter(t.added_at.date() for t in tracks if t.added_at is not None)
+    floor = max(_BULK_DAY_SONGS, _BULK_DAY_SHARE * len(tracks))
+    bulk = {day: count for day, count in days.items() if count >= floor}
+    liked = [
+        (t.added_at.year, t.genres)
+        for t in tracks
+        if t.added_at is not None and t.added_at.date() not in bulk
+    ]
+
+    spans = _year_spans(Counter(year for year, _ in liked))
+    column = {
+        year: index for index, span in enumerate(spans) for year in range(span.first, span.last + 1)
+    }
+    everything = [0] * len(spans)
+    by_genre: dict[str, list[int]] = defaultdict(lambda: [0] * len(spans))
+    for year, genres in liked:
+        everything[column[year]] += 1
+        for genre in genres:
+            by_genre[genre][column[year]] += 1
+
+    picked: dict[str, None] = {}
+    for index in range(len(spans)):
+        busiest = sorted(by_genre, key=lambda name: (-by_genre[name][index], name))
+        picked.update(dict.fromkeys(n for n in busiest[:_GENRES_PER_YEAR] if by_genre[n][index]))
+
+    lines = []
+    for name in picked:
+        counts = tuple(by_genre[name])
+        shares = [count / everything[i] for i, count in enumerate(counts)]
+        lines.append(LikedLine(name, sum(counts), counts, shares.index(max(shares))))
+    lines.sort(key=lambda line: (line.peak, -line.total, line.name))
+    return spans, tuple(everything), tuple(lines), tuple(sorted(bulk.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +362,44 @@ def _genre_table(data: PageData) -> str:
         f"<tbody>{rows}</tbody>"
         f'<tfoot><tr><th scope="row">Every song, any genre</th>{foot}'
         f'<td class="total">{_n(data.songs)}</td></tr></tfoot>'
+        "</table>"
+    )
+
+
+def _span_text(span: YearSpan) -> str:
+    return str(span.first) if span.first == span.last else f"{span.first}–{span.last % 100:02d}"
+
+
+def _year_label(span: YearSpan) -> str:
+    """ "2018" or "2023–26" in full; "’18", or "’23" over "–26", on narrow screens.
+
+    A run of years is stacked on phones because its column is the widest
+    head in a table that has to fit 390px.
+    """
+    short = f"’{span.first % 100:02d}" + (
+        "" if span.first == span.last else f"<br>–{span.last % 100:02d}"
+    )
+    return (
+        f'<span class="full">{_span_text(span)}</span>'
+        f'<span class="short" aria-hidden="true">{short}</span>'
+    )
+
+
+def _liked_table(data: PageData) -> str:
+    head = "".join(f'<th scope="col">{_year_label(s)}</th>' for s in data.liked_years)
+    rows = "".join(
+        f'<tr><th scope="row">{escape(line.name)}</th>'
+        + "".join(_cell(count, peak=index == line.peak) for index, count in enumerate(line.by_year))
+        + f'<td class="total">{_n(line.total)}</td></tr>'
+        for line in data.liked_lines
+    )
+    foot = "".join(_cell(count) for count in data.all_by_liked)
+    return (
+        '<table class="liked">'
+        f'<thead><tr><th scope="col">Genre</th>{head}<th scope="col">Songs</th></tr></thead>'
+        f"<tbody>{rows}</tbody>"
+        f'<tfoot><tr><th scope="row">Every song, any genre</th>{foot}'
+        f'<td class="total">{_n(sum(data.all_by_liked))}</td></tr></tfoot>'
         "</table>"
     )
 
@@ -384,7 +540,8 @@ footer p{margin:0;max-width:36rem;color:var(--muted);font-size:.9375rem}
 footer{grid-template-columns:1fr}
 th,td{padding:.6rem .2rem}td{font-size:.6875rem}thead th,tfoot th{font-size:.6875rem;letter-spacing:.02em}
 .full{display:none}.short{display:inline}th:first-child{min-width:5rem;font-size:.8125rem;line-height:1.35}
-td.text,th.text{display:none}.sub{display:block}}
+td.text,th.text{display:none}.sub{display:block}
+.liked :is(td,th+th){padding-left:.1rem;padding-right:.1rem}.liked td.total{padding-right:0}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 @media print{:root{--paper:#fff;--tinted:#fff;--ink:#000;--muted:#444;--hairline:#bbb;--pen:#000}
 .grid{overflow:visible}section{break-inside:avoid}}
@@ -401,6 +558,50 @@ def _headline(data: PageData) -> str:
     if not detours:
         return f"Mostly the {busiest}s."
     return f"Mostly the {busiest}s, with a detour through the {detours[0]}s."
+
+
+def _liked_headline(data: PageData) -> str:
+    """The first and last genres down the year-liked table, by the year each took hold."""
+    if not data.liked_lines:
+        return "No liked dates to go by yet."
+    first, last = data.liked_lines[0], data.liked_lines[-1]
+    if first.peak == last.peak:
+        return f"Mostly {escape(first.name)}."
+    return (
+        f"From {escape(first.name)} in {_span_text(data.liked_years[first.peak])} "
+        f"to {escape(last.name)} in {_span_text(data.liked_years[last.peak])}."
+    )
+
+
+def _day(day: date) -> str:
+    return f"{day.day} {day:%B %Y}"
+
+
+def _bulk_note(data: PageData) -> str:
+    """Why songs liked on an import day are missing from the year-liked table."""
+    if not data.bulk_days:
+        return ""
+    songs = sum(count for _, count in data.bulk_days)
+    if len(data.bulk_days) == 1:
+        when = f"one liked date, {_day(data.bulk_days[0][0])}"
+    else:
+        when = "the liked dates " + ", ".join(_day(day) for day, _ in data.bulk_days)
+    return (
+        f"‡ {_n(songs)} songs share {when}: they arrived in one import, so the date "
+        "says when they were moved in, not when I came to like them. They are left "
+        "out of this table and counted everywhere else."
+    )
+
+
+def _bulk_lead(data: PageData) -> str:
+    if not data.bulk_days:
+        return ""
+    songs = _n(sum(count for _, count in data.bulk_days))
+    if len(data.bulk_days) == 1:
+        return f" It leaves out the {songs} songs that arrived in one import on {_day(data.bulk_days[0][0])} ‡."
+    return (
+        f" It leaves out the {songs} songs that arrived in imports on {len(data.bulk_days)} days ‡."
+    )
 
 
 def _split_title(owner: str) -> str:
@@ -440,7 +641,20 @@ def render_page(data: PageData) -> str:
             "classified their main artist. They are in every total and in no genre’s row."
         ),
         'A figure marked <span class="peak-key">like this</span> is that genre’s busiest decade.',
+        "In the year-liked table each year puts forward its two busiest genres, and a "
+        "marked figure is the year that genre made up the largest share of what I liked. "
+        "Some years I liked far more than others, so the year with the most songs would "
+        "mark the same busy year on almost every row.",
+        "A song liked again in another version (a remaster, a deluxe edition) counts from "
+        "the first time it was liked.",
     ]
+    if any(span.first != span.last for span in data.liked_years):
+        notes.append(
+            f"A year with fewer than {_MIN_YEAR_SONGS} liked songs shares a column with "
+            "the years after it, so a column can span several years."
+        )
+    if data.bulk_days:
+        notes.append(_bulk_note(data))
     if data.undated:
         notes.append(
             "1 song carries no release date and sits in no decade."
@@ -456,7 +670,7 @@ def render_page(data: PageData) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>{owner}’s library, by genre and decade</title>
-<style>{_font_faces()}{_CSS}{_column_guides(len(data.decades))}</style>
+<style>{_font_faces()}{_CSS}{_column_guides(max(len(data.decades), len(data.liked_years)))}</style>
 </head>
 <body>
 <main>
@@ -474,20 +688,26 @@ def render_page(data: PageData) -> str:
 <p class="lead">The {len(data.lines)} genres with the most songs, by the decade those songs came out.</p>
 <div class="grid" role="region" aria-labelledby="t1" tabindex="0">{_genre_table(data)}</div>
 </section>
+<section aria-labelledby="t4">
+<p class="label"><span>02</span><span>Genres by year liked</span></p>
+<h2 id="t4">{_liked_headline(data)}</h2>
+<p class="lead">The same library against the year I liked each song, not the year it came out. Each year’s two busiest genres have a row, in the order they took hold.{_bulk_lead(data)}</p>
+<div class="grid" role="region" aria-labelledby="t4" tabindex="0">{_liked_table(data)}</div>
+</section>
 <section aria-labelledby="t2">
-<p class="label"><span>02</span><span>Artists</span></p>
+<p class="label"><span>03</span><span>Artists</span></p>
 <h2 id="t2">The ones I keep coming back to.</h2>
 <p class="lead">By songs liked, with the years those songs span.</p>
 <div class="grid" role="region" aria-labelledby="t2" tabindex="0">{_artist_table(data)}</div>
 </section>
 <section aria-labelledby="t3">
-<p class="label"><span>03</span><span>Albums</span></p>
+<p class="label"><span>04</span><span>Albums</span></p>
 <h2 id="t3">Albums I liked most of.</h2>
 <p class="lead">Songs liked, against how many songs the album has.</p>
 <div class="grid" role="region" aria-labelledby="t3" tabindex="0">{_album_table(data)}</div>
 </section>
 <section class="notes" aria-labelledby="notes">
-<p class="label"><span>04</span><span>Method</span></p>
+<p class="label"><span>05</span><span>Method</span></p>
 <h2 id="notes">How this was counted.</h2>
 <ol>{notes_html}</ol>
 </section>

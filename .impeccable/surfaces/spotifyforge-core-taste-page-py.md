@@ -11,7 +11,7 @@ Scope: one generated, self-contained HTML file. Visitor mode: Read.
 
 Audience and job: someone arriving from Lorenzo's GitHub or CV with a minute or two, deciding whether the project is real and its author careful. They read; they are asked for nothing.
 
-Content: summary only. Genre-by-decade grid, most-liked artists, most-liked albums, and notes on how the counting works. No track list, no play history. The file is local; publishing is undecided.
+Content: summary only. Genre-by-decade grid, genre-by-year-liked grid (added 2026-10-22: the same cells against when songs were liked, rows in the order genres took hold), most-liked artists, most-liked albums, and notes on how the counting works. No track list, no play history. The file is local; publishing is undecided.
 
 Memorable moment: seeing, in one grid, that psychedelic rock lives in the 1960s for this listener and hip hop in the 2010s.
 

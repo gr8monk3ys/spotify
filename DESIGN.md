@@ -46,13 +46,29 @@ The three faces are embedded as data URIs (latin subsets, in
 - **The grid.** Genres down, decades across, counts in mono. A genre's busiest
   decade is set in forest ink with a 2px underline; an empty cell is a muted
   dash. Pointing at a cell tints its row and its column.
-- **Phone layout.** The decade heads shorten to `60s`, and the tables fit a
+- **The second grid.** The same cells against the year each song was liked
+  instead of released. Its marked figure is the year a genre was the largest
+  share of what was liked, and its rows run in that order, so the marks fall
+  as a diagonal. A run of sparse years shares one column (`2023–26`).
+- **Phone layout.** The decade heads shorten to `60s` and the year heads to
+  `’18` (a run of years stacks, `’23` over `–26`), and the tables fit a
   390px screen without sideways scrolling. In the artist and album tables the
   second column folds under the name.
 - **Print.** Black on white, hairlines kept.
+
+## The Wrapped page
+
+`export wrapped` (`spotifyforge/core/wrapped.py`) is a second page on the same
+system. It imports the taste page's stylesheet, fonts and table helpers rather
+than restating them, and adds only a two-column split for the "where" section.
+Its own grid is hours down and weekdays across; the busiest cell (every one, on a
+tie) is set in forest ink, and the weekday heads shorten to `Mo` on phones. The
+coverage of the log is a wall label in the masthead, under the thesis.
 
 ## Departure from the site
 
 The site's wall label never goes below 0.72rem. On phones this page sets the
 table's column heads at 0.6875rem (11px) with tighter tracking so nine numeric
-columns fit. That is the only size outside the site's ramp.
+columns fit. That is the only size outside the site's ramp. The year-liked
+grid has ten numeric columns, one more than the decade grid, and on phones
+its cells take 0.1rem of side padding instead of 0.2rem to fit.

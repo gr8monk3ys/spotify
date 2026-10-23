@@ -15,6 +15,17 @@
 * **history:** `history playlists` and the `playlist_usage_report` MCP tool show
   which owned playlists are actually played
 * **export:** `export page` writes the library as one self-contained HTML page
+* **history:** `history likes` and the `liked_vs_played_report` MCP tool list songs
+  played but not liked, and liked songs in no top list and not in the log;
+  `--playlist` writes the oldest `--limit` (default 100) of the second list to a new
+  private playlist, and dates are shown on the local clock, as on the Wrapped page
+* **export:** `export wrapped` writes your own Wrapped from the listening log as one
+  self-contained local HTML page; `history sync` now records possible gaps beside the log
+* **export:** the page adds genres against the year each song was liked, with
+  bulk-import days set aside
+* **library:** `library records` and the `records_vs_streams` MCP tool join the
+  Discogs collection and wantlist to liked songs and plays: wanted and already
+  loved, owned but not streamed, loved but on neither shelf
 * **curate:** `curate features` estimates tempo from Deezer previews for tracks no
   database has a BPM for (optional `tempo` extra); `--retry-misses` re-asks Deezer
   about misses its quota errors left in the cache

@@ -205,3 +205,110 @@ def library_soundtracks(
             expand=False,
         )
     )
+
+
+@library_app.command("records")
+def library_records(
+    file: Path | None = typer.Option(
+        None, "--file", help="The discogs.json to read (default: MUSIC_DIR/discogs.json)."
+    ),
+    top: int = typer.Option(15, "--top", min=1, max=200, help="Rows shown per list."),
+) -> None:
+    """Records against streams: the Discogs shelves beside the liked library.
+
+    Reads [bold]discogs.json[/bold] and joins the collection and the
+    wantlist to your liked songs and the listening log by artist and
+    album title, editions collapsed. Lists what you want and already
+    love, what you own and never liked a song from, and the albums you
+    love that are on neither shelf. Read-only: nothing is written to
+    Spotify or Discogs.
+    """
+    from spotifyforge.core.curation import CurationEngine, dedupe_versions
+    from spotifyforge.core.history import load_plays
+    from spotifyforge.core.library import LibraryFileError
+    from spotifyforge.core.records import join_records, read_discogs_shelves
+
+    source = file or settings.music_dir / "discogs.json"
+    try:
+        records = read_discogs_shelves(source)
+    except LibraryFileError as exc:
+        err_console.print(Panel(str(exc), title="No Discogs export", border_style="red"))
+        raise typer.Exit(code=2) from exc
+
+    async def _liked(sp):
+        return dedupe_versions(await CurationEngine(sp).fetch_liked())
+
+    tracks = _run_spotify("Reading liked songs...", "Failed to read liked songs", _liked)
+    report = join_records(records, tracks, load_plays())
+
+    # Artist names and titles come from Discogs and Spotify: escaped, never interpreted.
+    def _record(m) -> str:
+        label = escape(f"{m.record.artist} — {m.record.title}")
+        return f"{label} [dim]×{m.record.copies}[/dim]" if m.record.copies > 1 else label
+
+    wanted = report.wanted_and_loved
+    table = Table(
+        title=f"Wanted and already loved ({len(wanted)})", box=box.SIMPLE, title_justify="left"
+    )
+    table.add_column("Record")
+    table.add_column("Liked", justify="right")
+    table.add_column("Plays", justify="right")
+    for m in wanted[:top]:
+        table.add_row(_record(m), str(m.liked), str(m.plays))
+    console.print(table)
+
+    owned = report.owned_not_streamed
+    table = Table(
+        title=f"Owned but not streamed ({len(owned)})", box=box.SIMPLE, title_justify="left"
+    )
+    table.add_column("Record")
+    table.add_column("Artist's liked songs", justify="right")
+    for m in owned[:top]:
+        table.add_row(_record(m), str(m.artist_liked))
+    console.print(table)
+
+    loved = report.loved_unshelved
+    table = Table(
+        title=f"Loved but on neither shelf ({len(loved)})", box=box.SIMPLE, title_justify="left"
+    )
+    table.add_column("Album")
+    table.add_column("Liked", justify="right")
+    table.add_column("Plays", justify="right")
+    for a in loved[:top]:
+        table.add_row(escape(f"{a.artist} — {a.title}"), str(a.liked), str(a.plays))
+    console.print(table)
+
+    unmatched = report.unmatched
+    table = Table(
+        title=f"Matched nothing on Spotify ({len(unmatched)})",
+        caption="Many liked songs by the artist: likelier a missed title than an unplayed record.",
+        box=box.SIMPLE,
+        title_justify="left",
+    )
+    table.add_column("Record")
+    table.add_column("Shelf")
+    table.add_column("Artist's liked songs", justify="right")
+    table.add_column("Their most liked albums")
+    for m in unmatched[:top]:
+        table.add_row(
+            _record(m),
+            m.record.shelf,
+            str(m.artist_liked),
+            escape(", ".join(m.artist_albums)) or "[dim]—[/dim]",
+        )
+    console.print(table)
+
+    def _rate(shelf) -> str:
+        hit = sum(1 for m in shelf if m.matched)
+        return f"{hit} of {len(shelf)}"
+
+    plays = (
+        f"{report.plays} logged play(s) since {report.plays_since[:10]}"
+        if report.plays_since
+        else "no logged plays"
+    )
+    console.print(
+        f"{report.discogs_rows} Discogs row(s), {len(tracks)} liked song(s), {plays}. "
+        f"Matched on Spotify: collection {_rate(report.collection)}, "
+        f"wantlist {_rate(report.wantlist)}."
+    )

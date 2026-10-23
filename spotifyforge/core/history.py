@@ -12,8 +12,8 @@ never a corrupt one, and a re-run picks up where the last line stops.
 Fifty plays is roughly two and a half hours of music, so the poll
 should run about hourly. A run that finds all fifty plays are new
 cannot tell whether a fifty-first was missed, and says so
-(:attr:`SyncResult.possible_gap`) rather than letting the history
-quietly claim to be complete.
+(:attr:`SyncResult.possible_gap`, and a line in the gaps file beside the
+log) rather than letting the history quietly claim to be complete.
 """
 
 from __future__ import annotations
@@ -77,6 +77,34 @@ def history_path() -> Path:
     return sidecar_path("listening_history.jsonl")
 
 
+@dataclass(frozen=True)
+class Gap:
+    """A stretch the log may be missing plays from: after one play, before another."""
+
+    after: str  # ISO 8601, UTC: the last play the log had
+    before: str  # the oldest play of the window that was entirely new
+
+
+def gaps_path(history: Path | None = None) -> Path:
+    """The possible gaps sit beside the history, so a test's log keeps its own."""
+    target = history or history_path()
+    return target.with_name(f"{target.stem}.gaps.jsonl")
+
+
+def load_gaps(history: Path | None = None) -> list[Gap]:
+    """Every possible gap a sync has recorded, oldest first."""
+    target = gaps_path(history)
+    if not target.exists():
+        return []
+    gaps = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        try:
+            gaps.append(Gap(**json.loads(line)))
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Skipping an unreadable line in %s", target)
+    return gaps
+
+
 def _play_from_item(item: Any) -> Play | None:
     track = item.track
     if track is None or track.id is None:
@@ -138,10 +166,15 @@ async def sync_history(spotify: Spotify, path: Path | None = None) -> SyncResult
                 handle.write(json.dumps(asdict(play), ensure_ascii=False) + "\n")
 
     possible_gap = latest is not None and len(window) >= WINDOW and len(fresh) == len(window)
-    if possible_gap:
+    if possible_gap and latest is not None:
         logger.warning(
             "All %d plays in Spotify's window were new; older plays may have been missed", WINDOW
         )
+        # Kept on disk, not only logged, so a page drawn from the history
+        # can say where it may be thin.
+        gap = Gap(after=latest.isoformat(), before=fresh[0].played_at)
+        with gaps_path(target).open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(asdict(gap)) + "\n")
     return SyncResult(
         added=len(fresh), total=len(known) + len(fresh), possible_gap=possible_gap, path=target
     )

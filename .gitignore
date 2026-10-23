@@ -21,4 +21,6 @@ venv/
 .impeccable/mocks/
 .impeccable/review/
 taste.html
+# export wrapped's default: unlike the taste page it holds play history.
+wrapped.html
 .impeccable/questions/
