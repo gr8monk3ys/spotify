@@ -80,6 +80,7 @@ spotifyforge export page --out taste.html           # One self-contained HTML pa
 spotifyforge export wrapped --out wrapped.html      # Your own Wrapped from the log (local only)
 spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
 spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
+spotifyforge library records                        # Discogs shelves vs liked songs and plays (read-only)
 spotifyforge library soundtracks                    # Dry run: soundtracks of films rated 4.5+ on Letterboxd
 spotifyforge library soundtracks --apply            # Write them to one private playlist
 ```
@@ -111,7 +112,9 @@ a 51st was missed, and records the possible gap in
 ## The page
 
 `export page` writes your library as a single HTML file: a table of your
-busiest genres against the decades the songs came out, then the artists and
+busiest genres against the decades the songs came out, a second table of
+genres against the year you liked each song (with songs that arrived in one
+bulk import set aside, since their date is the import's), then the artists and
 albums you have liked most of, and a note on how it was counted. It is a
 summary, with no track list and no play history. The file fetches nothing when
 opened (its three fonts are embedded), so it works from disk, by email or on
@@ -136,6 +139,7 @@ cannot, because it depends on how this package reads your library:
 |---|---|
 | `liked_genres` | Genres across your liked songs, with counts |
 | `search_liked` | Liked songs by genre, artist, title or year, with BPM and key where known |
+| `records_vs_streams` | The Discogs collection and wantlist against liked songs and plays |
 | `create_playlist` | Create a private playlist from chosen tracks, sequenced by key and tempo |
 | `list_playlists`, `get_playlist` | Read your playlists |
 | `deduplicate_playlist` | Remove repeated tracks from one of your own playlists |

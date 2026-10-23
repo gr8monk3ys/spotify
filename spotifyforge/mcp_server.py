@@ -282,6 +282,33 @@ async def search_liked(
     }
 
 
+@server.tool(annotations=_READ_ONLY)
+async def records_vs_streams(top: int = 20, refresh: bool = False) -> dict[str, Any]:
+    """The user's Discogs shelves joined to their liked songs and play log.
+
+    Reads discogs.json from the music directory (written by `discogs
+    export`); nothing is written to Discogs or Spotify. wanted_and_loved is
+    the wantlist ranked by liked songs, then plays: what to buy first.
+    owned_not_streamed is the collection with no liked song or play. loved_unshelved
+    is liked albums (3+ liked songs) on neither shelf: wantlist candidates
+    to suggest, never to add. Matching is by artist and title with editions
+    collapsed, so check unmatched_examples before calling a record unplayed:
+    one whose artist has many artist_liked_songs is more likely a title the
+    join missed. Lists are cut to `top`; the *_count fields are the totals.
+    """
+    from spotifyforge.config import settings
+    from spotifyforge.core.library import LibraryFileError
+    from spotifyforge.core.records import join_records, read_discogs_shelves, report_dict
+
+    try:
+        records = read_discogs_shelves(settings.music_dir / "discogs.json")
+    except LibraryFileError as exc:
+        raise ToolError(str(exc)) from exc
+    async with _spotify() as sp:
+        tracks = await _liked(sp, refresh)
+    return report_dict(join_records(records, tracks, load_plays()), top=max(1, min(top, 200)))
+
+
 # ---------------------------------------------------------------------------
 # Playlists
 # ---------------------------------------------------------------------------

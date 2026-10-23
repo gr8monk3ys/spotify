@@ -21,6 +21,11 @@
   private playlist, and dates are shown on the local clock, as on the Wrapped page
 * **export:** `export wrapped` writes your own Wrapped from the listening log as one
   self-contained local HTML page; `history sync` now records possible gaps beside the log
+* **export:** the page adds genres against the year each song was liked, with
+  bulk-import days set aside
+* **library:** `library records` and the `records_vs_streams` MCP tool join the
+  Discogs collection and wantlist to liked songs and plays: wanted and already
+  loved, owned but not streamed, loved but on neither shelf
 
 ### Removed
 

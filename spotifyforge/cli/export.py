@@ -89,7 +89,8 @@ def export_page(
     """Write your library as one self-contained HTML page.
 
     A timetable of your genres against the decades the songs came out,
-    plus the artists and albums you have liked most of. It is a summary:
+    the same against the year you liked them, plus the artists and albums
+    you have liked most of. It is a summary:
     counts only, no track list and no play history. The file fetches
     nothing when opened, so it works from disk, by email, or on any
     host. This command only writes the file; it publishes nothing.
