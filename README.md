@@ -108,7 +108,9 @@ a 51st was missed.
 ## The page
 
 `export page` writes your library as a single HTML file: a table of your
-busiest genres against the decades the songs came out, then the artists and
+busiest genres against the decades the songs came out, a second table of
+genres against the year you liked each song (with songs that arrived in one
+bulk import set aside, since their date is the import's), then the artists and
 albums you have liked most of, and a note on how it was counted. It is a
 summary, with no track list and no play history. The file fetches nothing when
 opened (its three fonts are embedded), so it works from disk, by email or on

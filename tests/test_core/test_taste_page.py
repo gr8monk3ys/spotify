@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from dataclasses import replace
+from datetime import UTC, date, datetime
 
 from spotifyforge.core.curation import CurationTrack
 from spotifyforge.core.taste_page import build_page_data, render_page
@@ -165,3 +166,109 @@ def test_the_fonts_ship_inside_the_package():
         "ibm-plex-mono-500-latin.woff2",
     ):
         assert (fonts / name).read_bytes()[:4] == b"wOF2"
+
+
+# -- genres by year liked -------------------------------------------------
+
+
+def _liked(track_id: str, genre: str, year: int, day: int = 1) -> CurationTrack:
+    """A song liked on *day* January of *year*."""
+    return replace(
+        _track(track_id, artist=f"artist {track_id}", genres=(genre,), album=track_id),
+        added_at=datetime(year, 1, day, 12, tzinfo=UTC),
+    )
+
+
+def _liked_library() -> list[CurationTrack]:
+    """50 songs liked in 2016 and 50 in 2018 (columns need 50), a sparse 2019."""
+    songs = [_liked(f"a{i}", "indie" if i < 30 else "rock", 2016, 1 + i % 28) for i in range(50)]
+    songs += [_liked(f"b{i}", "rap" if i < 45 else "indie", 2018, 1 + i % 28) for i in range(50)]
+    songs += [_liked(f"c{i}", "jazz", 2019, 1 + i % 28) for i in range(10)]
+    return songs
+
+
+def test_songs_are_counted_by_the_year_they_were_liked():
+    data = build_page_data(_liked_library(), "Someone", DAY)
+
+    # 2017 has nothing and 2019 too little, so each joins a neighbour:
+    # 2017 the year after it, the 2019 tail the column before it.
+    assert [(s.first, s.last) for s in data.liked_years] == [(2016, 2016), (2017, 2019)]
+    assert data.all_by_liked == (50, 60)
+    by_name = {line.name: line for line in data.liked_lines}
+    assert by_name["indie"].by_year == (30, 5)
+    assert by_name["rap"].by_year == (0, 45)
+    assert by_name["indie"].total == 35
+
+
+def test_each_year_puts_forward_its_busiest_genres_in_the_order_they_took_hold():
+    data = build_page_data(_liked_library(), "Someone", DAY)
+
+    # Two per column: indie and rock from 2016, rap and jazz from 2017-19.
+    assert [line.name for line in data.liked_lines] == ["indie", "rock", "rap", "jazz"]
+    assert [line.peak for line in data.liked_lines] == [0, 0, 1, 1]
+
+
+def test_a_genres_year_is_its_largest_share_not_its_largest_count():
+    songs = [_liked(f"a{i}", "dub" if i < 30 else "pop", 2016, 1 + i % 28) for i in range(50)]
+    songs += [_liked(f"b{i}", "dub" if i < 40 else "pop", 2018, 1 + i % 28) for i in range(200)]
+
+    data = build_page_data(songs, "Someone", DAY)
+
+    dub = next(line for line in data.liked_lines if line.name == "dub")
+    # 40 songs in 2017-18 is more than 30 in 2016, but 30 of 50 is the larger share.
+    assert dub.by_year == (30, 40)
+    assert dub.peak == 0
+
+
+def test_a_bulk_import_day_is_left_out_of_the_liked_table_and_nowhere_else():
+    imported = [_liked(f"x{i}", "rock", 2026, 14) for i in range(150)]
+    tracks = _liked_library() + imported
+
+    data = build_page_data(tracks, "Someone", DAY)
+
+    assert data.bulk_days == ((date(2026, 1, 14), 150),)
+    assert sum(data.all_by_liked) == 110
+    assert data.liked_years[-1].last == 2019
+    assert data.songs == 260  # still counted in the decade table and the key
+    html = render_page(data)
+    assert "It leaves out the 150 songs that arrived in one import on 14 January 2026 ‡." in html
+    assert "‡ 150 songs share one liked date, 14 January 2026" in html
+
+
+def test_an_ordinary_busy_day_is_not_an_import():
+    # 100 songs in a day is the floor, whatever share of the library it is.
+    tracks = [_liked(f"d{i}", "rock", 2018, 3) for i in range(99)]
+
+    data = build_page_data(tracks, "Someone", DAY)
+
+    assert data.bulk_days == ()
+    assert data.all_by_liked == (99,)
+
+
+def test_the_liked_table_renders_with_its_headline_and_spans():
+    html = render_page(build_page_data(_liked_library(), "Someone", DAY))
+
+    assert "From indie in 2016 to jazz in 2017–19." in html
+    assert '<span class="full">2017–19</span>' in html
+    assert '<span class="short" aria-hidden="true">’17<br>–19</span>' in html
+    assert '<tr><th scope="row">indie</th><td class="peak">30</td><td>5</td>' in html
+
+
+def test_songs_without_a_liked_date_leave_the_liked_table_empty():
+    data = build_page_data(_library(), "Someone", DAY)
+
+    assert data.liked_years == ()
+    assert data.unliked == len(_library())
+    assert "No liked dates to go by yet." in render_page(data)
+
+
+def test_genres_in_the_liked_table_are_escaped():
+    hostile = '<img src=x onerror=alert(1)>"&'
+    tracks = [_liked(f"h{i}", hostile, 2016, 1 + i % 28) for i in range(60)]
+
+    html = render_page(build_page_data(tracks, "Someone", DAY))
+
+    assert "<img" not in html
+    assert f'<tr><th scope="row">{"&lt;img src=x onerror=alert(1)&gt;&quot;&amp;"}</th>' in html
+    # The headline names the genre too.
+    assert "Mostly &lt;img src=x onerror=alert(1)&gt;&quot;&amp;." in html

@@ -15,6 +15,8 @@
 * **history:** `history playlists` and the `playlist_usage_report` MCP tool show
   which owned playlists are actually played
 * **export:** `export page` writes the library as one self-contained HTML page
+* **export:** the page adds genres against the year each song was liked, with
+  bulk-import days set aside
 
 ### Removed
 

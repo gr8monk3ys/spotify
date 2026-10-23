@@ -42,6 +42,7 @@ from spotifyforge.core.playlist_manager import extract_isrc
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
+    from datetime import datetime
 
     from tekore import Spotify
 
@@ -106,6 +107,11 @@ class CurationTrack:
     album_id: str | None = None
     album_name: str = ""
     album_total_tracks: int | None = None
+    # When the song was liked: the saved-tracks ``added_at``, which the
+    # same payload carries. Only the taste page reads it. Songs moved into
+    # the library in bulk all share their import day, so this is when a
+    # song arrived, which is not always when it was first liked.
+    added_at: datetime | None = None
 
 
 @dataclass
@@ -306,13 +312,13 @@ def _ordered_unique(values: Iterable[str]) -> tuple[str, ...]:
 
 def _saved_page_to_tracks(paging: Any) -> list[CurationTrack]:
     return [
-        to_curation_track(item.track)
+        to_curation_track(item.track, added_at=getattr(item, "added_at", None))
         for item in paging.items or []
         if item.track is not None and item.track.id is not None
     ]
 
 
-def to_curation_track(track: Any) -> CurationTrack:
+def to_curation_track(track: Any, added_at: datetime | None = None) -> CurationTrack:
     album = track.album
     release_year: int | None = None
     if album is not None and album.release_date:
@@ -336,6 +342,7 @@ def to_curation_track(track: Any) -> CurationTrack:
         # model change into 1700 albums silently exported with a null
         # affinity — the very field consumers are told to rank by.
         album_total_tracks=getattr(album, "total_tracks", None),
+        added_at=added_at,
     )
 
 
@@ -388,15 +395,30 @@ def dedupe_versions(tracks: list[CurationTrack]) -> list[CurationTrack]:
     remaster, single edit — each with its own track ID. Spotify's own
     de-duplication cannot see these as duplicates, and a playlist that
     repeats a song does not flow.
+
+    The kept version takes the earliest liked date of any version, since
+    that is when the song was liked. On this library 311 songs liked in
+    2015 to 2022 were liked again in a 2026 import, and the version kept
+    for popularity was usually the newer one.
     """
     best: dict[tuple[str, str], int] = {}
+    first_liked: dict[tuple[str, str], datetime] = {}
     for index, track in enumerate(tracks):
         key = track_song_key(track)
         if key not in best or track.popularity > tracks[best[key]].popularity:
             best[key] = index
+        if track.added_at is not None and (
+            key not in first_liked or track.added_at < first_liked[key]
+        ):
+            first_liked[key] = track.added_at
     if len(best) < len(tracks):
         logger.info("Collapsed %d duplicate recordings", len(tracks) - len(best))
-    return [tracks[i] for i in sorted(best.values())]
+    kept = []
+    for index in sorted(best.values()):
+        track = tracks[index]
+        earliest = first_liked.get(track_song_key(track))
+        kept.append(track if earliest == track.added_at else replace(track, added_at=earliest))
+    return kept
 
 
 # ---------------------------------------------------------------------------
