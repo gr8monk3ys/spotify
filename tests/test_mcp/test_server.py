@@ -420,3 +420,49 @@ async def test_playlist_usage_report(logged_in):
     assert out["played"] == [{"id": "mine1", "name": "Late Set", "plays": 1}]
     assert out["unplayed"] == [{"id": "mine2", "name": "Never Opened"}]
     assert out["long_enough_to_judge"] is False
+
+
+async def test_liked_vs_played_report_is_read_only_and_worded_honestly(logged_in):
+    from datetime import UTC, datetime, timedelta
+
+    from spotifyforge.core.history import sync_history
+
+    fake = logged_in
+    _like(fake, "heard", artist="a1", genres=["jazz"], name="Heard")
+    _like(fake, "quiet", artist="a2", genres=["jazz"], name="Quiet")
+    fake.add_track("habit", name="Habit", artist_id="a3", artist_name="Gamma")
+    fake.top_tracks_by_range[("user1", "long_term")] = ["heard", "habit"]
+    now = datetime.now(UTC)
+    for hours in (3, 2, 1):
+        fake.play("user1", "habit", (now - timedelta(hours=hours)).isoformat())
+    client = fake.async_client("user1")
+    await sync_history(client)
+    await client.close()
+    before = len(fake.requests)
+
+    out = await _ok("liked_vs_played_report")
+
+    assert {method for method, _ in fake.requests[before:]} == {"GET"}
+    assert out["liked_songs"] == 2
+    assert out["log"]["plays"] == 3
+    assert [t["time_range"] for t in out["top_lists"]] == ["short_term", "medium_term", "long_term"]
+    assert out["played_not_liked"] == [
+        {
+            "id": "habit",
+            "name": "Habit",
+            "artists": "Gamma",
+            "log_plays": 3,
+            "top_ranks": {"long_term": 2},
+        }
+    ]
+    assert [t["id"] for t in out["liked_not_heard"]] == ["quiet"]
+    assert out["wording"].startswith("not in your top lists or your log since ")
+    assert out["playlist_limit"] == 100
+    assert out["playlist_would_include"] == 1
+
+
+async def test_liked_vs_played_report_is_annotated_read_only():
+    async with Client(server) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    assert tools["liked_vs_played_report"].annotations.read_only_hint is True

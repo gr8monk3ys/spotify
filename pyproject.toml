@@ -61,6 +61,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 # The page template is HTML and CSS held in Python strings; wrapping a CSS
 # declaration or a sentence of copy at 100 columns only makes it harder to read.
 "spotifyforge/core/taste_page.py" = ["E501"]
+"spotifyforge/core/wrapped.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

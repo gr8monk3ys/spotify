@@ -123,3 +123,57 @@ def export_page(
         )
     )
     console.print(f"[dim]{out.resolve()}[/dim]")
+
+
+@export_app.command("wrapped")
+def export_wrapped(
+    out: Path = typer.Option(Path("wrapped.html"), "--out", "-o", help="Where to write the page."),
+    year: int | None = typer.Option(
+        None, "--year", "-y", min=2000, help="Only plays in this calendar year."
+    ),
+    name: str | None = typer.Option(
+        None, "--name", help="Whose listening it is (default: your Spotify display name)."
+    ),
+) -> None:
+    """Write your own Wrapped from the local listening log, as one HTML page.
+
+    Top songs, artists and albums, the hours and weekdays you listen,
+    where plays start, and songs played hard then dropped, all counted
+    from the log [bold]history sync[/bold] keeps. The page says when the
+    log starts and flags any gap a sync recorded. It holds your play
+    history, so it is written to a local file only and published nowhere.
+    Spotify is asked only for your name and which playlists are yours.
+    """
+    from spotifyforge.core.clock import utc_now
+    from spotifyforge.core.history import load_gaps, load_plays
+    from spotifyforge.core.playlist_manager import PlaylistManager
+    from spotifyforge.core.wrapped import build_wrapped, render_wrapped
+
+    plays = load_plays()
+
+    async def _read(sp):
+        owned = {p["id"]: p["name"] for p in await PlaylistManager(sp).get_owned_playlists()}
+        me = await sp.current_user()
+        return owned, me.display_name or me.id
+
+    owned, display_name = _run_spotify(
+        "Reading your profile and playlists...", "Failed to read your playlists", _read
+    )
+    data = build_wrapped(
+        plays, name or display_name, utc_now().date(), owned, load_gaps(), year=year
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_wrapped(data), encoding="utf-8", newline="\n")
+
+    since = f"{data.first:%Y-%m-%d}" if data.first else "—"
+    console.print(
+        Panel(
+            f"[green]Wrote the page[/green] from {data.plays} play(s) logged since {since} "
+            f"({data.days} day(s), {len(data.gaps)} recorded gap(s)).\n"
+            "It holds your play history: nothing was published, keep the file local.",
+            title="Wrapped",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]{out.resolve()}[/dim]")

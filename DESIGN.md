@@ -56,6 +56,15 @@ The three faces are embedded as data URIs (latin subsets, in
   second column folds under the name.
 - **Print.** Black on white, hairlines kept.
 
+## The Wrapped page
+
+`export wrapped` (`spotifyforge/core/wrapped.py`) is a second page on the same
+system. It imports the taste page's stylesheet, fonts and table helpers rather
+than restating them, and adds only a two-column split for the "where" section.
+Its own grid is hours down and weekdays across; the busiest cell (every one, on a
+tie) is set in forest ink, and the weekday heads shorten to `Mo` on phones. The
+coverage of the log is a wall label in the masthead, under the thesis.
+
 ## Departure from the site
 
 The site's wall label never goes below 0.72rem. On phones this page sets the

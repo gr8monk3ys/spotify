@@ -637,6 +637,89 @@ class TestHistory:
         assert "Not logged in" in result.stderr
 
 
+class TestHistoryLikes:
+    @pytest.fixture()
+    def library(self, cli_env):
+        """One liked song played, one liked song unheard, one habit not liked."""
+        from datetime import UTC, datetime, timedelta
+
+        fake = cli_env
+        fake.add_track("heard", name="Heard Often", artist_id="a1")
+        fake.add_track(
+            "quiet", name="[red]Quiet[/red]", artist_id="a2", album_name="[bold]B[/bold]"
+        )
+        fake.add_track("habit", name="[link=https://evil.example]Habit[/link]", artist_id="a3")
+        _login(fake)
+        fake.save_track("user1", "heard")
+        fake.save_track("user1", "quiet")
+        now = datetime.now(UTC)
+        for minutes in (40, 30, 20):
+            fake.play("user1", "habit", (now - timedelta(minutes=minutes)).isoformat())
+        fake.play("user1", "heard", (now - timedelta(minutes=10)).isoformat())
+        runner.invoke(app, ["history", "sync"])
+        return fake
+
+    def test_reports_both_lists_with_coverage_and_writes_nothing(self, library):
+        fake = library
+        before = len(fake.requests)
+
+        result = runner.invoke(app, ["history", "likes"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "Played, not liked:  1" in result.output
+        assert "Liked, not heard:   1" in result.output
+        assert "not in your top lists or your log since" in result.output
+        assert "never" not in result.output.lower()
+        # Other people's text is printed, not interpreted.
+        assert "[link=https://evil.example]Habit[/link]" in result.output
+        assert "[red]Quiet[/red]" in result.output
+        assert {method for method, _ in fake.requests[before:]} == {"GET"}
+        assert fake.playlists == {}
+
+    def test_playlist_flag_writes_one_new_private_playlist(self, library):
+        fake = library
+
+        result = runner.invoke(app, ["history", "likes", "--playlist"])
+
+        assert result.exit_code == 0, result.stderr
+        ((pid, meta),) = fake.playlists.items()
+        assert meta["public"] is False
+        assert meta["name"].startswith("Liked, not heard lately (")
+        assert fake.playlist_tracks[pid] == ["quiet"]
+        assert "(private) with 1 song(s)" in result.output
+
+    def test_playlist_limit_keeps_the_oldest_likes(self, library):
+        fake = library
+        fake.add_track("quieter", name="Quieter", artist_id="a4")
+        # The fake lists saves newest first in the order they were made, so
+        # this one reads as liked before "quiet".
+        fake.save_track("user1", "quieter")
+
+        result = runner.invoke(app, ["history", "likes", "--playlist", "--limit", "1"])
+
+        assert result.exit_code == 0, result.stderr
+        ((pid, _),) = fake.playlists.items()
+        assert fake.playlist_tracks[pid] == ["quieter"]
+        assert "(private) with 1 song(s)" in result.output
+        assert "The oldest 1 of 2 likes" in result.output
+
+    def test_log_dates_are_on_the_local_clock(self, library):
+        from datetime import datetime
+
+        from spotifyforge.core.history import load_plays
+
+        plays = load_plays()
+        first, last = (
+            datetime.fromisoformat(p.played_at).astimezone().date().isoformat()
+            for p in (plays[0], plays[-1])
+        )
+
+        result = runner.invoke(app, ["history", "likes"])
+
+        assert result.exit_code == 0, result.stderr
+        assert f"4 plays, {first} to {last}" in result.output
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -1003,3 +1086,41 @@ class TestExportPage:
 
         assert result.exit_code == 0, result.stderr
         assert "Test User’s library" in out.read_text(encoding="utf-8")
+
+
+class TestExportWrapped:
+    def test_writes_the_log_as_a_local_page_reading_only(self, cli_env, tmp_path):
+        from datetime import UTC, datetime, timedelta
+
+        fake = cli_env
+        fake.add_track("t1", name="Night Drive", artist_name="Alpha")
+        _login(fake)
+        fake.add_playlist("mine", name="Late Set", track_ids=["t1"])
+        now = datetime.now(UTC)
+        for minutes in (30, 20):
+            fake.play(
+                "user1",
+                "t1",
+                (now - timedelta(minutes=minutes)).isoformat(),
+                "spotify:playlist:mine",
+            )
+        runner.invoke(app, ["history", "sync"])
+        out = tmp_path / "wrapped.html"
+        before = len(fake.requests)
+
+        result = runner.invoke(app, ["export", "wrapped", "--out", str(out)])
+
+        assert result.exit_code == 0, result.stderr
+        assert "nothing was published" in result.output
+        html = out.read_text(encoding="utf-8")
+        assert "Test User’s listening, <em>since" in html
+        assert "No gaps recorded" in html
+        assert "Night Drive" in html
+        assert "Late Set" in html
+        assert {method for method, _ in fake.requests[before:]} == {"GET"}
+
+    def test_the_default_output_name_is_ignored_by_git(self):
+        from pathlib import Path
+
+        ignored = (Path(__file__).parents[2] / ".gitignore").read_text(encoding="utf-8")
+        assert "wrapped.html" in ignored.splitlines()
