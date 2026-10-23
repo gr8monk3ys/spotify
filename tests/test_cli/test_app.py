@@ -454,6 +454,68 @@ class TestDiscoverTimeCapsule:
         assert fake.playlist_tracks[created[0]["id"]] == ["t1"]
 
 
+class TestDiscoverShows:
+    def test_without_a_key_explains_how_to_get_one(self, cli_env, monkeypatch):
+        from spotifyforge.config import settings
+
+        monkeypatch.setattr(settings, "ticketmaster_api_key", "")
+        result = runner.invoke(app, ["discover", "shows"])
+        assert result.exit_code == 1
+        assert "SPOTIFYFORGE_TICKETMASTER_API_KEY" in result.stderr
+        assert "Traceback" not in result.output + result.stderr
+
+    def test_without_a_home_explains_how_to_set_one(self, cli_env, monkeypatch):
+        from spotifyforge.config import settings
+
+        monkeypatch.setattr(settings, "ticketmaster_api_key", "k")
+        monkeypatch.setattr(settings, "home_location", "")
+        result = runner.invoke(app, ["discover", "shows"])
+        assert result.exit_code == 1
+        assert "SPOTIFYFORGE_HOME_LOCATION" in result.stderr
+
+    def test_lists_shows_and_prints_their_text_literally(self, cli_env, monkeypatch):
+        import httpx
+
+        from spotifyforge.config import settings
+        from spotifyforge.core import shows
+        from tests.fake_spotify import _full_artist
+
+        fake = cli_env
+        _login(fake)
+        fake.top_artists["user1"] = [_full_artist("spJB", "Julien Baker")]
+        monkeypatch.setattr(settings, "ticketmaster_api_key", "k")
+        monkeypatch.setattr(shows, "_TICKETMASTER_INTERVAL", 0)
+
+        def ticketmaster(request):
+            if request.url.path.endswith("attractions.json"):
+                attraction = {"id": "JB", "name": "Julien Baker", "upcomingEvents": {"_total": 1}}
+                return httpx.Response(200, json={"_embedded": {"attractions": [attraction]}})
+            event = {
+                "id": "E1",
+                "name": "[red]Free[/red] Night",
+                "url": "https://www.ticketmaster.com/event/E1",
+                "dates": {"start": {"localDate": "2026-11-14"}, "status": {"code": "onsale"}},
+                "_embedded": {"venues": [{"name": "The Echo", "distance": 3.2, "units": "MILES"}]},
+            }
+            return httpx.Response(200, json={"_embedded": {"events": [event]}})
+
+        real_find = shows.find_shows
+
+        async def find_with_mock(*args, **kwargs):
+            transport = httpx.MockTransport(ticketmaster)
+            async with httpx.AsyncClient(transport=transport) as client:
+                return await real_find(*args, **{**kwargs, "client": client})
+
+        monkeypatch.setattr(shows, "find_shows", find_with_mock)
+
+        result = runner.invoke(app, ["discover", "shows", "--near", "Los Angeles"])
+        assert result.exit_code == 0, result.stderr
+        assert "1 show(s) in Los Angeles" in result.output
+        assert "[red]Free[/red] Night" in result.output
+        assert "Julien Baker *" in result.output  # a name match is flagged
+        assert "Matched by name only" in result.output
+
+
 # ---------------------------------------------------------------------------
 # Curate
 # ---------------------------------------------------------------------------
@@ -543,7 +605,7 @@ class TestCurateFeatures:
 
         captured: dict[str, list[str]] = {}
 
-        async def fake_gather(isrcs, deep=False, progress=None):
+        async def fake_gather(isrcs, deep=False, progress=None, **_):
             captured["isrcs"] = list(isrcs)
             return {}, 0
 
@@ -555,6 +617,46 @@ class TestCurateFeatures:
         # lookup must cover both.
         assert "ISRCPINNED" in captured["isrcs"]
         assert "ISRCT1" in captured["isrcs"]
+
+    def test_points_at_the_tempo_extra_when_tempo_is_missing(self, cli_env, monkeypatch):
+        fake = cli_env
+        fake.add_track("t1")
+        fake.save_track("user1", "t1")
+        _login(fake)
+        captured: dict[str, object] = {}
+
+        async def fake_gather(isrcs, deep=False, progress=None, **kwargs):
+            captured.update(kwargs)
+            return {}, 0
+
+        monkeypatch.setattr("spotifyforge.core.audio_features.gather_features", fake_gather)
+        monkeypatch.setattr("spotifyforge.core.tempo.available", lambda: False)
+
+        result = runner.invoke(app, ["curate", "features", "--retry-misses"])
+        assert result.exit_code == 0, result.stderr
+        assert captured["retry_misses"] is True
+        assert "spotifyforge[tempo]" in result.output
+
+    def test_reports_how_many_tempos_were_estimated(self, cli_env, monkeypatch):
+        from spotifyforge.core.audio_features import AudioFeature, FeatureCache, feature_cache_path
+
+        fake = cli_env
+        fake.add_track("t1")
+        fake.save_track("user1", "t1")
+        _login(fake)
+        cache = FeatureCache(feature_cache_path())
+        cache.put("ISRCT1", AudioFeature(tempo=99.0), "preview")
+        cache.save()
+
+        async def fake_gather(isrcs, deep=False, progress=None, **_):
+            return {"ISRCT1": AudioFeature(tempo=99.0)}, 0
+
+        monkeypatch.setattr("spotifyforge.core.audio_features.gather_features", fake_gather)
+
+        result = runner.invoke(app, ["curate", "features"])
+        assert result.exit_code == 0, result.stderr
+        assert "1 estimated from previews" in result.output
+        assert "spotifyforge[tempo]" not in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +832,7 @@ class TestConfigShow:
         from spotifyforge.config import settings
 
         monkeypatch.setattr(settings, "pexels_api_key", "supersecretkey123")
+        monkeypatch.setattr(settings, "ticketmaster_api_key", "ticketmastersecretZ9")
 
         result = runner.invoke(app, ["config", "show"])
         assert result.exit_code == 0, result.stderr
@@ -738,6 +841,9 @@ class TestConfigShow:
         # Secrets never appear in cleartext; only ****<last4>.
         assert "supersecretkey123" not in result.output
         assert "****y123" in result.output
+        # A key added later is masked without being listed by hand.
+        assert "ticketmastersecretZ9" not in result.output
+        assert "****etZ9" in result.output
         assert "test-client-secret" not in result.output
         assert "****" in result.output
         # Non-secret values are shown as-is.

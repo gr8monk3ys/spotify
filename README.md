@@ -29,6 +29,17 @@ On my library that covered key for 52% of recordings, enough for 97 of the
 221 playlists to be sequenced by Camelot-wheel key distance; the rest fall
 back to a popularity arc. Same-artist separation always outranks harmony.
 
+Tempo had a bigger hole: only 62% of my 2,665 unique liked songs had a BPM.
+Deezer answers 0 for much of its recent catalogue, AcousticBrainz stopped
+collecting in 2022, and 172 tracks Deezer did know had been cached as misses
+because its quota error arrives as HTTP 200. With the optional `tempo` extra
+(`pip install 'spotifyforge[tempo]'`, numpy and soundfile), `curate features`
+estimates the rest from Deezer's 30-second previews (`core/tempo.py`); on 200
+held-out songs with a known BPM the estimate lands within 3 BPM 64.5% of the
+time and within an octave 79%. Coverage is now 96.8%, 728 of it estimated.
+Half and double time count as the same pulse when sequencing, since even
+Deezer and AcousticBrainz disagree by an octave on 8% of songs.
+
 Spotify also leaves a lot of artists with no genres at all: 753 of my 2,662
 unique liked songs had nowhere to go but a "beyond genre" playlist.
 `curate genres` asks MusicBrainz about those artists (`core/genre_fallback.py`),
@@ -68,6 +79,7 @@ spotifyforge playlist list
 spotifyforge playlist deduplicate <playlist_id>
 spotifyforge playlist export <playlist_id> -f csv -o tracks.csv
 spotifyforge discover deep-cuts <artist_id> --threshold 25
+spotifyforge discover shows --days 60    # concerts near home by artists you play (Ticketmaster)
 
 spotifyforge history sync                # append recent plays to a local log (run hourly)
 spotifyforge history show --days 30      # what you actually played
@@ -109,6 +121,15 @@ A run that finds all 50 plays are new says so, because it cannot know whether
 a 51st was missed, and records the possible gap in
 `listening_history.gaps.jsonl` beside the log.
 
+`discover shows` needs a free Ticketmaster key
+(`SPOTIFYFORGE_TICKETMASTER_API_KEY`, from developer.ticketmaster.com) and a
+home (`SPOTIFYFORGE_HOME_LOCATION`, "lat,long" or a city, with
+`SPOTIFYFORGE_HOME_RADIUS_MILES`). It checks your top artists over all three
+Spotify time ranges, plus anyone the local log shows you playing, and only
+takes a Ticketmaster act when it links to that Spotify artist or is the one
+act with that exact name. Name-only matches are flagged, and names several
+acts share are listed rather than guessed.
+
 ## The page
 
 `export page` writes your library as a single HTML file: a table of your
@@ -148,6 +169,7 @@ cannot, because it depends on how this package reads your library:
 | `top_tracks`, `recently_played` | What Spotify itself reports |
 | `listening_history` | Plays counted from the local log `history sync` keeps |
 | `playlist_usage_report` | Which of your own playlists were played, and how many never were |
+| `upcoming_shows` | Concerts near home by the artists you play most, from Ticketmaster |
 | `liked_vs_played_report` | Songs you play but have not liked, and liked songs no record has heard |
 
 So "make me a 25-track late-night jazz fusion playlist from my liked songs"

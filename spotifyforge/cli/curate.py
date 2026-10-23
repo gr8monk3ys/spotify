@@ -944,16 +944,28 @@ def curate_features(
         "--deep",
         help="Also fetch musical key via MusicBrainz/AcousticBrainz (~1 track/sec).",
     ),
+    retry_misses: bool = typer.Option(
+        False,
+        "--retry-misses",
+        help="Ask Deezer again about every track it had no tempo for.",
+    ),
     max_tracks: int | None = _MAX_TRACKS,
 ) -> None:
     """Fetch tempo and key for your liked songs, caching them on disk.
 
     Spotify's own audio-features endpoint is withdrawn for this app, so
     tempo comes from Deezer and musical key from AcousticBrainz, both
-    looked up by ISRC. Results are cached, so this is slow once and
-    instant afterwards; re-run it after liking new music.
+    looked up by ISRC. Tracks neither knows get a tempo estimated from
+    Deezer's 30-second preview, if the [bold]tempo[/bold] extra is
+    installed. Results are cached, so this is slow once and instant
+    afterwards; re-run it after liking new music.
     """
-    from spotifyforge.core.audio_features import feature_cache_path, gather_features
+    from spotifyforge.core import tempo
+    from spotifyforge.core.audio_features import (
+        estimated_tempo_count,
+        feature_cache_path,
+        gather_features,
+    )
     from spotifyforge.core.curation import CurationEngine
     from spotifyforge.core.expansion import load_expansions
 
@@ -977,18 +989,25 @@ def curate_features(
     with Progress(transient=True) as progress:
         task = progress.add_task("Looking up tempo/key...", total=len(isrcs))
         features, learned = _run(
-            gather_features(isrcs, deep=deep, progress=lambda: progress.advance(task))
+            gather_features(
+                isrcs,
+                deep=deep,
+                progress=lambda: progress.advance(task),
+                retry_misses=retry_misses,
+            )
         )
 
     analysed = sum(1 for f in features.values() if f.tempo is not None)
+    estimated = estimated_tempo_count(isrcs)
     keyed = sum(1 for f in features.values() if f.has_key)
     console.print(
         Panel(
             f"Recordings with an ISRC: [bold]{len(isrcs)}[/bold] "
             f"from {len(tracks)} liked + {len(pinned)} pinned tracks\n"
             f"Newly resolved:          [bold]{learned}[/bold]\n"
-            f"Tempo known:             [bold]{analysed}[/bold]\n"
-            f"Key known:               [bold]{keyed}[/bold]"
+            f"Tempo known:             [bold]{analysed}[/bold]"
+            + (f" [dim]({estimated} estimated from previews)[/dim]" if estimated else "")
+            + f"\nKey known:               [bold]{keyed}[/bold]"
             + ("" if deep else "  [dim](use --deep to fetch keys)[/dim]")
             + f"\nCache: {feature_cache_path()}",
             title="Audio features",
@@ -996,6 +1015,12 @@ def curate_features(
             expand=False,
         )
     )
+    if analysed < len(isrcs) and not tempo.available():
+        console.print(
+            f"[dim]{len(isrcs) - analysed} tracks have no tempo. Install the tempo extra "
+            "([bold]pip install 'spotifyforge\\[tempo]'[/bold]) to estimate them from "
+            "30-second previews.[/dim]"
+        )
     if keyed:
         console.print(
             "\nRun [bold]spotifyforge curate reflow --harmonic[/bold] to re-sequence "

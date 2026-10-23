@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # Pexels (photo cover art); free key from pexels.com/api.
     pexels_api_key: str = ""
 
+    # Ticketmaster (shows by artists you play); free key from
+    # developer.ticketmaster.com. Home is "lat,long" or a city name; the
+    # radius only applies to lat,long, because Ticketmaster's city filter
+    # is a name match, not a distance.
+    ticketmaster_api_key: str = ""
+    home_location: str = ""
+    home_radius_miles: int = 50
+
     @model_validator(mode="after")
     def _expand_paths(self) -> "Settings":
         self.data_dir = self.data_dir.expanduser()

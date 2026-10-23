@@ -422,6 +422,83 @@ async def test_playlist_usage_report(logged_in):
     assert out["long_enough_to_judge"] is False
 
 
+async def test_upcoming_shows_is_read_only_and_open_world():
+    async with Client(server) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    hints = tools["upcoming_shows"].annotations
+    assert hints.read_only_hint is True
+    assert hints.open_world_hint is True
+
+
+async def test_upcoming_shows_without_a_key_says_how_to_get_one(logged_in, monkeypatch):
+    from spotifyforge.config import settings
+    from spotifyforge.core import shows
+
+    monkeypatch.setattr(settings, "ticketmaster_api_key", "")
+    result = await _call("upcoming_shows")
+    assert result.is_error
+    assert result.content[0].text.endswith(shows.HOW_TO_GET_A_KEY)
+
+
+async def test_upcoming_shows_without_a_home_says_how_to_set_one(logged_in, monkeypatch):
+    from spotifyforge.config import settings
+
+    monkeypatch.setattr(settings, "ticketmaster_api_key", "k")
+    monkeypatch.setattr(settings, "home_location", "")
+    result = await _call("upcoming_shows")
+    assert result.is_error
+    assert "SPOTIFYFORGE_HOME_LOCATION" in result.content[0].text
+
+
+async def test_upcoming_shows_reports_shows_and_how_sure_each_match_is(logged_in, monkeypatch):
+    import httpx
+
+    from spotifyforge.config import settings
+    from spotifyforge.core import shows
+    from tests.fake_spotify import _full_artist
+
+    fake = logged_in
+    fake.top_artists["user1"] = [_full_artist("spPB", "Phoebe Bridgers")]
+    monkeypatch.setattr(settings, "ticketmaster_api_key", "k")
+    monkeypatch.setattr(settings, "home_location", "34.0522,-118.2437")
+    monkeypatch.setattr(shows, "_TICKETMASTER_INTERVAL", 0)
+
+    def ticketmaster(request):
+        if request.url.path.endswith("attractions.json"):
+            attraction = {
+                "id": "PB",
+                "name": "Phoebe Bridgers",
+                "externalLinks": {"spotify": [{"url": "https://open.spotify.com/artist/spPB"}]},
+            }
+            return httpx.Response(200, json={"_embedded": {"attractions": [attraction]}})
+        event = {
+            "id": "E1",
+            "name": "Phoebe Bridgers",
+            "url": "javascript:alert(1)",
+            "dates": {"start": {"localDate": "2026-11-14", "localTime": "20:00:00"}},
+            "_embedded": {"venues": [{"name": "Hollywood Bowl", "distance": 7.34}]},
+        }
+        return httpx.Response(200, json={"_embedded": {"events": [event]}, "page": {}})
+
+    real_find = shows.find_shows
+
+    async def find_with_mock(*args, **kwargs):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(ticketmaster)) as client:
+            return await real_find(*args, **{**kwargs, "client": client})
+
+    monkeypatch.setattr(shows, "find_shows", find_with_mock)
+
+    out = await _ok("upcoming_shows", days=60)
+
+    assert out["where"] == "within 50 miles of 34.0522,-118.244"
+    (show,) = out["shows"]
+    assert show["artists"] == ["Phoebe Bridgers"]
+    assert show["confidence"] == "linked"
+    assert show["distance_miles"] == 7.3
+    assert show["url"] is None  # the model never sees a link that is not a ticket page
+    assert out["matched_by_name_only"] == []
+
+
 async def test_liked_vs_played_report_is_read_only_and_worded_honestly(logged_in):
     from datetime import UTC, datetime, timedelta
 

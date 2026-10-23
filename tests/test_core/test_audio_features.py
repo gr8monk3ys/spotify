@@ -17,20 +17,28 @@ from spotifyforge.core.audio_features import (
     AudioFeature,
     DeezerProvider,
     FeatureCache,
+    PreviewTempoProvider,
     _RateLimiter,
     camelot,
+    estimated_tempo_count,
+    feature_cache_path,
     fetch_features,
+    gather_features,
     key_distance,
     parse_key,
 )
+
+QUOTA = {"error": {"type": "Exception", "message": "Quota limit exceeded", "code": 4}}
 
 MBID = "daa22b27-f253-46a1-9194-525d5f35bd89"
 
 
 @pytest.fixture(autouse=True)
 def _no_musicbrainz_sleep(monkeypatch):
-    """Skip the 1s politeness delay so tests stay fast."""
+    """Skip the politeness delays so tests stay fast."""
     monkeypatch.setattr("spotifyforge.core.audio_features._MUSICBRAINZ_INTERVAL", 0)
+    monkeypatch.setattr("spotifyforge.core.audio_features._DEEZER_INTERVAL", 0)
+    monkeypatch.setattr("spotifyforge.core.audio_features._DEEZER_QUOTA_PAUSE", 0)
 
 
 def _client(handler) -> httpx.AsyncClient:
@@ -125,6 +133,37 @@ async def test_deezer_reports_every_isrc_even_on_transport_failure():
     assert set(out) == {"GOOD", "BAD"}
     assert out["GOOD"].tempo == 100
     assert out["BAD"] == AudioFeature()
+
+
+async def test_deezer_waits_out_a_quota_error_instead_of_calling_it_a_miss():
+    # Deezer's quota error is an HTTP 200; runs that did not check for it
+    # cached hundreds of known tracks as having no BPM.
+    answers = iter([QUOTA, QUOTA, {"bpm": 97}])
+    out = await _collect(DeezerProvider(), lambda r: httpx.Response(200, json=next(answers)), ["X"])
+    assert out["X"].tempo == 97
+
+
+async def test_a_persistent_quota_error_leaves_the_track_unasked(tmp_path):
+    path = tmp_path / "f.json"
+    async with _client(lambda r: httpx.Response(200, json=QUOTA)) as client:
+        await fetch_features(["X"], [DeezerProvider()], FeatureCache(path), client=client)
+
+    cache = FeatureCache(path)
+    assert cache.get("X") is None
+    assert not cache.tried("X", "deezer")  # so the next run asks again
+
+
+async def test_deezer_reads_a_non_quota_error_as_unknown():
+    body = {"error": {"type": "DataException", "message": "no data", "code": 800}}
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json=body)
+
+    out = await _collect(DeezerProvider(), handler, ["X"])
+    assert out["X"] == AudioFeature()
+    assert len(calls) == 1
 
 
 async def test_acousticbrainz_resolves_a_batch_in_one_pair_of_calls():
@@ -365,3 +404,158 @@ async def test_progress_is_checkpointed_so_an_interrupt_keeps_the_work(tmp_path,
     # the save() at the end of fetch_features.
     assert path.exists()
     assert len(FeatureCache(path)) >= 2
+
+
+def test_cache_records_which_provider_supplied_the_tempo(tmp_path):
+    cache = FeatureCache(tmp_path / "f.json")
+    cache.put("A", AudioFeature(), "deezer")
+    cache.put("A", AudioFeature(tempo=88.0), "preview")
+    cache.put("A", AudioFeature(tempo=90.0, key=9, mode=0), "acousticbrainz")
+
+    assert cache.get("A").tempo == 88.0  # the first value stays
+    assert cache.tempo_source("A") == "preview"  # and so does its origin
+    assert cache.tempo_source("missing") is None
+
+
+def test_forget_tempo_misses_reopens_only_the_misses(tmp_path):
+    cache = FeatureCache(tmp_path / "f.json")
+    cache.put("HIT", AudioFeature(tempo=120.0), "deezer")
+    cache.put("MISS", AudioFeature(), "deezer")
+    cache.put("MISS", AudioFeature(), "acousticbrainz")
+
+    assert cache.forget_tempo_misses("deezer") == 1
+    assert cache.tried("HIT", "deezer")
+    assert not cache.tried("MISS", "deezer")
+    assert cache.tried("MISS", "acousticbrainz")
+
+
+async def test_gather_with_retry_misses_asks_deezer_again(monkeypatch):
+    cache = FeatureCache(feature_cache_path())
+    cache.put("HIT", AudioFeature(tempo=120.0), "deezer")
+    cache.put("MISS", AudioFeature(), "deezer")
+    cache.save()
+    asked = []
+
+    def handler(request):
+        asked.append(request.url.path)
+        return httpx.Response(200, json={"bpm": 101})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler))
+    )
+
+    quiet, _ = await gather_features(["HIT", "MISS"], estimate=False)
+    assert quiet["MISS"].tempo is None and asked == []  # a miss stays a miss by default
+
+    features, learned = await gather_features(["HIT", "MISS"], estimate=False, retry_misses=True)
+    assert asked == ["/track/isrc:MISS"]
+    assert features["MISS"].tempo == 101
+    assert learned == 1
+
+
+def test_estimated_tempo_count_counts_preview_estimates_only():
+    cache = FeatureCache(feature_cache_path())
+    cache.put("MEASURED", AudioFeature(tempo=120.0), "deezer")
+    cache.put("GUESSED", AudioFeature(tempo=95.5), "preview")
+    cache.save()
+
+    assert estimated_tempo_count(["MEASURED", "GUESSED", "GUESSED", "ABSENT"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Preview tempo estimates
+# ---------------------------------------------------------------------------
+
+PREVIEW = "https://cdnt-preview.dzcdn.net/api/1/1/0/a/b/0/clip.mp3"
+
+
+def _preview_handler(tracks: dict[str, dict], audio: bytes, downloads: list[str]):
+    def handler(request):
+        if request.url.host == "api.deezer.com":
+            isrc = request.url.path.rsplit(":", 1)[1]
+            return httpx.Response(200, json=tracks[isrc])
+        downloads.append(str(request.url))
+        return httpx.Response(200, content=audio)
+
+    return handler
+
+
+def _click_track_wav(bpm: float) -> bytes:
+    pytest.importorskip("numpy")
+    pytest.importorskip("soundfile")
+    from tests.test_core.test_tempo import _clicks, _wav
+
+    return _wav(_clicks(bpm))
+
+
+async def _collect_preview(client, isrcs):
+    return {isrc: f async for isrc, f in PreviewTempoProvider().stream(client, isrcs)}
+
+
+async def test_preview_estimate_fills_a_tempo_deezer_does_not_have(tmp_path):
+    downloads: list[str] = []
+    handler = _preview_handler(
+        {"A": {"bpm": 0, "preview": PREVIEW}}, _click_track_wav(120.0), downloads
+    )
+    cache = FeatureCache(tmp_path / "f.json")
+    async with _client(handler) as client:
+        features = await fetch_features(
+            ["A"], [DeezerProvider(), PreviewTempoProvider()], cache, client=client
+        )
+
+    assert features["A"].tempo == pytest.approx(120.0, abs=3)
+    assert cache.tempo_source("A") == "preview"
+    assert downloads == [PREVIEW]
+
+
+async def test_preview_estimates_only_the_gaps(tmp_path):
+    downloads: list[str] = []
+    tracks = {
+        "KNOWN": {"bpm": 128, "preview": PREVIEW},
+        "GAP": {"bpm": 0, "preview": PREVIEW},
+        "SILENT": {"bpm": 0, "preview": ""},  # nothing to listen to
+    }
+    handler = _preview_handler(tracks, _click_track_wav(100.0), downloads)
+    cache = FeatureCache(tmp_path / "f.json")
+    async with _client(handler) as client:
+        features = await fetch_features(
+            list(tracks), [DeezerProvider(), PreviewTempoProvider()], cache, client=client
+        )
+
+    assert len(downloads) == 1  # GAP only; KNOWN already had a measured tempo
+    assert features["KNOWN"].tempo == 128
+    assert features["GAP"].tempo == pytest.approx(100.0, abs=3)
+    assert features["SILENT"].tempo is None
+    assert cache.tried("SILENT", "preview")  # a track with no preview is not re-asked
+    assert not cache.tried("KNOWN", "preview")
+
+
+async def test_without_the_extra_previews_are_not_even_recorded_as_tried(tmp_path, monkeypatch):
+    monkeypatch.setattr("spotifyforge.core.tempo.available", lambda: False)
+    downloads: list[str] = []
+    handler = _preview_handler({"A": {"bpm": 0, "preview": PREVIEW}}, b"", downloads)
+    cache = FeatureCache(tmp_path / "f.json")
+    async with _client(handler) as client:
+        await fetch_features(
+            ["A"], [DeezerProvider(), PreviewTempoProvider()], cache, client=client
+        )
+
+    assert downloads == []
+    # Installing the extra later must pick this track up.
+    assert not cache.tried("A", "preview")
+
+
+async def test_an_oversized_preview_is_not_decoded(monkeypatch):
+    monkeypatch.setattr("spotifyforge.core.tempo.available", lambda: True)
+    monkeypatch.setattr("spotifyforge.core.audio_features._MAX_PREVIEW_BYTES", 10)
+    decoded = []
+    monkeypatch.setattr(
+        "spotifyforge.core.tempo.estimate_from_audio", lambda audio: decoded.append(audio)
+    )
+    handler = _preview_handler({"A": {"bpm": 0, "preview": PREVIEW}}, b"x" * 11, [])
+    async with _client(handler) as client:
+        out = await _collect_preview(client, ["A"])
+
+    assert out["A"] == AudioFeature()
+    assert decoded == []
