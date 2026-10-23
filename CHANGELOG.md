@@ -15,6 +15,8 @@
 * **history:** `history playlists` and the `playlist_usage_report` MCP tool show
   which owned playlists are actually played
 * **export:** `export page` writes the library as one self-contained HTML page
+* **history:** `history likes` and the `liked_vs_played_report` MCP tool list songs
+  played but not liked, and liked songs in no top list and not in the log
 
 ### Removed
 

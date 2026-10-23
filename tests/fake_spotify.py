@@ -76,6 +76,8 @@ class FakeSpotify:
         self.playlist_tracks: dict[str, list[str]] = {}
         self.tracks: dict[str, dict[str, Any]] = {}
         self.top_tracks: dict[str, list[str]] = {}  # user -> track ids
+        # (user, time_range) -> track ids; a range left unset falls back to top_tracks.
+        self.top_tracks_by_range: dict[tuple[str, str], list[str]] = {}
         self.top_artists: dict[str, list[dict[str, Any]]] = {}
         self.artist_albums: dict[str, list[str]] = {}  # artist -> album ids
         self.album_tracks: dict[str, list[str]] = {}  # album -> track ids
@@ -606,7 +608,8 @@ class FakeSpotify:
             )
 
         if path == "/v1/me/top/tracks":
-            ids = self.top_tracks.get(me, [])
+            time_range = query.get("time_range", "medium_term")
+            ids = self.top_tracks_by_range.get((me, time_range), self.top_tracks.get(me, []))
             items = [self.tracks[t] for t in ids[offset : offset + limit]]
             return httpx.Response(
                 200, json=self._paging(f"{API}/me/top/tracks", items, limit, offset, len(ids))

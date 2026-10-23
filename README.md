@@ -72,6 +72,7 @@ spotifyforge discover deep-cuts <artist_id> --threshold 25
 spotifyforge history sync                # append recent plays to a local log (run hourly)
 spotifyforge history show --days 30      # what you actually played
 spotifyforge history playlists           # which of your own playlists you play
+spotifyforge history likes               # played but not liked; liked but not heard lately
 
 # Other platforms (shared files in MUSIC_DIR, default ~/.music)
 spotifyforge export library                         # Write ~/.music/music-library.json for discogs
@@ -134,6 +135,7 @@ cannot, because it depends on how this package reads your library:
 | `top_tracks`, `recently_played` | What Spotify itself reports |
 | `listening_history` | Plays counted from the local log `history sync` keeps |
 | `playlist_usage_report` | Which of your own playlists were played, and how many never were |
+| `liked_vs_played_report` | Songs you play but have not liked, and liked songs no record has heard |
 
 So "make me a 25-track late-night jazz fusion playlist from my liked songs"
 becomes three calls: learn the genres, pick the tracks, create it sequenced.
