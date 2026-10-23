@@ -72,10 +72,12 @@ spotifyforge discover deep-cuts <artist_id> --threshold 25
 spotifyforge history sync                # append recent plays to a local log (run hourly)
 spotifyforge history show --days 30      # what you actually played
 spotifyforge history playlists           # which of your own playlists you play
+spotifyforge history likes               # played but not liked; liked but not heard lately
 
 # Other platforms (shared files in MUSIC_DIR, default ~/.music)
 spotifyforge export library                         # Write ~/.music/music-library.json for discogs
 spotifyforge export page --out taste.html           # One self-contained HTML page of your library
+spotifyforge export wrapped --out wrapped.html      # Your own Wrapped from the log (local only)
 spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
 spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
 spotifyforge library soundtracks                    # Dry run: soundtracks of films rated 4.5+ on Letterboxd
@@ -103,7 +105,8 @@ Fifty plays is about two and a half hours of music; hourly is enough:
 ```
 
 A run that finds all 50 plays are new says so, because it cannot know whether
-a 51st was missed.
+a 51st was missed, and records the possible gap in
+`listening_history.gaps.jsonl` beside the log.
 
 ## The page
 
@@ -115,6 +118,13 @@ opened (its three fonts are embedded), so it works from disk, by email or on
 any host, in light and dark and on a phone. The command only writes the file;
 publishing it is up to you. The look follows my own site's design system; see
 `DESIGN.md`.
+
+`export wrapped` writes a second page in the same style from the listening log:
+top songs, artists and albums, the hours and weekdays you listen, where plays
+start, and songs played hard then dropped. It says when the log starts and
+flags every possible gap `history sync` recorded. Unlike the taste page it holds
+play history, so treat it as private: the default `wrapped.html` is ignored by
+git and the command publishes nothing.
 
 ## MCP server
 
@@ -134,6 +144,7 @@ cannot, because it depends on how this package reads your library:
 | `top_tracks`, `recently_played` | What Spotify itself reports |
 | `listening_history` | Plays counted from the local log `history sync` keeps |
 | `playlist_usage_report` | Which of your own playlists were played, and how many never were |
+| `liked_vs_played_report` | Songs you play but have not liked, and liked songs no record has heard |
 
 So "make me a 25-track late-night jazz fusion playlist from my liked songs"
 becomes three calls: learn the genres, pick the tracks, create it sequenced.
