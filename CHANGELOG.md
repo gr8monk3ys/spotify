@@ -17,6 +17,9 @@
 * **export:** `export page` writes the library as one self-contained HTML page
 * **export:** the page adds genres against the year each song was liked, with
   bulk-import days set aside
+* **library:** `library records` and the `records_vs_streams` MCP tool join the
+  Discogs collection and wantlist to liked songs and plays: wanted and already
+  loved, owned but not streamed, loved but on neither shelf
 
 ### Removed
 

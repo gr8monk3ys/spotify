@@ -863,6 +863,45 @@ class TestLibrarySave:
         assert "In Utero" in result.output
 
 
+class TestLibraryRecords:
+    def test_joins_the_shelves_reads_only_and_escapes_markup(self, cli_env, tmp_path):
+        from tests.test_core.test_library import FIXTURE
+
+        fake = cli_env
+        _login(fake)
+        for i in range(3):
+            fake.add_track(f"u{i}", artist_name="Nirvana", album_name="In Utero (Remastered)")
+            fake.save_track("user1", f"u{i}")
+        for i in range(3):
+            fake.add_track(
+                f"x{i}", artist_id="a2", artist_name="[bold]Loud[/bold]", album_name="[red]LP"
+            )
+            fake.save_track("user1", f"x{i}")
+        doc = {**FIXTURE, "wantlist": [{**FIXTURE["collection"][0], "release_id": 7}]}
+        path = tmp_path / "discogs.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        before = len(fake.requests)
+
+        result = runner.invoke(
+            app, ["library", "records", "--file", str(path)], env={"COLUMNS": "200"}
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert "Wanted and already loved (1)" in result.output
+        assert "Owned but not streamed (1)" in result.output
+        assert "Kid A" in result.output
+        assert "[bold]Loud[/bold]" in result.output  # shown as text, not applied
+        assert "collection 1 of 2" in result.output
+        assert "wantlist 1 of 1" in result.output
+        assert {method for method, _ in fake.requests[before:]} == {"GET"}
+
+    def test_missing_file_exits_2(self, cli_env, tmp_path):
+        result = runner.invoke(app, ["library", "records", "--file", str(tmp_path / "no.json")])
+
+        assert result.exit_code == 2
+        assert "discogs export" in result.stderr
+
+
 class TestLibrarySoundtracks:
     @pytest.fixture()
     def films(self, cli_env, tmp_path):

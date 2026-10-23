@@ -78,6 +78,7 @@ spotifyforge export library                         # Write ~/.music/music-libra
 spotifyforge export page --out taste.html           # One self-contained HTML page of your library
 spotifyforge library save --from-discogs            # Dry run: Discogs collection -> Spotify saved albums
 spotifyforge library save --from-discogs --apply    # Save the unambiguous matches (needs a re-login once)
+spotifyforge library records                        # Discogs shelves vs liked songs and plays (read-only)
 spotifyforge library soundtracks                    # Dry run: soundtracks of films rated 4.5+ on Letterboxd
 spotifyforge library soundtracks --apply            # Write them to one private playlist
 ```
@@ -128,6 +129,7 @@ cannot, because it depends on how this package reads your library:
 |---|---|
 | `liked_genres` | Genres across your liked songs, with counts |
 | `search_liked` | Liked songs by genre, artist, title or year, with BPM and key where known |
+| `records_vs_streams` | The Discogs collection and wantlist against liked songs and plays |
 | `create_playlist` | Create a private playlist from chosen tracks, sequenced by key and tempo |
 | `list_playlists`, `get_playlist` | Read your playlists |
 | `deduplicate_playlist` | Remove repeated tracks from one of your own playlists |

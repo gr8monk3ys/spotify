@@ -153,6 +153,44 @@ async def test_liked_library_is_cached_until_refresh(logged_in):
     assert (await _ok("search_liked", refresh=True))["total_matches"] == 2
 
 
+async def test_records_vs_streams_reads_discogs_json_and_writes_nothing(
+    logged_in, tmp_path, monkeypatch
+):
+    import json
+
+    from spotifyforge.config import settings
+    from tests.test_core.test_library import FIXTURE
+
+    fake = logged_in
+    for i in range(3):
+        fake.add_track(f"u{i}", artist_name="Nirvana", album_name="In Utero (Deluxe Edition)")
+        fake.save_track("user1", f"u{i}")
+    monkeypatch.setattr(settings, "music_dir", tmp_path)
+    (tmp_path / "discogs.json").write_text(json.dumps(FIXTURE), encoding="utf-8")
+    before = len(fake.requests)
+
+    out = await _ok("records_vs_streams")
+
+    assert out["collection"] == {"records": 2, "matched": 1}
+    assert out["wantlist"] == {"records": 1, "matched": 0}
+    assert [r["title"] for r in out["owned_not_streamed"]] == ["Kid A"]
+    assert out["unmatched_count"] == 2
+    assert {method for method, _ in fake.requests[before:]} == {"GET"}
+
+
+async def test_records_vs_streams_without_the_export_names_the_command(
+    logged_in, tmp_path, monkeypatch
+):
+    from spotifyforge.config import settings
+
+    monkeypatch.setattr(settings, "music_dir", tmp_path)
+
+    result = await _call("records_vs_streams")
+
+    assert result.is_error
+    assert "discogs export" in result.content[0].text
+
+
 async def test_create_playlist_sequences_liked_tracks_and_is_private(logged_in):
     fake = logged_in
     # Three tracks by one artist and one by another: the arc ordering must
