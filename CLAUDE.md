@@ -12,7 +12,7 @@ The five canonical roles, label string equal to role name. See `docs/agents/tria
 
 ### Domain docs
 
-Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context: `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ## Media fleet: the join is alive, the engines are frozen (2026-08-30)
 
